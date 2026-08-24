@@ -5,6 +5,7 @@
 //! [`Problem`], which rejects anything else at construction.
 
 pub mod generate;
+pub mod lp;
 pub mod model;
 pub mod reader;
 pub mod sparse;

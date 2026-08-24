@@ -1,5 +1,5 @@
 Minimize
-  1x1 + 2x2 + 3x3 + 4x4 + 5x5 + 6x6
+  1 x1 + 2 x2 + 3 x3 + 4 x4 + 5 x5 + 6 x6
 
 Subject To
   x1 + x2  + x6 >= 2

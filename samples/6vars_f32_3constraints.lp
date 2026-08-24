@@ -1,5 +1,5 @@
 Minimize
-  3x1 + 5x2 + 6x3 + 9x4 + 10x5 + 10x6
+  3 x1 + 5 x2 + 6 x3 + 9 x4 + 10 x5 + 10 x6
 
 Subject To
   - 2 x1 + 6 x2 - 3 x3 + 4 x4 + 1 x5 - 2 x6 >=  2  \ comment

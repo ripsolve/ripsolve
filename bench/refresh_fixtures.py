@@ -56,6 +56,9 @@ def reference_values(lp_path):
 
     env = gp.Env(params={"OutputFlag": 0})
     model = gp.read(str(lp_path), env=env)
+    # For a maximization the relaxation is an upper bound, not a lower one, so the
+    # sense has to travel with the values for them to be checkable.
+    sense = "maximize" if model.ModelSense == gp.GRB.MAXIMIZE else "minimize"
 
     # Root LP relaxation, with presolve and cuts off so the value is the honest
     # relaxation of the model as written -- that is what bipper's simplex must
@@ -73,7 +76,7 @@ def reference_values(lp_path):
     if model.Status != gp.GRB.OPTIMAL:
         sys.exit(f"{lp_path.name}: MIP status {model.Status}")
 
-    return lp_value, model.ObjVal, [v.X for v in model.getVars()]
+    return lp_value, model.ObjVal, [v.X for v in model.getVars()], sense
 
 
 def main():
@@ -89,10 +92,11 @@ def main():
         name = f"{kind}_c{cols}_r{rows}_s{seed}"
         lp_path = scratch / f"{name}.lp"
         bipper_gen(kind, cols, rows, seed, lp_path)
-        lp_value, mip_value, solution = reference_values(lp_path)
+        lp_value, mip_value, solution, sense = reference_values(lp_path)
         entries.append({
             "kind": kind, "n_cols": cols, "n_rows": rows, "seed": seed,
             "name": name,
+            "sense": sense,
             "digest": f"{lp_digest(lp_path.read_text()):016x}",
             "lp_relaxation": lp_value,
             "mip_optimum": mip_value,
@@ -101,12 +105,31 @@ def main():
         })
         print(f"{name:28s} lp={lp_value:12.6f}  mip={mip_value:12.6f}")
 
+    # The bundled samples cost nothing extra to cover and exercise the readers on
+    # hand-written files rather than only on generator output.
+    samples = []
+    for path in sorted((ROOT / "samples").iterdir()):
+        if path.suffix.lower() not in (".lp", ".mps"):
+            continue
+        lp_value, mip_value, solution, sense = reference_values(path)
+        samples.append({
+            "file": path.name,
+            "sense": sense,
+            "digest": f"{lp_digest(path.read_text()):016x}",
+            "lp_relaxation": lp_value,
+            "mip_optimum": mip_value,
+            "solution": [int(round(x)) for x in solution],
+        })
+        print(f"{path.name:28s} lp={lp_value:12.6f}  mip={mip_value:12.6f}")
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(
-        {"generator": "bipper gen", "oracle": "gurobi", "instances": entries},
+        {"generator": "bipper gen", "oracle": "gurobi",
+         "instances": entries, "samples": samples},
         indent=2,
     ) + "\n")
-    print(f"\nwrote {len(entries)} instances to {args.out.relative_to(ROOT)}")
+    print(f"\nwrote {len(entries)} instances and {len(samples)} samples "
+          f"to {args.out.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
