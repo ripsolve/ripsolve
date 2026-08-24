@@ -29,6 +29,74 @@
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
 
+/// When to try a heuristic again, based on whether the last attempts worked.
+///
+/// A fixed interval is wrong in both directions. On a model where diving keeps
+/// landing, the search wants it often; on one where it keeps failing — and it fails
+/// on entire instance families, not just occasional nodes — every attempt is a
+/// short chain of LPs spent for nothing. Running unconditionally every 100 nodes
+/// measurably cost `v064c1000n100` its incumbent quality, because the time went to
+/// dives instead of nodes.
+///
+/// So: double the interval on each failure up to a cap, and snap back to the base
+/// on any success. A heuristic that never works costs a vanishing share of the
+/// search; one that starts working again is picked back up immediately.
+#[derive(Clone, Debug)]
+pub struct Schedule {
+    base: usize,
+    interval: usize,
+    next: usize,
+    calls: usize,
+    successes: usize,
+}
+
+/// How far the interval may grow. Past this a heuristic is effectively retired for
+/// the run, but never quite — a search that changes character still gets one look.
+const MAX_INTERVAL_FACTOR: usize = 64;
+
+impl Schedule {
+    /// `base` is the node interval between attempts while they keep succeeding.
+    /// Zero disables the heuristic entirely.
+    pub fn new(base: usize) -> Self {
+        Self {
+            base,
+            interval: base,
+            next: base,
+            calls: 0,
+            successes: 0,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.base > 0
+    }
+
+    /// Is an attempt due at this node?
+    pub fn due(&self, node_index: usize) -> bool {
+        self.enabled() && node_index >= self.next
+    }
+
+    /// Record what an attempt achieved and set the next one.
+    pub fn record(&mut self, node_index: usize, improved: bool) {
+        self.calls += 1;
+        if improved {
+            self.successes += 1;
+            self.interval = self.base;
+        } else {
+            self.interval = (self.interval * 2).min(self.base * MAX_INTERVAL_FACTOR);
+        }
+        self.next = node_index + self.interval;
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls
+    }
+
+    pub fn successes(&self) -> usize {
+        self.successes
+    }
+}
+
 /// A feasible binary assignment and its objective, in the internal minimization
 /// form.
 #[derive(Clone, Debug)]
@@ -416,5 +484,60 @@ mod tests {
         assert!(!is_feasible(&p, &all_zero, 1e-6));
         let all_one = vec![1.0; p.n_cols()];
         assert!(is_feasible(&p, &all_one, 1e-6));
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::Schedule;
+
+    #[test]
+    fn a_zero_base_disables_the_heuristic() {
+        let s = Schedule::new(0);
+        assert!(!s.enabled());
+        assert!(!s.due(0));
+        assert!(!s.due(1_000_000));
+    }
+
+    #[test]
+    fn failures_back_the_interval_off_geometrically() {
+        let mut s = Schedule::new(10);
+        assert!(!s.due(9));
+        assert!(s.due(10));
+
+        s.record(10, false); // next at 10 + 20
+        assert!(!s.due(29));
+        assert!(s.due(30));
+
+        s.record(30, false); // next at 30 + 40
+        assert!(!s.due(69));
+        assert!(s.due(70));
+    }
+
+    #[test]
+    fn a_success_snaps_the_interval_back() {
+        // A heuristic that starts working again must be picked straight back up,
+        // not left at whatever interval its earlier failures had grown to.
+        let mut s = Schedule::new(10);
+        for node in [10, 30, 70] {
+            s.record(node, false);
+        }
+        s.record(150, true);
+        assert!(s.due(160), "interval did not reset after a success");
+        assert_eq!(s.successes(), 1);
+        assert_eq!(s.calls(), 4);
+    }
+
+    #[test]
+    fn the_interval_is_capped() {
+        // Never retired outright: a search that changes character still gets a look.
+        let mut s = Schedule::new(10);
+        let mut node = 0;
+        for _ in 0..40 {
+            node += 1 << 20;
+            s.record(node, false);
+        }
+        // Capped at base * 64, so an attempt is still due a bounded distance later.
+        assert!(s.due(node + 10 * 64), "interval grew past its cap");
     }
 }

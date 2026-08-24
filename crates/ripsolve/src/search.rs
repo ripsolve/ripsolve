@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::branch::{self, Pseudocosts};
 use crate::cuts;
-use crate::heuristic::{self, Limits};
+use crate::heuristic::{self, Limits, Schedule};
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
 use crate::presolve::{self, Outcome};
@@ -71,8 +71,10 @@ pub struct Options {
     /// search keeps its open set to roughly the tree depth, while best-bound holds
     /// every unexplored node.
     pub plunge_limit: usize,
-    /// Run primal heuristics at the root, and every `heuristic_frequency` nodes.
-    /// Zero disables them.
+    /// Base node interval between in-tree heuristic attempts. Zero disables them.
+    ///
+    /// This is a starting point, not a fixed cadence: the interval doubles after
+    /// each attempt that finds nothing and snaps back here after one that does.
     pub heuristic_frequency: usize,
     /// Limits on the heuristics themselves.
     pub heuristic_limits: Limits,
@@ -287,6 +289,7 @@ struct Worker<'a> {
     strong_budget: usize,
     options: Options,
     iterations: usize,
+    dives: Schedule,
 }
 
 impl<'a> Worker<'a> {
@@ -299,6 +302,7 @@ impl<'a> Worker<'a> {
             strong_budget: options.strong_branching_budget,
             options,
             iterations: 0,
+            dives: Schedule::new(options.heuristic_frequency),
         }
     }
 
@@ -361,8 +365,7 @@ impl<'a> Worker<'a> {
         // Dive from this node every so often. Nodes deep in the tree already have
         // many columns fixed, so a dive from one is short and often lands somewhere
         // the search would take a long time to reach.
-        if options.heuristic_frequency > 0
-            && index.is_multiple_of(options.heuristic_frequency)
+        if self.dives.due(index)
             && integral_solution(&solved.x, options.integrality_tolerance).is_none()
         {
             let found = heuristic::dive(
@@ -374,12 +377,15 @@ impl<'a> Worker<'a> {
                 &options.heuristic_limits,
                 &mut self.iterations,
             );
-            if let Some(found) = found
-                && found.objective < incumbent
-            {
-                out.incumbent = Some((found.objective, found.x));
-                out.heuristic_hits += 1;
-            }
+            let improved = match found {
+                Some(found) if found.objective < incumbent => {
+                    out.incumbent = Some((found.objective, found.x));
+                    out.heuristic_hits += 1;
+                    true
+                }
+                _ => false,
+            };
+            self.dives.record(index, improved);
         }
 
         match integral_solution(&solved.x, options.integrality_tolerance) {

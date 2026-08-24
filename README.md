@@ -177,9 +177,17 @@ finds solutions on five of the six models where diving finds none.
 
 The solutions are poor — 2791 against an optimum of 137 on `v064c064` — but an
 incumbent of any quality switches pruning on. `v064c200` drops from 9916 nodes and
-5.7s to 3388 nodes and 2.25s. Where the search was already finding incumbents
-quickly the heuristics only cost time, and `v064c1000n020` remains unsolved with no
-feasible point found by anything, Gurobi included.
+5.7s to 3388 nodes and 2.25s. `v064c1000n020` remains unsolved, with no feasible
+point found by anything, Gurobi included.
+
+In-tree attempts are scheduled adaptively rather than on a fixed cadence: the
+interval doubles after each attempt that finds nothing and snaps back to the base
+after one that succeeds. A fixed cadence is wrong in both directions, and diving
+fails on whole instance families rather than the occasional node, so the wasted
+attempts were measurable — running unconditionally cost `v064c1000n100` its
+incumbent quality. Backing off leaves the search tree identical and removes the
+overhead: `v128c1000n100` 13.3s to 9.8s, `v081c162n009` 1.7s to 1.4s, at unchanged
+node counts.
 
 ## Layout
 
