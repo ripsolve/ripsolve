@@ -12,6 +12,8 @@
 //! "correct and far better than enumeration" to "competitive", and each slots in
 //! without disturbing this loop.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
 
 use crate::branch::{self, Pseudocosts};
@@ -51,6 +53,17 @@ pub struct Options {
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
+    /// Consecutive depth-first steps before the search jumps to the best-bound
+    /// open node. Zero makes the search pure best-bound.
+    ///
+    /// Defaults to zero, which measured best on four of five instances and turned
+    /// `v064c1000n100` from a 77% gap into a 14-second solve. The textbook argument
+    /// for plunging is that depth-first reaches incumbents sooner, but the primal
+    /// heuristics already supply those, so the plunge buys little and costs bound
+    /// progress. Raise it if memory becomes the binding constraint: a plunging
+    /// search keeps its open set to roughly the tree depth, while best-bound holds
+    /// every unexplored node.
+    pub plunge_limit: usize,
     /// Run primal heuristics at the root, and every `heuristic_frequency` nodes.
     /// Zero disables them.
     pub heuristic_frequency: usize,
@@ -79,6 +92,7 @@ impl Default for Options {
             // measured; a larger budget finds no more cuts and only costs time.
             cut_rounds: 3,
             cuts_per_round: 32,
+            plunge_limit: 0,
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
@@ -120,6 +134,120 @@ impl Solution {
             }
             _ => f64::INFINITY,
         }
+    }
+}
+
+/// A node's key in the best-bound pool: weakest bound first, deeper nodes winning
+/// ties so the pool does not grow with shallow work.
+///
+/// `f64` is not `Ord`, and the bounds here are always finite, so `total_cmp` gives
+/// the total order a heap needs without a newtype over the bit pattern.
+#[derive(PartialEq)]
+struct Key {
+    bound: f64,
+    depth: usize,
+}
+
+impl Eq for Key {}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bound
+            .total_cmp(&other.bound)
+            .then(other.depth.cmp(&self.depth))
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The open node set: a depth-first plunge stack plus a best-bound pool.
+///
+/// Neither rule alone is good enough. Pure depth-first finds incumbents quickly —
+/// a child differs from its parent by one bound, so its LP re-solves in a few
+/// pivots — but it will happily spend an entire run inside one subtree while the
+/// global bound never moves. Pure best-bound moves the bound as fast as possible
+/// but wanders across the tree, warm-starting badly and finding incumbents late.
+///
+/// So: plunge for a bounded number of steps, then flush what is left of the dive
+/// into the pool and take the weakest-bounded node in it. That is what makes the
+/// reported gap close rather than just the incumbent improve.
+struct OpenNodes {
+    plunge: Vec<Node>,
+    pool: BinaryHeap<(Reverse<Key>, usize)>,
+    /// Nodes held out of the heap, indexed by the id stored alongside the key.
+    store: Vec<Option<Node>>,
+    steps: usize,
+    limit: usize,
+}
+
+impl OpenNodes {
+    fn new(limit: usize) -> Self {
+        Self {
+            plunge: Vec::new(),
+            pool: BinaryHeap::new(),
+            store: Vec::new(),
+            steps: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, node: Node) {
+        self.plunge.push(node);
+    }
+
+    /// Move the whole dive into the pool, ending the plunge.
+    fn flush(&mut self) {
+        while let Some(node) = self.plunge.pop() {
+            let key = Key {
+                bound: node.bound,
+                depth: node.fixings.len(),
+            };
+            let id = self.store.len();
+            self.store.push(Some(node));
+            self.pool.push((Reverse(key), id));
+        }
+        self.steps = 0;
+    }
+
+    fn pop(&mut self) -> Option<Node> {
+        if self.steps >= self.limit {
+            self.flush();
+        }
+        if let Some(node) = self.plunge.pop() {
+            self.steps += 1;
+            return Some(node);
+        }
+        self.steps = 0;
+        while let Some((_, id)) = self.pool.pop() {
+            if let Some(node) = self.store[id].take() {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.plunge.is_empty() && self.pool.iter().all(|&(_, id)| self.store[id].is_none())
+    }
+
+    /// The weakest bound among all open nodes, which is the search's global bound.
+    fn best_bound(&self) -> f64 {
+        let from_plunge = self
+            .plunge
+            .iter()
+            .map(|n| n.bound)
+            .fold(f64::INFINITY, f64::min);
+        let from_pool = self
+            .pool
+            .iter()
+            .filter(|&&(_, id)| self.store[id].is_some())
+            .map(|(Reverse(key), _)| key.bound)
+            .fold(f64::INFINITY, f64::min);
+        from_plunge.min(from_pool)
     }
 }
 
@@ -258,12 +386,13 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     }
 
     let root_bound = root.objective;
-    let mut stack: Vec<Node> = vec![Node {
+    let mut open = OpenNodes::new(options.plunge_limit);
+    open.push(Node {
         fixings: Vec::new(),
         bound: root_bound,
         basis: root.basis.clone(),
         origin: None,
-    }];
+    });
     let mut pseudocosts = Pseudocosts::new(n);
     let mut strong_budget = options.strong_branching_budget;
     let mut heuristic_solutions = 0usize;
@@ -310,15 +439,15 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     if let Some(x) = integral_solution(&root.x, options.integrality_tolerance) {
         incumbent = root.objective;
         incumbent_x = Some(x);
-        stack.clear();
+        open = OpenNodes::new(options.plunge_limit);
     }
 
     let mut status = Status::Optimal;
 
-    while let Some(node) = stack.pop() {
+    while let Some(node) = open.pop() {
         if nodes >= options.max_nodes {
             status = Status::NodeLimit;
-            stack.push(node);
+            open.push(node);
             break;
         }
         if options
@@ -326,7 +455,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             .is_some_and(|limit| started.elapsed() >= limit)
         {
             status = Status::TimeLimit;
-            stack.push(node);
+            open.push(node);
             break;
         }
         // The parent's bound may have been overtaken by an incumbent found since this
@@ -449,7 +578,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                 for v in children {
                     let mut fixings = node.fixings.clone();
                     fixings.push((decision.column as u32, v));
-                    stack.push(Node {
+                    open.push(Node {
                         fixings,
                         bound: solved.objective,
                         basis: solved.basis.clone(),
@@ -467,18 +596,14 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
     // The best bound is the weakest still-open node; with none left, the incumbent
     // is proven and the bound is the incumbent itself.
-    let open_bound = stack
-        .iter()
-        .map(|node| node.bound)
-        .fold(f64::INFINITY, f64::min);
-    let internal_bound = if stack.is_empty() {
+    let internal_bound = if open.is_empty() {
         if incumbent.is_finite() {
             incumbent
         } else {
             root_bound
         }
     } else {
-        open_bound.min(incumbent)
+        open.best_bound().min(incumbent)
     };
 
     let status = match (status, &incumbent_x) {
@@ -526,4 +651,105 @@ fn integral_solution(x: &[f64], tolerance: f64) -> Option<Vec<u8>> {
         out.push(rounded as u8);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lp::Lp;
+    use crate::model::{RowSense, Sense};
+    use crate::sparse::SparseMatrix;
+
+    fn node(bound: f64, depth: usize) -> Node {
+        // A node's basis is irrelevant to the ordering under test.
+        let lp = Lp::relaxation(&trivial());
+        Node {
+            fixings: (0..depth).map(|j| (j as u32, 0u8)).collect(),
+            bound,
+            basis: lp.solve().basis,
+            origin: None,
+        }
+    }
+
+    fn trivial() -> Problem {
+        Problem {
+            name: "t".into(),
+            sense: Sense::Minimize,
+            obj: vec![1.0],
+            obj_offset: 0.0,
+            matrix: SparseMatrix::from_triplets(1, 1, [(0, 0, 1.0)]),
+            row_lb: vec![RowSense::Ge.bounds(0.0).0],
+            row_ub: vec![RowSense::Ge.bounds(0.0).1],
+            col_lb: vec![0.0],
+            col_ub: vec![1.0],
+            col_names: vec!["x".into()],
+            row_names: vec!["c".into()],
+        }
+    }
+
+    #[test]
+    fn a_zero_plunge_limit_is_pure_best_bound() {
+        let mut open = OpenNodes::new(0);
+        for bound in [5.0, 1.0, 3.0] {
+            open.push(node(bound, 0));
+        }
+        // Weakest bound first, regardless of push order.
+        let order: Vec<f64> = std::iter::from_fn(|| open.pop().map(|n| n.bound)).collect();
+        assert_eq!(order, vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn plunging_takes_the_most_recent_node_first() {
+        let mut open = OpenNodes::new(10);
+        open.push(node(5.0, 0));
+        open.push(node(1.0, 0));
+        // Depth-first ignores the bound while the plunge lasts.
+        assert_eq!(open.pop().map(|n| n.bound), Some(1.0));
+        assert_eq!(open.pop().map(|n| n.bound), Some(5.0));
+    }
+
+    #[test]
+    fn the_plunge_ends_after_its_limit() {
+        let mut open = OpenNodes::new(2);
+        for bound in [9.0, 8.0, 1.0] {
+            open.push(node(bound, 0));
+        }
+        // Two depth-first steps, then a jump to the weakest remaining bound.
+        assert_eq!(open.pop().map(|n| n.bound), Some(1.0));
+        assert_eq!(open.pop().map(|n| n.bound), Some(8.0));
+        assert_eq!(open.pop().map(|n| n.bound), Some(9.0));
+    }
+
+    #[test]
+    fn ties_prefer_the_deeper_node() {
+        // Otherwise the pool fills with shallow work that never gets finished.
+        let mut open = OpenNodes::new(0);
+        open.push(node(2.0, 1));
+        open.push(node(2.0, 7));
+        assert_eq!(open.pop().map(|n| n.fixings.len()), Some(7));
+    }
+
+    #[test]
+    fn the_global_bound_is_the_weakest_open_node() {
+        let mut open = OpenNodes::new(0);
+        open.push(node(4.0, 0));
+        open.push(node(2.5, 0));
+        assert_eq!(open.best_bound(), 2.5);
+        // Once that node is taken, the bound rises to what is left.
+        open.pop();
+        assert_eq!(open.best_bound(), 4.0);
+        open.pop();
+        assert!(open.is_empty());
+        assert_eq!(open.best_bound(), f64::INFINITY);
+    }
+
+    #[test]
+    fn emptiness_accounts_for_nodes_already_taken() {
+        // Popping leaves a spent entry in the heap; it must not read as still open.
+        let mut open = OpenNodes::new(0);
+        open.push(node(1.0, 0));
+        open.pop();
+        assert!(open.is_empty());
+        assert!(open.pop().is_none());
+    }
 }

@@ -77,6 +77,28 @@ measurement said so: probing made every instance tried markedly worse, taking
 `v128c256n100` from 10 nodes to 917. Two explanations were tested and ruled out.
 See `branch.rs` for what is and is not yet known about why.
 
+## Node selection
+
+The open node set is a depth-first plunge stack plus a best-bound pool, and by
+default the plunge length is zero — the search is pure best-bound.
+
+That default was measured, not assumed. The textbook argument for plunging is that
+depth-first reaches incumbents sooner, and a child's LP re-solves in a few pivots
+from its parent's basis. But the primal heuristics already supply incumbents, so
+the plunge buys little and costs bound progress. Switching from pure depth-first:
+
+| instance | depth-first | best-bound |
+|---|---:|---:|
+| `v081c162n018` | 13570 nodes, 7.9s | 302 nodes, 0.5s |
+| `v081c162n009` | 20584 nodes, 12.7s | 1286 nodes, 1.6s |
+| `v064c200` | 17472 nodes, 14.8s | 2846 nodes, 2.9s |
+| `v064c1000n100` | 77% gap after 60s | solved in 14s |
+
+The trade is real, in two places. Best-bound finds incumbents later, so a run that
+hits its time limit reports a worse one — `mkp_500` ends at a 3% gap rather than 1%.
+And it holds every unexplored node in memory where plunging keeps the open set to
+roughly the tree depth, so `plunge_limit` is there to raise when that binds.
+
 ## The basis factorization
 
 The basis is held as a sparse LU with Markowitz pivoting, plus a product-form eta
