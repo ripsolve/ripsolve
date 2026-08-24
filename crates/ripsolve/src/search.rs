@@ -500,13 +500,14 @@ struct Shared {
     heuristic_hits: AtomicUsize,
     /// Set when a limit stops the search; read by every worker to wind down.
     stopped: AtomicUsize,
+    /// Nodes whose LP never resolved. Any of them could hold the optimum.
+    unresolved: AtomicUsize,
 }
 
 /// Reasons a parallel search stops early, encoded for the atomic.
 const STOP_NONE: usize = 0;
 const STOP_NODES: usize = 1;
 const STOP_TIME: usize = 2;
-const STOP_EXHAUSTED: usize = 3;
 
 impl Shared {
     fn incumbent(&self) -> f64 {
@@ -595,6 +596,7 @@ fn run_parallel(
         iterations: AtomicUsize::new(0),
         heuristic_hits: AtomicUsize::new(0),
         stopped: AtomicUsize::new(STOP_NONE),
+        unresolved: AtomicUsize::new(0),
     };
 
     std::thread::scope(|scope| {
@@ -631,7 +633,9 @@ fn run_parallel(
 
                     let outcome = worker.process(&node, best, index);
                     if outcome.exhausted {
-                        shared.stopped.store(STOP_EXHAUSTED, Ordering::Relaxed);
+                        // Skip the node and keep going; see the serial driver. The
+                        // count is what stops the search claiming optimality.
+                        shared.unresolved.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some((objective, x)) = outcome.incumbent
                         && shared.offer(objective, x)
@@ -653,7 +657,8 @@ fn run_parallel(
     let status = match shared.stopped.load(Ordering::Relaxed) {
         STOP_NODES => Status::NodeLimit,
         STOP_TIME => Status::TimeLimit,
-        STOP_EXHAUSTED => Status::NodeLimit,
+        // A tree that was exhausted apart from a skipped node proves nothing.
+        _ if shared.unresolved.load(Ordering::Relaxed) > 0 => Status::NodeLimit,
         _ => Status::Optimal,
     };
 
@@ -823,6 +828,8 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         origin: None,
     });
     let mut heuristic_solutions = 0usize;
+    // Nodes whose LP never resolved. Any of them could hold the optimum.
+    let mut unresolved = 0usize;
 
     // An incumbent before the first branch is worth more than one found later: the
     // search cannot prune anything until it holds one.
@@ -942,8 +949,13 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         nodes += 1;
         let outcome = worker.process(&node, incumbent, nodes);
         if outcome.exhausted {
-            status = Status::NodeLimit;
-            break;
+            // This node's LP ran out of iterations, so its subtree was never
+            // examined and nothing can be concluded about what is in it. That
+            // forfeits the *optimality claim*, but abandoning the whole search over
+            // it is far worse: on MIPLIB's pk1 the run stopped after four nodes with
+            // an incumbent of 35, where continuing reaches 21.
+            unresolved += 1;
+            continue;
         }
         heuristic_solutions += outcome.heuristic_hits;
         if let Some((objective, x)) = outcome.incumbent
@@ -971,6 +983,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     };
 
     let status = match (status, &incumbent_x) {
+        // A search that exhausted its tree but skipped a node has not proven
+        // anything, and must not say it has.
+        (Status::Optimal, _) if unresolved > 0 => Status::NodeLimit,
         (Status::Optimal, None) => Status::Infeasible,
         (other, _) => other,
     };

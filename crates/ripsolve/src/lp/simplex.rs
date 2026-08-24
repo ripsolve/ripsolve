@@ -834,21 +834,30 @@ impl<'a> Solver<'a> {
     }
 
     /// The most primal-infeasible basic variable, with the bound it violates.
-    fn most_infeasible_row(&self) -> Option<(usize, At)> {
+    ///
+    /// Under `bland` it returns the *first* infeasible row by basic variable index
+    /// instead of the worst, which is the leaving half of Bland's rule.
+    fn most_infeasible_row(&self, bland: bool) -> Option<(usize, At)> {
         let tol = self.lp.tol.primal_feasibility;
         let mut worst = tol;
-        let mut found = None;
+        let mut found: Option<(usize, At)> = None;
         for i in 0..self.lp.m {
             let j = self.basic[i];
             let v = self.z[j];
             let (below, above) = (self.lp.lower[j] - v, v - self.lp.upper[j]);
-            if below > worst {
-                worst = below;
-                found = Some((i, At::Lower));
+            let violation = below.max(above);
+            if violation <= tol {
+                continue;
             }
-            if above > worst {
-                worst = above;
-                found = Some((i, At::Upper));
+            let side = if below > above { At::Lower } else { At::Upper };
+            if bland {
+                // Lowest basic variable index wins, regardless of how bad it is.
+                if found.is_none_or(|(prev, _)| j < self.basic[prev]) {
+                    found = Some((i, side));
+                }
+            } else if violation > worst {
+                worst = violation;
+                found = Some((i, side));
             }
         }
         found
@@ -873,8 +882,16 @@ impl<'a> Solver<'a> {
         let tol = self.lp.tol.dual_feasibility;
         let pivot_tol = self.lp.tol.pivot;
         let mut rho: Vec<f64> = Vec::new();
+        // Degenerate steps in a row before switching to Bland's rule. The primal
+        // method has had this since it first cycled; the dual method had nothing,
+        // and since every warm start enters through the dual method, that is nearly
+        // every node in the search. MIPLIB's pk1 -- 86 columns -- burned 100,000
+        // iterations across four nodes before the caller gave up.
+        const STALL_LIMIT: usize = 100;
+        let mut stalled = 0usize;
 
         while *iterations < max_iterations {
+            let bland = stalled > STALL_LIMIT;
             if cutoff.is_some_and(|limit| self.objective() > limit) {
                 return Some(LpStatus::CutOff);
             }
@@ -888,7 +905,7 @@ impl<'a> Solver<'a> {
             self.basis.btran(&self.cost_b, &mut y);
             self.y = y;
 
-            let Some((r, violated)) = self.most_infeasible_row() else {
+            let Some((r, violated)) = self.most_infeasible_row(bland) else {
                 // Primal feasible and still dual feasible, so this is the optimum.
                 return Some(LpStatus::Optimal);
             };
@@ -933,7 +950,16 @@ impl<'a> Solver<'a> {
                 let d = self.reduced_cost(j, false);
                 let ratio = (d.abs() / arj.abs()).max(0.0);
                 let pivot = arj.abs();
-                if ratio < best_ratio - tol || (ratio <= best_ratio + tol && pivot > best_pivot) {
+                // Ties go to the largest pivot, which is numerically safest. Under
+                // Bland's they go to the lowest index instead: the rule only
+                // guarantees termination when it governs both choices, which is the
+                // same mistake that made strong branching cycle earlier.
+                let wins_tie = if bland {
+                    best.is_none_or(|(prev, _)| j < prev)
+                } else {
+                    pivot > best_pivot
+                };
+                if ratio < best_ratio - tol || (ratio <= best_ratio + tol && wins_tie) {
                     if ratio < best_ratio {
                         best_ratio = ratio;
                     }
@@ -970,6 +996,7 @@ impl<'a> Solver<'a> {
             // Move the entering variable exactly far enough to place the leaving one
             // on the bound it was violating.
             let step = (target - self.z[leaving]) / -self.alpha[r];
+            stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
             self.z[entering] += step;
             for i in 0..self.lp.m {
                 let bj = self.basic[i];
@@ -999,6 +1026,21 @@ impl<'a> Solver<'a> {
         // Cuts whose coefficients span more than this are numerically worthless and
         // actively harmful to the LPs that must then carry them.
         const MAX_DYNAMISM: f64 = 1e6;
+        // How many columns a cut may touch: a fraction of the model, but never
+        // fewer than a floor.
+        //
+        // GMI cuts come out far denser than the rows they are derived from -- on
+        // MIPLIB's pk1 the model's rows average 23% of the columns while its cuts
+        // reach 81%. A dense row destroys the sparsity the LU factorization depends
+        // on, so every later solve pays for it: pk1 went from 171k nodes without
+        // cuts to 24 with them, each node burning tens of thousands of iterations.
+        //
+        // The floor matters as much as the fraction. On a sixteen-column model no
+        // useful GMI cut is under 40% dense, and a pure fraction rejects every one
+        // of them -- while the LPs there are so cheap that a dense row costs nothing
+        // worth guarding against.
+        const MAX_DENSITY: f64 = 0.4;
+        const MIN_SUPPORT: usize = 30;
         const TINY: f64 = 1e-11;
 
         let lp = self.lp;
@@ -1134,7 +1176,9 @@ impl<'a> Solver<'a> {
                 .iter()
                 .map(|&(_, v)| v.abs())
                 .fold(f64::INFINITY, f64::min);
-            if largest / smallest > MAX_DYNAMISM || !rhs.is_finite() {
+            let allowed = MIN_SUPPORT.max((MAX_DENSITY * lp.n_structural as f64) as usize);
+            if largest / smallest > MAX_DYNAMISM || !rhs.is_finite() || coefficients.len() > allowed
+            {
                 continue;
             }
 
