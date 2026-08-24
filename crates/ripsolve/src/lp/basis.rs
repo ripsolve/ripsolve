@@ -1,45 +1,65 @@
-//! The basis inverse, and the two solves the simplex needs against it.
+//! The basis inverse, and the solves the simplex needs against it.
 //!
-//! Representation: a dense, explicitly maintained `B^-1`, updated in place by
-//! elementary row operations after each pivot and periodically recomputed from
-//! scratch to stop error accumulating.
+//! Representation: a sparse LU factorization (see [`crate::lp::lu`]) plus a
+//! *product form* update — an "eta file" of rank-one corrections, one per pivot,
+//! replayed on top of the factors. Periodically the etas are discarded and the
+//! basis refactorized, which both bounds the replay cost and stops error
+//! accumulating.
 //!
-//! That is deliberately the simplest thing that is *correct*. A production simplex
-//! keeps a sparse LU factorization with Forrest-Tomlin updates instead, which is
-//! both faster and numerically stronger. The point of this module's narrow surface
-//! — [`Basis::ftran`], [`Basis::btran`], [`Basis::update`], [`Basis::refactorize`]
-//! — is that the swap can happen later without the simplex driver noticing. Until
-//! the benchmarks demand it, an explicit inverse costs O(m^2) per iteration and is
-//! far easier to verify.
+//! # Why product form rather than Forrest-Tomlin
+//!
+//! Forrest-Tomlin updates the `U` factor in place and keeps the eta file shorter,
+//! which is what a mature solver does. Product form is a few lines by comparison
+//! and is what makes the correctness argument easy to see: after a pivot on row
+//! `r`, the new basis is `B_new = B_old E`, where `E` is the identity with column
+//! `r` replaced by `d = B_old^-1 a_q`. So `B_new^-1 = E^-1 B_old^-1`, and after `k`
+//! pivots `B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1`. FTRAN therefore applies the factors
+//! first and the etas in order; BTRAN applies the transposed etas in reverse and
+//! the factors last.
+//!
+//! The interface — [`Basis::ftran`], [`Basis::btran`], [`Basis::update`],
+//! [`Basis::refactorize`] — is unchanged from the dense explicit inverse this
+//! replaced, so Forrest-Tomlin can supersede product form later without the simplex
+//! driver noticing, exactly as this change did.
+
+use crate::lp::lu::{Lu, Singular};
 
 /// Why a refactorization could not produce a usable basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BasisError {
-    /// The basis matrix is singular even after pivoting; the caller must repair the
-    /// basis (typically by swapping the offending column for a logical) and retry.
+    /// The basis is singular at this position; the caller must repair it (typically
+    /// by swapping in a logical) and retry.
     Singular { row: usize },
 }
 
-/// A dense inverse of the current basis matrix.
-pub struct Basis {
-    m: usize,
-    /// `B^-1`, row-major, `m x m`.
-    inv: Vec<f64>,
-    /// Pivots applied since the last refactorization.
-    updates: usize,
+/// One product-form update: the transformed entering column and its pivot row.
+struct Eta {
+    row: usize,
+    pivot: f64,
+    /// The column's other nonzeros, `(row, value)` with `row != self.row`.
+    column: Vec<(usize, f64)>,
 }
 
+/// A factorized basis.
+pub struct Basis {
+    m: usize,
+    lu: Lu,
+    etas: Vec<Eta>,
+}
+
+/// Entries smaller than this are treated as structurally absent.
+const ZERO_TOL: f64 = 1e-12;
+
 impl Basis {
-    /// The inverse of the all-logical starting basis.
-    ///
-    /// Logical `i` enters the computational matrix as `-e_i`, so that basis is `-I`
-    /// and is its own inverse.
+    /// The all-logical starting basis, whose matrix is `-I`.
     pub fn all_logical(m: usize) -> Self {
-        let mut inv = vec![0.0; m * m];
-        for i in 0..m {
-            inv[i * m + i] = -1.0;
+        let columns: Vec<(Vec<usize>, Vec<f64>)> = (0..m).map(|i| (vec![i], vec![-1.0])).collect();
+        let lu = Lu::factor(m, &columns, ZERO_TOL).expect("-I is nonsingular");
+        Self {
+            m,
+            lu,
+            etas: Vec::new(),
         }
-        Self { m, inv, updates: 0 }
     }
 
     pub fn dimension(&self) -> usize {
@@ -48,160 +68,99 @@ impl Basis {
 
     /// Pivots applied since the last refactorization.
     pub fn updates(&self) -> usize {
-        self.updates
+        self.etas.len()
     }
 
-    fn row(&self, i: usize) -> &[f64] {
-        &self.inv[i * self.m..(i + 1) * self.m]
+    /// Nonzeros held in the factors, for diagnostics.
+    pub fn nnz(&self) -> usize {
+        self.lu.nnz() + self.etas.iter().map(|e| e.column.len() + 1).sum::<usize>()
     }
 
     /// FTRAN: solve `B d = a`, returning `d = B^-1 a`.
     pub fn ftran(&self, a: &[f64], out: &mut Vec<f64>) {
-        debug_assert_eq!(a.len(), self.m);
-        out.clear();
-        out.resize(self.m, 0.0);
-        for (i, slot) in out.iter_mut().enumerate() {
-            let row = &self.inv[i * self.m..(i + 1) * self.m];
-            // Skipping zeros pays off because entering columns are typically sparse.
-            *slot = a
-                .iter()
-                .zip(row)
-                .filter(|(v, _)| **v != 0.0)
-                .map(|(v, r)| r * v)
-                .sum();
+        self.lu.ftran(a, out);
+        for eta in &self.etas {
+            // v_r <- v_r / pivot, then v_i <- v_i - d_i * v_r.
+            let scaled = out[eta.row] / eta.pivot;
+            out[eta.row] = scaled;
+            if scaled != 0.0 {
+                for &(i, v) in &eta.column {
+                    out[i] -= v * scaled;
+                }
+            }
         }
     }
 
     /// BTRAN: solve `B' y = c`, returning `y' = c' B^-1`.
     pub fn btran(&self, c: &[f64], out: &mut Vec<f64>) {
-        debug_assert_eq!(c.len(), self.m);
         out.clear();
-        out.resize(self.m, 0.0);
-        // y_k = sum_i c_i * inv[i][k]; skipping zero c_i matters because in phase 1
-        // the cost vector is mostly zeros.
-        for (i, &ci) in c.iter().enumerate() {
-            if ci == 0.0 {
-                continue;
+        out.extend_from_slice(c);
+        // Transposed etas, newest first: only the pivot row's entry changes.
+        for eta in self.etas.iter().rev() {
+            let mut acc = out[eta.row];
+            for &(i, v) in &eta.column {
+                acc -= v * out[i];
             }
-            let row = self.row(i);
-            for k in 0..self.m {
-                out[k] += ci * row[k];
-            }
+            out[eta.row] = acc / eta.pivot;
         }
+        let mut work = std::mem::take(out);
+        self.lu.btran(&work, out);
+        work.clear();
     }
 
     /// BTRAN against a unit vector: row `r` of `B^-1`.
     ///
-    /// The dual simplex needs this to price a whole pivot row at once. With an
-    /// explicit inverse it is a row copy; behind an LU factorization it would be a
-    /// btran of `e_r`, which is why it lives here rather than being read off the
+    /// The dual simplex prices a whole pivot row at once and needs this. With an
+    /// explicit inverse it was a row copy; here it is an ordinary BTRAN, which is
+    /// why it belongs behind the interface rather than being read off the
     /// representation by the caller.
     pub fn btran_unit(&self, r: usize, out: &mut Vec<f64>) {
-        out.clear();
-        out.extend_from_slice(self.row(r));
+        let mut unit = vec![0.0; self.m];
+        unit[r] = 1.0;
+        self.btran(&unit, out);
     }
 
-    /// Apply the rank-one update for a pivot on row `r`, where `d = B^-1 a_q` was
-    /// computed for the entering column `a_q`.
+    /// Record a pivot on row `r`, where `d = B^-1 a_q` for the entering column.
     ///
-    /// `d[r]` is the pivot element; the caller is responsible for having rejected a
-    /// pivot too small to be safe.
+    /// The caller is responsible for having rejected a pivot too small to be safe.
     pub fn update(&mut self, d: &[f64], r: usize) {
         debug_assert_eq!(d.len(), self.m);
-        let m = self.m;
-        if m == 0 {
+        if self.m == 0 {
             return;
         }
         let pivot = d[r];
         debug_assert!(pivot != 0.0, "pivot on a zero element");
-
-        let scale = 1.0 / pivot;
-        for v in &mut self.inv[r * m..(r + 1) * m] {
-            *v *= scale;
-        }
-        // Copied once, outside the loop: it aliases the mutable row borrow below, and
-        // hoisting it turns m allocations per pivot into one.
-        let pivot_row: Vec<f64> = self.row(r).to_vec();
-        for (i, (&factor, row)) in d.iter().zip(self.inv.chunks_exact_mut(m)).enumerate() {
-            if i == r || factor == 0.0 {
-                continue;
-            }
-            for (target, p) in row.iter_mut().zip(&pivot_row) {
-                *target -= factor * p;
-            }
-        }
-        self.updates += 1;
+        let column = d
+            .iter()
+            .enumerate()
+            .filter(|&(i, &v)| i != r && v.abs() > ZERO_TOL)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        self.etas.push(Eta {
+            row: r,
+            pivot,
+            column,
+        });
     }
 
-    /// Recompute `B^-1` from scratch by Gauss-Jordan elimination with partial
-    /// pivoting, given the basis columns as dense vectors.
-    ///
-    /// Returns the row whose pivot was unusable if the basis is singular, so the
-    /// caller can repair that position and try again.
-    pub fn refactorize(&mut self, columns: &[Vec<f64>], pivot_tol: f64) -> Result<(), BasisError> {
-        let m = self.m;
-        debug_assert_eq!(columns.len(), m);
-        // A model with no rows has an empty basis, which is already its own inverse.
-        if m == 0 {
-            self.updates = 0;
+    /// Refactorize from the basis columns, given as `(rows, values)` pairs.
+    pub fn refactorize(
+        &mut self,
+        columns: &[(Vec<usize>, Vec<f64>)],
+        _pivot_tol: f64,
+    ) -> Result<(), BasisError> {
+        if self.m == 0 {
+            self.etas.clear();
             return Ok(());
         }
-
-        // Work on [B | I] and reduce the left half to the identity.
-        let mut work = vec![0.0f64; m * 2 * m];
-        for (j, col) in columns.iter().enumerate() {
-            debug_assert_eq!(col.len(), m);
-            for i in 0..m {
-                work[i * 2 * m + j] = col[i];
+        match Lu::factor(self.m, columns, ZERO_TOL) {
+            Ok(lu) => {
+                self.lu = lu;
+                self.etas.clear();
+                Ok(())
             }
+            Err(Singular { position }) => Err(BasisError::Singular { row: position }),
         }
-        for i in 0..m {
-            work[i * 2 * m + m + i] = 1.0;
-        }
-
-        for c in 0..m {
-            let (mut best, mut best_val) = (c, work[c * 2 * m + c].abs());
-            for r in c + 1..m {
-                let v = work[r * 2 * m + c].abs();
-                if v > best_val {
-                    best = r;
-                    best_val = v;
-                }
-            }
-            if best_val <= pivot_tol {
-                return Err(BasisError::Singular { row: c });
-            }
-            if best != c {
-                for k in 0..2 * m {
-                    work.swap(c * 2 * m + k, best * 2 * m + k);
-                }
-            }
-            let pivot = work[c * 2 * m + c];
-            let scale = 1.0 / pivot;
-            for k in 0..2 * m {
-                work[c * 2 * m + k] *= scale;
-            }
-            for r in 0..m {
-                if r == c {
-                    continue;
-                }
-                let factor = work[r * 2 * m + c];
-                if factor == 0.0 {
-                    continue;
-                }
-                for k in 0..2 * m {
-                    work[r * 2 * m + k] -= factor * work[c * 2 * m + k];
-                }
-            }
-        }
-
-        // Copy the reduced right half of [B | I], which is now B^-1.
-        for (i, row) in self.inv.chunks_exact_mut(m).enumerate() {
-            let start = i * 2 * m + m;
-            row.copy_from_slice(&work[start..start + m]);
-        }
-        self.updates = 0;
-        Ok(())
     }
 }
 
@@ -209,19 +168,32 @@ impl Basis {
 mod tests {
     use super::*;
 
-    fn dense_identity_check(basis: &Basis, columns: &[Vec<f64>]) {
-        // B^-1 B must be the identity.
+    fn sparse(m: usize, dense: &[Vec<f64>]) -> Vec<(Vec<usize>, Vec<f64>)> {
+        dense
+            .iter()
+            .map(|col| {
+                let mut rows = Vec::new();
+                let mut vals = Vec::new();
+                for (i, &v) in col.iter().enumerate().take(m) {
+                    if v != 0.0 {
+                        rows.push(i);
+                        vals.push(v);
+                    }
+                }
+                (rows, vals)
+            })
+            .collect()
+    }
+
+    /// `B^-1 B` must be the identity, checked column by column.
+    fn assert_inverts(basis: &Basis, dense: &[Vec<f64>]) {
         let m = basis.dimension();
         let mut out = Vec::new();
-        for (j, col) in columns.iter().enumerate() {
+        for (j, col) in dense.iter().enumerate() {
             basis.ftran(col, &mut out);
-            assert_eq!(out.len(), m);
-            for (i, &got) in out.iter().enumerate() {
+            for (i, &got) in out.iter().enumerate().take(m) {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (got - expected).abs() < 1e-9,
-                    "B^-1 B [{i}][{j}] = {got}, expected {expected}"
-                );
+                assert!((got - expected).abs() < 1e-9, "B^-1 B [{i}][{j}] = {got}");
             }
         }
     }
@@ -238,46 +210,37 @@ mod tests {
 
     #[test]
     fn refactorize_inverts() {
-        let columns = vec![
+        let dense = vec![
             vec![2.0, 1.0, 1.0],
             vec![1.0, 3.0, 2.0],
             vec![1.0, 0.0, 4.0],
         ];
         let mut b = Basis::all_logical(3);
-        b.refactorize(&columns, 1e-9).unwrap();
-        dense_identity_check(&b, &columns);
+        b.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        assert_inverts(&b, &dense);
         assert_eq!(b.updates(), 0);
     }
 
     #[test]
     fn refactorize_reports_a_singular_basis() {
-        // Third column is the sum of the first two.
-        let columns = vec![
+        let dense = vec![
             vec![1.0, 0.0, 1.0],
             vec![0.0, 1.0, 1.0],
             vec![1.0, 1.0, 2.0],
         ];
         let mut b = Basis::all_logical(3);
         assert!(matches!(
-            b.refactorize(&columns, 1e-9),
+            b.refactorize(&sparse(3, &dense), 1e-9),
             Err(BasisError::Singular { .. })
         ));
     }
 
     #[test]
-    fn refactorize_pivots_around_a_zero_leading_entry() {
-        // Needs a row swap: the (0,0) entry is zero but the matrix is nonsingular.
-        let columns = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
-        let mut b = Basis::all_logical(2);
-        b.refactorize(&columns, 1e-9).unwrap();
-        dense_identity_check(&b, &columns);
-    }
-
-    #[test]
     fn update_matches_a_refactorization_of_the_same_basis() {
-        // Replacing basis column 1 by `entering` must give the same inverse whether
-        // reached by a rank-one update or by inverting the new basis outright.
-        let mut columns = vec![
+        // Replacing a basis column must give the same inverse whether reached by a
+        // product-form update or by refactorizing the new basis outright. This is
+        // the property the whole eta file rests on.
+        let mut dense = vec![
             vec![2.0, 1.0, 1.0],
             vec![1.0, 3.0, 2.0],
             vec![1.0, 0.0, 4.0],
@@ -285,33 +248,67 @@ mod tests {
         let entering = vec![3.0, -1.0, 2.0];
 
         let mut updated = Basis::all_logical(3);
-        updated.refactorize(&columns, 1e-9).unwrap();
+        updated.refactorize(&sparse(3, &dense), 1e-9).unwrap();
         let mut d = Vec::new();
         updated.ftran(&entering, &mut d);
         updated.update(&d, 1);
 
-        columns[1] = entering;
-        let mut fresh = Basis::all_logical(3);
-        fresh.refactorize(&columns, 1e-9).unwrap();
-
-        for (a, b) in updated.inv.iter().zip(&fresh.inv) {
-            assert!((a - b).abs() < 1e-9, "{a} vs {b}");
-        }
-        dense_identity_check(&updated, &columns);
+        dense[1] = entering;
+        assert_inverts(&updated, &dense);
         assert_eq!(updated.updates(), 1);
+
+        let mut fresh = Basis::all_logical(3);
+        fresh.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        let probe = [1.0, -2.0, 0.5];
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        updated.ftran(&probe, &mut a);
+        fresh.ftran(&probe, &mut b);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-9, "{x} vs {y}");
+        }
+        updated.btran(&probe, &mut a);
+        fresh.btran(&probe, &mut b);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-9, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn many_updates_stay_consistent() {
+        // The eta file must remain correct as it grows, not just for one pivot.
+        let mut dense = vec![
+            vec![4.0, 1.0, 0.0, 1.0],
+            vec![1.0, 3.0, 1.0, 0.0],
+            vec![0.0, 1.0, 5.0, 1.0],
+            vec![1.0, 0.0, 1.0, 2.0],
+        ];
+        let mut basis = Basis::all_logical(4);
+        basis.refactorize(&sparse(4, &dense), 1e-9).unwrap();
+
+        for (step, replacement) in [
+            (0usize, vec![1.0, 2.0, 0.0, 1.0]),
+            (2, vec![0.0, 1.0, 3.0, 1.0]),
+            (1, vec![2.0, 0.0, 1.0, 1.0]),
+            (3, vec![1.0, 1.0, 1.0, 4.0]),
+        ] {
+            let mut d = Vec::new();
+            basis.ftran(&replacement, &mut d);
+            basis.update(&d, step);
+            dense[step] = replacement;
+            assert_inverts(&basis, &dense);
+        }
+        assert_eq!(basis.updates(), 4);
     }
 
     #[test]
     fn btran_unit_is_a_row_of_the_inverse() {
-        let columns = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let dense = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
         let mut b = Basis::all_logical(2);
-        b.refactorize(&columns, 1e-9).unwrap();
-
+        b.refactorize(&sparse(2, &dense), 1e-9).unwrap();
         for r in 0..2 {
             let mut rho = Vec::new();
             b.btran_unit(r, &mut rho);
-            // rho' B must be e_r'.
-            for (j, col) in columns.iter().enumerate() {
+            for (j, col) in dense.iter().enumerate() {
                 let dot: f64 = rho.iter().zip(col).map(|(a, b)| a * b).sum();
                 let expected = if j == r { 1.0 } else { 0.0 };
                 assert!((dot - expected).abs() < 1e-9, "row {r}, column {j}: {dot}");
@@ -320,18 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn btran_solves_the_transposed_system() {
-        let columns = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
-        let mut b = Basis::all_logical(2);
-        b.refactorize(&columns, 1e-9).unwrap();
-
-        let c = [5.0, 7.0];
-        let mut y = Vec::new();
-        b.btran(&c, &mut y);
-        // y' B == c'
-        for (j, col) in columns.iter().enumerate() {
-            let dot: f64 = y.iter().zip(col).map(|(a, b)| a * b).sum();
-            assert!((dot - c[j]).abs() < 1e-9, "column {j}: {dot} vs {}", c[j]);
-        }
+    fn a_zero_row_basis_is_handled() {
+        // A model with no rows has an empty basis; nothing here may panic on it.
+        let mut b = Basis::all_logical(0);
+        assert!(b.refactorize(&[], 1e-9).is_ok());
+        let mut out = Vec::new();
+        b.ftran(&[], &mut out);
+        assert!(out.is_empty());
+        b.update(&[], 0);
+        assert_eq!(b.updates(), 0);
     }
 }

@@ -184,6 +184,19 @@ impl Lp {
         self.n_structural + self.m
     }
 
+    /// Column `j` of `[A | -I]` as `(rows, values)`.
+    ///
+    /// Refactorization wants the sparsity, not a dense scatter — the whole point of
+    /// the LU is to touch only the nonzeros.
+    fn column_sparse(&self, j: usize) -> (Vec<usize>, Vec<f64>) {
+        if j < self.n_structural {
+            let (rows, vals) = self.matrix.column(j);
+            (rows.to_vec(), vals.to_vec())
+        } else {
+            (vec![j - self.n_structural], vec![-1.0])
+        }
+    }
+
     /// Scatter column `j` of `[A | -I]` into a dense buffer of length `m`.
     fn column_into(&self, j: usize, out: &mut [f64]) {
         out.fill(0.0);
@@ -595,15 +608,8 @@ impl<'a> Solver<'a> {
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
         for _ in 0..lp.m + 1 {
-            let columns: Vec<Vec<f64>> = self
-                .basic
-                .iter()
-                .map(|&j| {
-                    let mut c = vec![0.0; lp.m];
-                    lp.column_into(j, &mut c);
-                    c
-                })
-                .collect();
+            let columns: Vec<(Vec<usize>, Vec<f64>)> =
+                self.basic.iter().map(|&j| lp.column_sparse(j)).collect();
             match self.basis.refactorize(&columns, lp.tol.pivot) {
                 Ok(()) => {
                     self.recompute_basic_values();

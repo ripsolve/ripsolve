@@ -10,8 +10,8 @@ variable is binary; general integer and continuous variables are out of scope.
 Status: **early, but solving**. The model layer, LP/MPS readers, instance
 generator, test oracle, LP relaxation solver, presolve, lifted knapsack cover
 cuts, pseudocost branching, and a depth-first branch-and-bound search are in place.
-Primal heuristics are not, and neither is a sparse LU factorization — which the
-measurements now say is the binding constraint on larger models.
+The basis is factorized sparsely. Primal heuristics are the main thing still
+missing.
 
 Both the relaxation and the integer optimum are checked against an independent
 solver on every bundled sample and generated instance.
@@ -69,6 +69,29 @@ Strong branching is implemented alongside it and is **off by default**, because
 measurement said so: probing made every instance tried markedly worse, taking
 `v128c256n100` from 10 nodes to 917. Two explanations were tested and ruled out.
 See `branch.rs` for what is and is not yet known about why.
+
+## The basis factorization
+
+The basis is held as a sparse LU with Markowitz pivoting, plus a product-form eta
+file for the per-pivot updates. It replaced a dense explicit inverse, which cost
+`O(m^2)` per solve and `O(m^3)` to rebuild — at `m = 1000` that was 0.2 seconds per
+branch-and-bound node.
+
+On the 1000-row models, in a fixed 100-second budget:
+
+| | dense inverse | sparse LU |
+|---|---:|---:|
+| `v064c1000n100` nodes | 1,370 | 13,451 |
+| `v064c1000n100` simplex iterations | 6,594 | 49,245 |
+| `v064c1000n100` remaining gap | 93.7% | 51.6% |
+| `v064c1000n020` simplex iterations | 10,486 | 59,926 |
+
+That is roughly 7.5x the simplex throughput, which narrows the per-iteration gap
+against Gurobi on these models from about 53x to about 9x. Smaller models gain
+between 1.2x and 2.4x in wall clock.
+
+Forrest-Tomlin updates would shorten the eta file further and are the natural next
+step; the `Basis` interface was built so that swap needs no change to the simplex.
 
 ## Layout
 
