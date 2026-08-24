@@ -83,8 +83,6 @@ pub enum ReadError {
     UnknownFormat(String),
     #[error("the model has no objective function")]
     NoObjective,
-    #[error("the model has {0} objectives; ripsolve supports exactly one")]
-    MultipleObjectives(usize),
     #[error("variable {0:?} is {1}, which ripsolve does not support")]
     UnsupportedVariable(String, String),
     #[error("integer variable {0:?} has the fractional bound {1}")]
@@ -148,9 +146,12 @@ impl Problem {
         lp: &LpProblem,
         integral: &HashSet<String>,
     ) -> Result<Problem, ReadError> {
-        if lp.objectives.len() > 1 {
-            return Err(ReadError::MultipleObjectives(lp.objectives.len()));
-        }
+        // MPS marks the objective as a free row, and files routinely carry more than
+        // one: the first is the objective and the rest are free rows kept for other
+        // purposes. Every mainstream solver takes the first and ignores the others,
+        // and MIPLIB instances rely on it, so rejecting the file would be a reader
+        // limitation rather than a real restriction. Both formats preserve source
+        // order, so "first" is well defined.
         let objective = lp
             .objectives
             .values()
