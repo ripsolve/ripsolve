@@ -163,12 +163,20 @@ fn cuts_do_not_change_any_optimum() {
             (None, None) => {}
             (a, b) => panic!("{file}: cuts {a:?}, plain {b:?}"),
         }
-        // Cuts can only tighten the root relaxation, never weaken it.
-        assert!(
-            with.root_bound_after_cuts >= with.root_bound - 1e-6,
-            "{file}: root bound fell from {} to {}",
-            with.root_bound,
-            with.root_bound_after_cuts
-        );
+        // Cuts can only tighten the root relaxation, never weaken it. "Tighter"
+        // means closer to the optimum, which is a *higher* bound when minimizing and
+        // a *lower* one when maximizing -- so the direction-free statement is that
+        // the gap to the optimum must not widen.
+        if let Some(optimum) = with.objective {
+            let gap_before = (optimum - with.root_bound).abs();
+            let gap_after = (optimum - with.root_bound_after_cuts).abs();
+            assert!(
+                gap_after <= gap_before + 1e-6,
+                "{file}: cuts widened the root gap from {gap_before} to {gap_after} \
+                 (bound {} -> {}, optimum {optimum})",
+                with.root_bound,
+                with.root_bound_after_cuts
+            );
+        }
     }
 }
