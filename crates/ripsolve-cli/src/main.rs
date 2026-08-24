@@ -178,6 +178,7 @@ fn main() -> Result<()> {
                     solution.cuts_added, solution.root_bound, solution.root_bound_after_cuts
                 );
             }
+            println!("heuristic: {} incumbents", solution.heuristic_solutions);
             println!(
                 "{} nodes, {} simplex iterations, {elapsed:.3?}",
                 solution.nodes, solution.simplex_iterations

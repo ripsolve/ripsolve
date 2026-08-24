@@ -10,8 +10,7 @@ variable is binary; general integer and continuous variables are out of scope.
 Status: **early, but solving**. The model layer, LP/MPS readers, instance
 generator, test oracle, LP relaxation solver, presolve, lifted knapsack cover
 cuts, pseudocost branching, and a depth-first branch-and-bound search are in place.
-The basis is factorized sparsely. Primal heuristics are the main thing still
-missing.
+The basis is factorized sparsely, and primal heuristics supply early incumbents.
 
 Both the relaxation and the integer optimum are checked against an independent
 solver on every bundled sample and generated instance.
@@ -92,6 +91,26 @@ between 1.2x and 2.4x in wall clock.
 
 Forrest-Tomlin updates would shorten the eta file further and are the natural next
 step; the `Basis` interface was built so that swap needs no change to the simplex.
+
+## Primal heuristics
+
+Branch and bound cannot prune anything until it holds a feasible solution, so
+finding one early matters independently of the bound. Three are tried, cheapest
+first: rounding the relaxation, diving, and a feasibility pump.
+
+Diving turned out to be the wrong tool for this instance family and **fails on
+every model in it**. It commits to a rounding and re-solves a smaller LP each step,
+so where the feasible set is sparse it walks into infeasibility with no way back —
+adding a one-level backtrack was not enough to save it. The feasibility pump never
+fixes anything, alternating instead between rounding and re-optimizing the original
+constraint set under a distance objective, so its LP stays feasible throughout. It
+finds solutions on five of the six models where diving finds none.
+
+The solutions are poor — 2791 against an optimum of 137 on `v064c064` — but an
+incumbent of any quality switches pruning on. `v064c200` drops from 9916 nodes and
+5.7s to 3388 nodes and 2.25s. Where the search was already finding incumbents
+quickly the heuristics only cost time, and `v064c1000n020` remains unsolved with no
+feasible point found by anything, Gurobi included.
 
 ## Layout
 

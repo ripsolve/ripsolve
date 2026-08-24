@@ -7,6 +7,7 @@
 pub mod branch;
 pub mod cuts;
 pub mod generate;
+pub mod heuristic;
 pub mod lp;
 pub mod model;
 pub mod presolve;

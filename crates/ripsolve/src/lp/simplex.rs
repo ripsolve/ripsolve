@@ -171,6 +171,21 @@ impl Lp {
         self.upper[j] = hi;
     }
 
+    /// Replace the structural objective coefficients.
+    ///
+    /// The feasibility pump repeatedly re-optimizes the same constraint set under a
+    /// distance objective, so it needs to swap the costs without rebuilding the LP.
+    /// Logical columns keep their zero cost.
+    pub fn set_costs(&mut self, costs: &[f64]) {
+        debug_assert_eq!(costs.len(), self.n_structural);
+        self.cost[..self.n_structural].copy_from_slice(costs);
+    }
+
+    /// The structural objective coefficients, for saving and restoring.
+    pub fn costs(&self) -> &[f64] {
+        &self.cost[..self.n_structural]
+    }
+
     /// The current bounds of a structural column.
     pub fn column_bounds(&self, j: usize) -> (f64, f64) {
         (self.lower[j], self.upper[j])

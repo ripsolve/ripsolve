@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::branch::{self, Pseudocosts};
 use crate::cuts;
+use crate::heuristic::{self, Limits};
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
 use crate::presolve::{self, Outcome};
@@ -50,6 +51,11 @@ pub struct Options {
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
+    /// Run primal heuristics at the root, and every `heuristic_frequency` nodes.
+    /// Zero disables them.
+    pub heuristic_frequency: usize,
+    /// Limits on the heuristics themselves.
+    pub heuristic_limits: Limits,
     /// Total strong-branching probes allowed across the whole search.
     ///
     /// Defaults to zero — strong branching is implemented but **off**, because on
@@ -73,6 +79,8 @@ impl Default for Options {
             // measured; a larger budget finds no more cuts and only costs time.
             cut_rounds: 3,
             cuts_per_round: 32,
+            heuristic_frequency: 100,
+            heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
         }
     }
@@ -94,6 +102,8 @@ pub struct Solution {
     pub presolve: Option<presolve::Stats>,
     /// Cuts added at the root.
     pub cuts_added: usize,
+    /// Incumbents found by a primal heuristic rather than by the search itself.
+    pub heuristic_solutions: usize,
     /// The root relaxation before any cuts, in the user's original sense.
     pub root_bound: f64,
     /// The root relaxation after cutting, in the user's original sense.
@@ -152,6 +162,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     simplex_iterations: 0,
                     presolve: None,
                     cuts_added: 0,
+                    heuristic_solutions: 0,
                     root_bound: f64::NAN,
                     root_bound_after_cuts: f64::NAN,
                 };
@@ -192,6 +203,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             simplex_iterations: iterations,
             presolve: presolve_stats,
             cuts_added: 0,
+            heuristic_solutions: 0,
             root_bound: f64::NAN,
             root_bound_after_cuts: f64::NAN,
         };
@@ -244,6 +256,44 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     }];
     let mut pseudocosts = Pseudocosts::new(n);
     let mut strong_budget = options.strong_branching_budget;
+    let mut heuristic_solutions = 0usize;
+
+    // An incumbent before the first branch is worth more than one found later: the
+    // search cannot prune anything until it holds one.
+    if options.heuristic_frequency > 0 && root.status == LpStatus::Optimal {
+        // Cheapest first. Rounding costs no LP at all; diving costs a short chain of
+        // them; the pump costs the most but is the only one that reliably finds
+        // anything on models whose feasible set is sparse.
+        let found = heuristic::round(problem, &root.x, &options.heuristic_limits)
+            .or_else(|| {
+                heuristic::dive(
+                    problem,
+                    &mut lp,
+                    &root.basis,
+                    &root.x,
+                    None,
+                    &options.heuristic_limits,
+                    &mut iterations,
+                )
+            })
+            .or_else(|| {
+                heuristic::feasibility_pump(
+                    problem,
+                    &mut lp,
+                    &root.basis,
+                    &root.x,
+                    &options.heuristic_limits,
+                    &mut iterations,
+                )
+            });
+        if let Some(found) = found
+            && found.objective < incumbent
+        {
+            incumbent = found.objective;
+            incumbent_x = Some(found.x);
+            heuristic_solutions += 1;
+        }
+    }
 
     // Consider the root itself first, so an integral relaxation is picked up without
     // a branching step.
@@ -318,6 +368,32 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
         if !improves(solved.objective, incumbent, options.gap_tolerance) {
             continue;
+        }
+
+        // Dive from this node every so often. Nodes deep in the tree already have
+        // many columns fixed, so a dive from one is short and often lands somewhere
+        // the search would take a long time to reach.
+        if options.heuristic_frequency > 0
+            && nodes.is_multiple_of(options.heuristic_frequency)
+            && integral_solution(&solved.x, options.integrality_tolerance).is_none()
+        {
+            let cutoff = incumbent.is_finite().then_some(incumbent);
+            let found = heuristic::dive(
+                problem,
+                &mut lp,
+                &solved.basis,
+                &solved.x,
+                cutoff,
+                &options.heuristic_limits,
+                &mut iterations,
+            );
+            if let Some(found) = found
+                && found.objective < incumbent
+            {
+                incumbent = found.objective;
+                incumbent_x = Some(found.x);
+                heuristic_solutions += 1;
+            }
         }
 
         match integral_solution(&solved.x, options.integrality_tolerance) {
@@ -411,6 +487,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         simplex_iterations: iterations,
         presolve: presolve_stats,
         cuts_added,
+        heuristic_solutions,
         root_bound: problem.objective_value(first_bound),
         root_bound_after_cuts: problem.objective_value(root_bound),
     }
