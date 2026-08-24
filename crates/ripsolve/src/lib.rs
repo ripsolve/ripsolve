@@ -4,6 +4,7 @@
 //! ordinary bounded continuous LPs, but the model exposed here is pure BIP: see
 //! [`Problem`], which rejects anything else at construction.
 
+pub mod branch;
 pub mod cuts;
 pub mod generate;
 pub mod lp;

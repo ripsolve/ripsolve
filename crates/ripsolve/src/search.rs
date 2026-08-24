@@ -14,6 +14,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::branch::{self, Pseudocosts};
 use crate::cuts;
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
@@ -49,6 +50,14 @@ pub struct Options {
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
+    /// Total strong-branching probes allowed across the whole search.
+    ///
+    /// Defaults to zero — strong branching is implemented but **off**, because on
+    /// every instance measured it made the search substantially worse, not better:
+    /// v081c162n018 goes from 3828 nodes to 23686, and v128c256n100 from 10 to 917.
+    /// Pure pseudocost scoring is the better default here. See the module docs on
+    /// why the probes are suspected to be uninformative on these instances.
+    pub strong_branching_budget: usize,
 }
 
 impl Default for Options {
@@ -64,6 +73,7 @@ impl Default for Options {
             // measured; a larger budget finds no more cuts and only costs time.
             cut_rounds: 3,
             cuts_per_round: 32,
+            strong_branching_budget: 0,
         }
     }
 }
@@ -114,6 +124,10 @@ struct Node {
     bound: f64,
     /// The parent's final basis, to warm start from.
     basis: BasisState,
+    /// The branch that created this node: `(column, went_up, parent objective,
+    /// parent fractional value)`. Recorded so that solving this node measures the
+    /// real cost of that branching decision and feeds it back.
+    origin: Option<(usize, bool, f64, f64)>,
 }
 
 /// Solve a binary integer program to proven optimality.
@@ -226,7 +240,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         fixings: Vec::new(),
         bound: root_bound,
         basis: root.basis.clone(),
+        origin: None,
     }];
+    let mut pseudocosts = Pseudocosts::new(n);
+    let mut strong_budget = options.strong_branching_budget;
 
     // Consider the root itself first, so an integral relaxation is picked up without
     // a branching step.
@@ -276,6 +293,16 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         iterations += solved.iterations;
         nodes += 1;
 
+        // Whatever this node's LP turned out to be, it is the measured consequence
+        // of the branch that created it; feed that back before doing anything else.
+        if let Some((column, up, parent_objective, fraction)) = node.origin
+            && solved.status == LpStatus::Optimal
+        {
+            let step = if up { 1.0 - fraction } else { fraction };
+            let degradation = (solved.objective - parent_objective).max(0.0);
+            pseudocosts.record(column, up, degradation, step);
+        }
+
         match solved.status {
             LpStatus::Infeasible | LpStatus::CutOff => continue,
             LpStatus::Unbounded => {
@@ -299,23 +326,53 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                 incumbent_x = Some(x);
             }
             None => {
-                let Some(branch) = most_fractional(&solved.x, options.integrality_tolerance) else {
+                let decision = branch::select(
+                    &mut lp,
+                    &solved.basis,
+                    &solved.x,
+                    solved.objective,
+                    &mut pseudocosts,
+                    options.integrality_tolerance,
+                    &mut strong_budget,
+                    &mut iterations,
+                );
+                let Some(decision) = decision else { continue };
+                // Strong branching can prove a node has no feasible completion at
+                // all, which prunes it outright.
+                if decision.dead {
                     continue;
-                };
-                let value = solved.x[branch];
+                }
 
-                // Push both children; the stack pops last-in first, so the branch
-                // nearer the relaxation's own value is pushed last and explored first.
-                // Diving towards it tends to reach a feasible incumbent sooner, which
-                // in turn makes the bound prune harder.
-                let (first, second) = if value > 0.5 { (0u8, 1u8) } else { (1u8, 0u8) };
-                for v in [first, second] {
+                // A probe that proved one side infeasible decides the column outright,
+                // so descend into the single surviving child instead of branching.
+                let children: Vec<u8> = match decision.forced {
+                    Some(value) => vec![value],
+                    None => {
+                        // The stack pops last-in first, so the side nearer the
+                        // relaxation's own value is pushed last and explored first.
+                        // Diving towards it reaches a feasible incumbent sooner,
+                        // which makes the bound prune harder.
+                        if decision.fraction > 0.5 {
+                            vec![0, 1]
+                        } else {
+                            vec![1, 0]
+                        }
+                    }
+                };
+
+                for v in children {
                     let mut fixings = node.fixings.clone();
-                    fixings.push((branch as u32, v));
+                    fixings.push((decision.column as u32, v));
                     stack.push(Node {
                         fixings,
                         bound: solved.objective,
                         basis: solved.basis.clone(),
+                        origin: Some((
+                            decision.column,
+                            v == 1,
+                            solved.objective,
+                            decision.fraction,
+                        )),
                     });
                 }
             }
@@ -382,18 +439,4 @@ fn integral_solution(x: &[f64], tolerance: f64) -> Option<Vec<u8>> {
         out.push(rounded as u8);
     }
     Some(out)
-}
-
-/// The column whose value sits closest to one half.
-fn most_fractional(x: &[f64], tolerance: f64) -> Option<usize> {
-    let mut best = None;
-    let mut best_distance = 0.5;
-    for (j, &v) in x.iter().enumerate() {
-        let distance = (v - 0.5).abs();
-        if (v - v.round()).abs() > tolerance && distance < best_distance {
-            best_distance = distance;
-            best = Some(j);
-        }
-    }
-    best
 }

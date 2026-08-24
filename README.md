@@ -9,9 +9,9 @@ variable is binary; general integer and continuous variables are out of scope.
 
 Status: **early, but solving**. The model layer, LP/MPS readers, instance
 generator, test oracle, LP relaxation solver, presolve, lifted knapsack cover
-cuts, and a depth-first branch-and-bound search are in place. Better branching and
-primal heuristics are not, and the evidence now says branching is the binding
-constraint.
+cuts, pseudocost branching, and a depth-first branch-and-bound search are in place.
+Primal heuristics are not, and neither is a sparse LU factorization — which the
+measurements now say is the binding constraint on larger models.
 
 Both the relaxation and the integer optimum are checked against an independent
 solver on every bundled sample and generated instance.
@@ -56,8 +56,19 @@ nothing — on `v064c064` from 72.47 to 84.83 against an optimum of 137, and on
 `v064c200` from 72.13 to 82.70 against 225. Converting that bound into a smaller
 tree is another matter: with most-fractional branching the node counts do not track
 the bound at all. On `v064c200`, successive cut budgets give 9304, then 16918, then
-6230 nodes while the bound only improves. Branching choice, not the bound, now
-dominates the tree's shape, which is what pseudocost branching exists to fix.
+6230 nodes while the bound only improves. Branching choice, not the bound,
+dominated the tree's shape.
+
+Pseudocost branching addresses that, scoring a column by the objective degradation
+it has actually caused rather than by how fractional it looks. It is a large win on
+the hardest instances and roughly neutral elsewhere — `v081c162n018` drops from
+14602 nodes to 3828, `v081c162n009` from 87138 to 74570, while `v048c048` and
+`v064c200` move slightly the wrong way.
+
+Strong branching is implemented alongside it and is **off by default**, because
+measurement said so: probing made every instance tried markedly worse, taking
+`v128c256n100` from 10 nodes to 917. Two explanations were tested and ruled out.
+See `branch.rs` for what is and is not yet known about why.
 
 ## Layout
 
