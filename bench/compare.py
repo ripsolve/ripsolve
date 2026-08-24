@@ -10,6 +10,7 @@ Fairness notes, all deliberate:
   * The same time limit applies to both, and a run that hits it is reported with
     its remaining gap rather than as a solve.
 """
+import os
 import re
 import subprocess
 import sys
@@ -20,8 +21,27 @@ EXE = ROOT / "target" / "release" / "ripsolve"
 LIMIT = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
 THREADS = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 
-BIPGEN = pathlib.Path.home() / "repos" / "bip-gen"
-SCRATCH = pathlib.Path("/tmp/claude-1000/-home-andy-repos/784cbd5f-e5c1-4a72-b4b8-e191a18aa741/scratchpad/bench")
+# Instances not shipped with the repo. Anything missing is skipped, so the
+# comparison runs anywhere even if only the bundled samples are present.
+BIPGEN = pathlib.Path(os.environ.get("RIPSOLVE_BIPGEN", pathlib.Path.home() / "repos" / "bip-gen"))
+SCRATCH = ROOT / "bench" / "out"
+
+
+def ensure_generated():
+    """Generate the dense knapsack instances the comparison uses.
+
+    Written into bench/out, which is gitignored: they are reproducible from the
+    solver's own generator, so shipping them would only add weight.
+    """
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    for cols in (200, 500):
+        path = SCRATCH / f"mkp_{cols}.lp"
+        if not path.exists():
+            subprocess.run(
+                [str(EXE), "gen", "--kind", "knapsack", "--cols", str(cols),
+                 "--rows", "30", "--seed", "42", "-o", str(path)],
+                check=True,
+            )
 
 INSTANCES = [
     ("v032c032",      ROOT / "samples/v032c032.lp"),
@@ -84,6 +104,7 @@ def cell(r):
     return f"{r['obj']:.0f} (gap {r['gap']*100:.0f}%)"
 
 
+ensure_generated()
 print(f"time limit {LIMIT:.0f}s, both solvers on {THREADS} thread(s)\n")
 hdr = f"{'instance':16} | {'ripsolve':>26} | {'Gurobi':>26} | ratio"
 print(hdr)

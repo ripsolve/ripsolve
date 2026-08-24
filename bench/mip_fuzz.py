@@ -14,7 +14,8 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE = ROOT / "target" / "release" / "ripsolve"
-OUT = pathlib.Path("/tmp/claude-1000/-home-andy-repos/784cbd5f-e5c1-4a72-b4b8-e191a18aa741/scratchpad/mipfuzz")
+# Gitignored scratch space; the models are reproducible from their seeds.
+OUT = ROOT / "bench" / "out" / "mipfuzz"
 OUT.mkdir(parents=True, exist_ok=True)
 
 
