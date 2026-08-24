@@ -578,7 +578,7 @@ mod tests {
     /// rather than from combinatorial reasoning, so they are the family most likely
     /// to produce a subtly invalid inequality.
     fn assert_gomory_is_valid(p: &Problem, label: &str) -> usize {
-        let lp = Lp::relaxation(p);
+        let mut lp = Lp::relaxation(p);
         let relaxed = lp.solve();
         if relaxed.status != LpStatus::Optimal {
             return 0;
@@ -632,7 +632,7 @@ mod tests {
             seed: 5,
         };
         let mut p = Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap();
-        let lp = Lp::relaxation(&p);
+        let mut lp = Lp::relaxation(&p);
         let before = lp.solve();
         let cuts = separate_gomory(&lp, &before.basis, &before.x, 16);
         assert!(

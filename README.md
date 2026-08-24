@@ -158,8 +158,27 @@ That is roughly 7.5x the simplex throughput, which narrows the per-iteration gap
 against Gurobi on these models from about 53x to about 9x. Smaller models gain
 between 1.2x and 2.4x in wall clock.
 
-Forrest-Tomlin updates would shorten the eta file further and are the natural next
-step; the `Basis` interface was built so that swap needs no change to the simplex.
+Forrest-Tomlin updates would shorten the eta file further, and the `Basis` interface
+was built so that swap needs no change to the simplex — but measurement says not to
+bother. Sweeping the refactorization interval over an 80x range moves solve time by
+3-7%, so neither replaying the eta file nor rebuilding the factors is where the time
+goes.
+
+Where it went was rebuilding factors that were already correct. A warm re-solve
+performing *zero* pivots cost 9.1ms on a 1000-row model, against 10.9ms for a real
+node doing eleven — 84% of node time was setup. A child's basis is identical to its
+parent's, since bounds do not enter the basis matrix, so the factors are reusable
+verbatim. Each LP now keeps its recent factorizations:
+
+| | before | after |
+|---|---:|---:|
+| `v128c1000n100` | 9.2s | 4.2s |
+| `v064c1000n100` | 10.9s | 9.2s |
+| `v256c256n100` | 0.48s | 0.33s |
+
+The cache holds many entries rather than one because best-bound node selection does
+not visit the tree in an order that keeps a single entry warm — measured at an 8-20%
+hit rate for one entry. What recurs is siblings, which share a parent's basis.
 
 ## Primal heuristics
 

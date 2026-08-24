@@ -787,7 +787,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         with_cuts.add_cuts(&found);
         cuts_added += found.len();
 
-        let candidate = Lp::relaxation(&with_cuts);
+        let mut candidate = Lp::relaxation(&with_cuts);
         let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
         iterations += resolved.iterations;
         if resolved.status != LpStatus::Optimal {
@@ -1011,7 +1011,7 @@ mod tests {
 
     fn node(bound: f64, depth: usize) -> Node {
         // A node's basis is irrelevant to the ordering under test.
-        let lp = Lp::relaxation(&trivial());
+        let mut lp = Lp::relaxation(&trivial());
         Node {
             fixings: (0..depth).map(|j| (j as u32, 0u8)).collect(),
             bound,
