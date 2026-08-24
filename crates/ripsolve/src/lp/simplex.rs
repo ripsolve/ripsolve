@@ -121,6 +121,10 @@ enum Entry {
 }
 
 /// An LP in computational form, ready to solve.
+///
+/// Cloneable so that each thread of a parallel search can hold its own, since
+/// solving a node mutates the column bounds.
+#[derive(Clone)]
 pub struct Lp {
     n_structural: usize,
     m: usize,

@@ -2,8 +2,9 @@
 """Head-to-head comparison of ripsolve against Gurobi.
 
 Fairness notes, all deliberate:
-  * Gurobi is pinned to one thread, because ripsolve is single-threaded. Gurobi
-    defaults to every core, which would not be a comparison of algorithms.
+  * Both solvers get the same thread count, passed as the second argument. At one
+    thread this compares algorithms; at the machine's full width it compares what a
+    user would actually experience.
   * Only the solve is timed on both sides -- gurobipy's Runtime excludes parsing,
     and ripsolve's reported elapsed covers search only.
   * The same time limit applies to both, and a run that hits it is reported with
@@ -17,6 +18,7 @@ import pathlib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE = ROOT / "target" / "release" / "ripsolve"
 LIMIT = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
+THREADS = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 
 BIPGEN = pathlib.Path.home() / "repos" / "bip-gen"
 SCRATCH = pathlib.Path("/tmp/claude-1000/-home-andy-repos/784cbd5f-e5c1-4a72-b4b8-e191a18aa741/scratchpad/bench")
@@ -43,7 +45,7 @@ def gurobi(path):
     import gurobipy as gp
     env = gp.Env(params={"OutputFlag": 0})
     m = gp.read(str(path), env=env)
-    m.setParam("Threads", 1)
+    m.setParam("Threads", THREADS)
     m.setParam("TimeLimit", LIMIT)
     m.setParam("MIPGap", 0.0)
     m.optimize()
@@ -56,7 +58,7 @@ def gurobi(path):
 
 def ripsolve(path):
     out = subprocess.run(
-        [str(EXE), "solve", "--time-limit", str(LIMIT), str(path)],
+        [str(EXE), "solve", "--time-limit", str(LIMIT), "-t", str(THREADS), str(path)],
         capture_output=True, text=True, timeout=LIMIT * 3,
     ).stdout
     obj = re.search(r"objective: ([-\d.e+]+)", out)
@@ -82,7 +84,7 @@ def cell(r):
     return f"{r['obj']:.0f} (gap {r['gap']*100:.0f}%)"
 
 
-print(f"time limit {LIMIT:.0f}s, Gurobi pinned to 1 thread\n")
+print(f"time limit {LIMIT:.0f}s, both solvers on {THREADS} thread(s)\n")
 hdr = f"{'instance':16} | {'ripsolve':>26} | {'Gurobi':>26} | ratio"
 print(hdr)
 print("-" * len(hdr))

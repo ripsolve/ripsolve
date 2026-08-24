@@ -49,6 +49,9 @@ enum Command {
         /// Skip cut generation.
         #[arg(long)]
         no_cuts: bool,
+        /// Worker threads; defaults to the machine's parallelism.
+        #[arg(short, long)]
+        threads: Option<usize>,
     },
     /// Solve a model's LP relaxation and report the bound.
     Relax {
@@ -117,6 +120,7 @@ fn main() -> Result<()> {
             verbose,
             no_presolve,
             no_cuts,
+            threads,
         } => {
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -127,6 +131,8 @@ fn main() -> Result<()> {
                 time_limit: time_limit.map(Duration::from_secs_f64),
                 gap_tolerance: gap,
                 presolve: !no_presolve,
+                threads: threads
+                    .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
                 cut_rounds: if no_cuts {
                     0
                 } else {

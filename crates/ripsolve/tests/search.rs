@@ -180,3 +180,72 @@ fn cuts_do_not_change_any_optimum() {
         }
     }
 }
+
+#[test]
+fn parallel_search_reaches_the_same_answer() {
+    // The one property a parallel solver must have. Which node a worker takes
+    // depends on timing, so node counts vary run to run; the proven optimum must
+    // not, because every bound and cut is globally valid and every worker prunes
+    // against the same shared incumbent.
+    let data = fixtures();
+    for entry in data["samples"].as_array().unwrap() {
+        let file = entry["file"].as_str().unwrap();
+        let problem = Problem::from_file(&samples_dir().join(file)).unwrap();
+        let expected = entry["mip_optimum"].as_f64().unwrap();
+
+        for threads in [2usize, 4, 8] {
+            let solution = search::solve(
+                &problem,
+                Options {
+                    threads,
+                    ..Options::default()
+                },
+            );
+            assert_eq!(
+                solution.status,
+                Status::Optimal,
+                "{file} on {threads} threads"
+            );
+            let got = solution.objective.unwrap_or(f64::NAN);
+            let scale = expected.abs().max(1.0);
+            assert!(
+                (got - expected).abs() <= 1e-6 * scale,
+                "{file} on {threads} threads: got {got}, expected {expected}"
+            );
+            assert!(
+                solution.gap() <= 1e-6,
+                "{file} on {threads} threads: gap {} not closed",
+                solution.gap()
+            );
+        }
+    }
+}
+
+#[test]
+fn parallel_search_respects_a_node_limit() {
+    // A limit must stop every worker, not just the one that noticed it.
+    let spec = ripsolve::generate::Spec {
+        kind: ripsolve::generate::Kind::Knapsack,
+        n_cols: 45,
+        n_rows: 20,
+        seed: 3,
+    };
+    let problem = Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap();
+    let solution = search::solve(
+        &problem,
+        Options {
+            threads: 4,
+            max_nodes: 20,
+            heuristic_frequency: 0,
+            ..Options::default()
+        },
+    );
+    assert_ne!(solution.status, Status::Optimal);
+    // Workers in flight may each finish their node, so allow slack over the limit
+    // but not an unbounded overshoot.
+    assert!(
+        solution.nodes <= 40,
+        "ran {} nodes past a limit of 20",
+        solution.nodes
+    );
+}

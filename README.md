@@ -77,6 +77,29 @@ measurement said so: probing made every instance tried markedly worse, taking
 `v128c256n100` from 10 nodes to 917. Two explanations were tested and ruled out.
 See `branch.rs` for what is and is not yet known about why.
 
+## Parallelism
+
+The tree search runs across worker threads sharing one node pool and one incumbent.
+Presolve, cut generation and the root heuristics all run once, before any thread is
+spawned — only the tree is parallel. The CLI uses the machine's parallelism by
+default; the library defaults to one thread so its behaviour is predictable.
+
+Node counts vary between runs, because which node a worker takes depends on timing.
+The *answer* does not: every bound and cut is globally valid and every worker prunes
+against the shared incumbent, so the proven optimum is the same however the work is
+divided. That is asserted across every sample at 2, 4 and 8 threads.
+
+| | 1 thread | 4 threads | 16 threads |
+|---|---:|---:|---:|
+| `mkp_200` | 8.3s | 3.3s | 2.6s |
+| `mkp_500` gap after 120s | 3.07% | 3.03% | 0.30% |
+| `mkp_500` simplex iterations | 834k | 3.27M | 6.70M |
+
+Throughput scales about 8x on 16 threads. The shortfall against linear is inherent
+rather than incidental: workers expand nodes that a serial search would have pruned
+against an incumbent it had already found, so total node count rises with thread
+count even as wall-clock time falls. `mkp_200` goes from 19522 nodes to 49432.
+
 ## Node selection
 
 The open node set is a depth-first plunge stack plus a best-bound pool, and by

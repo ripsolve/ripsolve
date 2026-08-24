@@ -14,6 +14,8 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::branch::{self, Pseudocosts};
@@ -53,6 +55,11 @@ pub struct Options {
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
+    /// Worker threads for the tree search. One (or zero) runs the serial driver.
+    ///
+    /// Only the tree is parallel: presolve, cut generation and the root heuristics
+    /// all run once, before any thread is spawned.
+    pub threads: usize,
     /// Consecutive depth-first steps before the search jumps to the best-bound
     /// open node. Zero makes the search pure best-bound.
     ///
@@ -92,6 +99,7 @@ impl Default for Options {
             // measured; a larger budget finds no more cuts and only costs time.
             cut_rounds: 3,
             cuts_per_round: 32,
+            threads: 1,
             plunge_limit: 0,
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
@@ -251,6 +259,400 @@ impl OpenNodes {
     }
 }
 
+/// What processing one node produced.
+struct NodeOutcome {
+    /// A feasible assignment found here, by the LP landing integral or by a
+    /// heuristic.
+    incumbent: Option<(f64, Vec<u8>)>,
+    children: Vec<Node>,
+    /// The node's LP hit its iteration limit, so the search cannot claim to have
+    /// examined this subtree and must not report optimality.
+    exhausted: bool,
+    /// Incumbents that came from a heuristic rather than from the relaxation.
+    heuristic_hits: usize,
+}
+
+/// Everything needed to process nodes: an LP to re-solve them in, and the
+/// branching history built up while doing so.
+///
+/// Node processing lives here rather than inline in the search loop so that the
+/// serial and parallel drivers run *the same* code. The logic is subtle — cutoff
+/// handling, pseudocost feedback, forced fixings — and two copies of it would
+/// diverge.
+struct Worker<'a> {
+    problem: &'a Problem,
+    lp: Lp,
+    pseudocosts: Pseudocosts,
+    strong_budget: usize,
+    options: Options,
+    iterations: usize,
+}
+
+impl<'a> Worker<'a> {
+    fn new(problem: &'a Problem, lp: Lp, options: Options) -> Self {
+        let n = problem.n_cols();
+        Self {
+            problem,
+            lp,
+            pseudocosts: Pseudocosts::new(n),
+            strong_budget: options.strong_branching_budget,
+            options,
+            iterations: 0,
+        }
+    }
+
+    /// Solve one node and decide what becomes of it.
+    ///
+    /// `incumbent` is the best objective known *now*; in a parallel search that may
+    /// be better than when the node was created, which only ever prunes more.
+    fn process(&mut self, node: &Node, incumbent: f64, index: usize) -> NodeOutcome {
+        let problem = self.problem;
+        let options = self.options;
+        let mut out = NodeOutcome {
+            incumbent: None,
+            children: Vec::new(),
+            exhausted: false,
+            heuristic_hits: 0,
+        };
+
+        // Rebuild this node's bounds from the root. Resetting first costs O(n) and
+        // makes the node independent of whatever the previous one left behind.
+        for j in 0..problem.n_cols() {
+            self.lp
+                .set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
+        }
+        for &(j, v) in &node.fixings {
+            self.lp
+                .set_column_bounds(j as usize, f64::from(v), f64::from(v));
+        }
+
+        let cutoff = incumbent.is_finite().then_some(incumbent);
+        let solved = self
+            .lp
+            .solve_warm(&node.basis, cutoff, options.max_iterations_per_node);
+        self.iterations += solved.iterations;
+
+        // Whatever this node's LP turned out to be, it is the measured consequence
+        // of the branch that created it; feed that back before doing anything else.
+        if let Some((column, up, parent_objective, fraction)) = node.origin
+            && solved.status == LpStatus::Optimal
+        {
+            let step = if up { 1.0 - fraction } else { fraction };
+            let degradation = (solved.objective - parent_objective).max(0.0);
+            self.pseudocosts.record(column, up, degradation, step);
+        }
+
+        match solved.status {
+            // Unbounded is impossible for a bounded binary relaxation; treated as a
+            // dead node defensively rather than trusted.
+            LpStatus::Infeasible | LpStatus::CutOff | LpStatus::Unbounded => return out,
+            LpStatus::IterationLimit => {
+                out.exhausted = true;
+                return out;
+            }
+            LpStatus::Optimal => {}
+        }
+
+        if !improves(solved.objective, incumbent, options.gap_tolerance) {
+            return out;
+        }
+
+        // Dive from this node every so often. Nodes deep in the tree already have
+        // many columns fixed, so a dive from one is short and often lands somewhere
+        // the search would take a long time to reach.
+        if options.heuristic_frequency > 0
+            && index.is_multiple_of(options.heuristic_frequency)
+            && integral_solution(&solved.x, options.integrality_tolerance).is_none()
+        {
+            let found = heuristic::dive(
+                problem,
+                &mut self.lp,
+                &solved.basis,
+                &solved.x,
+                cutoff,
+                &options.heuristic_limits,
+                &mut self.iterations,
+            );
+            if let Some(found) = found
+                && found.objective < incumbent
+            {
+                out.incumbent = Some((found.objective, found.x));
+                out.heuristic_hits += 1;
+            }
+        }
+
+        match integral_solution(&solved.x, options.integrality_tolerance) {
+            Some(x) => {
+                let better = out
+                    .incumbent
+                    .as_ref()
+                    .is_none_or(|(o, _)| solved.objective < *o);
+                if better {
+                    out.incumbent = Some((solved.objective, x));
+                }
+            }
+            None => {
+                let decision = branch::select(
+                    &mut self.lp,
+                    &solved.basis,
+                    &solved.x,
+                    solved.objective,
+                    &mut self.pseudocosts,
+                    options.integrality_tolerance,
+                    &mut self.strong_budget,
+                    &mut self.iterations,
+                );
+                let Some(decision) = decision else { return out };
+                // Strong branching can prove a node has no feasible completion at
+                // all, which prunes it outright.
+                if decision.dead {
+                    return out;
+                }
+
+                // A probe that proved one side infeasible decides the column
+                // outright, so descend into the single surviving child.
+                let values: Vec<u8> = match decision.forced {
+                    Some(value) => vec![value],
+                    // Under a plunge, the stack pops last-in first, so the side
+                    // nearer the relaxation's own value goes last and is explored
+                    // first. Under best-bound selection the order is immaterial.
+                    None if decision.fraction > 0.5 => vec![0, 1],
+                    None => vec![1, 0],
+                };
+
+                for v in values {
+                    let mut fixings = node.fixings.clone();
+                    fixings.push((decision.column as u32, v));
+                    out.children.push(Node {
+                        fixings,
+                        bound: solved.objective,
+                        basis: solved.basis.clone(),
+                        origin: Some((
+                            decision.column,
+                            v == 1,
+                            solved.objective,
+                            decision.fraction,
+                        )),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// What a tree search produced, whether it ran on one thread or several.
+struct TreeResult {
+    status: Status,
+    incumbent: f64,
+    incumbent_x: Option<Vec<u8>>,
+    nodes: usize,
+    iterations: usize,
+    heuristic_hits: usize,
+    /// The weakest bound left open, or infinity if the tree was exhausted.
+    open_bound: f64,
+}
+
+/// The open node set and the count of workers currently holding a node.
+///
+/// `active` is what makes termination decidable: an empty pool does not mean the
+/// search is finished, only that every remaining node is currently being expanded
+/// by some worker and may yet produce children. The search is over when the pool is
+/// empty *and* no worker is active.
+struct SharedPool {
+    open: OpenNodes,
+    active: usize,
+    finished: bool,
+}
+
+/// State shared by every worker in a parallel search.
+struct Shared {
+    pool: Mutex<SharedPool>,
+    /// Signalled whenever a worker pushes children or goes idle.
+    wake: Condvar,
+    /// The incumbent, guarded for writing.
+    best: Mutex<(f64, Option<Vec<u8>>)>,
+    /// The incumbent objective again, as raw bits, for lock-free reads on the hot
+    /// path. Always written under `best`, so it can only lag, never lead — and a
+    /// stale-but-worse cutoff prunes less, never wrongly.
+    best_bits: AtomicU64,
+    nodes: AtomicUsize,
+    iterations: AtomicUsize,
+    heuristic_hits: AtomicUsize,
+    /// Set when a limit stops the search; read by every worker to wind down.
+    stopped: AtomicUsize,
+}
+
+/// Reasons a parallel search stops early, encoded for the atomic.
+const STOP_NONE: usize = 0;
+const STOP_NODES: usize = 1;
+const STOP_TIME: usize = 2;
+const STOP_EXHAUSTED: usize = 3;
+
+impl Shared {
+    fn incumbent(&self) -> f64 {
+        f64::from_bits(self.best_bits.load(Ordering::Relaxed))
+    }
+
+    /// Install a better incumbent, if it really is better.
+    ///
+    /// Two workers can find improvements concurrently, so the comparison is redone
+    /// under the lock rather than trusted from the atomic read that motivated it.
+    fn offer(&self, objective: f64, x: Vec<u8>) -> bool {
+        let mut best = self.best.lock().expect("incumbent lock");
+        if objective < best.0 {
+            best.0 = objective;
+            best.1 = Some(x);
+            self.best_bits.store(objective.to_bits(), Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Take the next node, or `None` once the search is over.
+    fn take(&self) -> Option<Node> {
+        let mut pool = self.pool.lock().expect("pool lock");
+        loop {
+            if pool.finished {
+                return None;
+            }
+            if self.stopped.load(Ordering::Relaxed) != STOP_NONE {
+                pool.finished = true;
+                self.wake.notify_all();
+                return None;
+            }
+            if let Some(node) = pool.open.pop() {
+                pool.active += 1;
+                return Some(node);
+            }
+            if pool.active == 0 {
+                // Nothing open and nobody working: the tree is exhausted.
+                pool.finished = true;
+                self.wake.notify_all();
+                return None;
+            }
+            pool = self.wake.wait(pool).expect("pool wait");
+        }
+    }
+
+    /// Return a node's children and release the worker.
+    fn give_back(&self, children: Vec<Node>) {
+        let mut pool = self.pool.lock().expect("pool lock");
+        pool.active -= 1;
+        for child in children {
+            pool.open.push(child);
+        }
+        self.wake.notify_all();
+    }
+}
+
+/// Run the tree search across `threads` workers.
+///
+/// Node counts and iteration counts vary between runs, because which node a worker
+/// takes depends on timing. The *answer* does not: every worker prunes against a
+/// shared incumbent and every cut and bound is globally valid, so the proven
+/// optimum is the same however the work is divided.
+#[allow(clippy::too_many_arguments)]
+fn run_parallel(
+    problem: &Problem,
+    lp: &Lp,
+    open: OpenNodes,
+    options: Options,
+    started: Instant,
+    incumbent: f64,
+    incumbent_x: Option<Vec<u8>>,
+    threads: usize,
+) -> TreeResult {
+    let shared = Shared {
+        pool: Mutex::new(SharedPool {
+            open,
+            active: 0,
+            finished: false,
+        }),
+        wake: Condvar::new(),
+        best: Mutex::new((incumbent, incumbent_x)),
+        best_bits: AtomicU64::new(incumbent.to_bits()),
+        nodes: AtomicUsize::new(0),
+        iterations: AtomicUsize::new(0),
+        heuristic_hits: AtomicUsize::new(0),
+        stopped: AtomicUsize::new(STOP_NONE),
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            // Each worker gets its own LP, since solving a node mutates the column
+            // bounds, and its own branching history. Sharing the pseudocosts would
+            // pool more evidence but put a lock on the hot path; per-worker history
+            // is the cheaper trade at these thread counts.
+            let mut worker = Worker::new(problem, lp.clone(), options);
+            let shared = &shared;
+            scope.spawn(move || {
+                while let Some(node) = shared.take() {
+                    let index = shared.nodes.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    if index > options.max_nodes {
+                        shared.stopped.store(STOP_NODES, Ordering::Relaxed);
+                        shared.give_back(vec![node]);
+                        continue;
+                    }
+                    if options
+                        .time_limit
+                        .is_some_and(|limit| started.elapsed() >= limit)
+                    {
+                        shared.stopped.store(STOP_TIME, Ordering::Relaxed);
+                        shared.give_back(vec![node]);
+                        continue;
+                    }
+
+                    let best = shared.incumbent();
+                    if !improves(node.bound, best, options.gap_tolerance) {
+                        shared.give_back(Vec::new());
+                        continue;
+                    }
+
+                    let outcome = worker.process(&node, best, index);
+                    if outcome.exhausted {
+                        shared.stopped.store(STOP_EXHAUSTED, Ordering::Relaxed);
+                    }
+                    if let Some((objective, x)) = outcome.incumbent
+                        && shared.offer(objective, x)
+                        && outcome.heuristic_hits > 0
+                    {
+                        shared.heuristic_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    shared.give_back(outcome.children);
+                }
+                shared
+                    .iterations
+                    .fetch_add(worker.iterations, Ordering::Relaxed);
+            });
+        }
+    });
+
+    let pool = shared.pool.into_inner().expect("pool lock");
+    let (incumbent, incumbent_x) = shared.best.into_inner().expect("incumbent lock");
+    let status = match shared.stopped.load(Ordering::Relaxed) {
+        STOP_NODES => Status::NodeLimit,
+        STOP_TIME => Status::TimeLimit,
+        STOP_EXHAUSTED => Status::NodeLimit,
+        _ => Status::Optimal,
+    };
+
+    TreeResult {
+        status,
+        incumbent,
+        incumbent_x,
+        nodes: shared.nodes.load(Ordering::Relaxed).min(options.max_nodes),
+        iterations: shared.iterations.load(Ordering::Relaxed),
+        heuristic_hits: shared.heuristic_hits.load(Ordering::Relaxed),
+        open_bound: if pool.open.is_empty() {
+            f64::INFINITY
+        } else {
+            pool.open.best_bound()
+        },
+    }
+}
+
 /// One open subproblem: the columns fixed so far, and where to resume from.
 struct Node {
     /// Every column fixed on the path from the root, as `(column, value)`.
@@ -301,7 +703,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         (problem, None)
     };
 
-    let n = problem.n_cols();
+    let _ = problem.n_cols();
     let mut lp = Lp::relaxation(problem);
     // Cuts add rows but never columns, so `n` stays valid across the cut loop.
 
@@ -393,8 +795,6 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         basis: root.basis.clone(),
         origin: None,
     });
-    let mut pseudocosts = Pseudocosts::new(n);
-    let mut strong_budget = options.strong_branching_budget;
     let mut heuristic_solutions = 0usize;
 
     // An incumbent before the first branch is worth more than one found later: the
@@ -444,6 +844,52 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
     let mut status = Status::Optimal;
 
+    let threads = options.threads.max(1);
+    if threads > 1 {
+        let result = run_parallel(
+            problem,
+            &lp,
+            open,
+            options,
+            started,
+            incumbent,
+            incumbent_x,
+            threads,
+        );
+        nodes += result.nodes;
+        iterations += result.iterations;
+        heuristic_solutions += result.heuristic_hits;
+        let internal_bound = if result.open_bound.is_finite() {
+            result.open_bound.min(result.incumbent)
+        } else if result.incumbent.is_finite() {
+            result.incumbent
+        } else {
+            root_bound
+        };
+        let status = match (result.status, &result.incumbent_x) {
+            (Status::Optimal, None) => Status::Infeasible,
+            (other, _) => other,
+        };
+        return Solution {
+            status,
+            objective: result
+                .incumbent_x
+                .as_ref()
+                .map(|_| problem.objective_value(result.incumbent)),
+            x: result.incumbent_x.unwrap_or_default(),
+            bound: problem.objective_value(internal_bound),
+            nodes,
+            simplex_iterations: iterations,
+            presolve: presolve_stats,
+            cuts_added,
+            heuristic_solutions,
+            root_bound: problem.objective_value(first_bound),
+            root_bound_after_cuts: problem.objective_value(root_bound),
+        };
+    }
+
+    let mut worker = Worker::new(problem, lp, options);
+
     while let Some(node) = open.pop() {
         if nodes >= options.max_nodes {
             status = Status::NodeLimit;
@@ -458,141 +904,30 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             open.push(node);
             break;
         }
-        // The parent's bound may have been overtaken by an incumbent found since this
-        // node was pushed, in which case it needs no solve at all.
+        // The parent's bound may have been overtaken by an incumbent found since
+        // this node was pushed, in which case it needs no solve at all.
         if !improves(node.bound, incumbent, options.gap_tolerance) {
             continue;
         }
 
-        // Rebuild this node's bounds from the root. Resetting first costs O(n) and
-        // makes the node independent of whatever the previous one left behind.
-        for j in 0..n {
-            lp.set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
-        }
-        for &(j, v) in &node.fixings {
-            lp.set_column_bounds(j as usize, f64::from(v), f64::from(v));
-        }
-
-        let cutoff = if incumbent.is_finite() {
-            Some(incumbent)
-        } else {
-            None
-        };
-        let solved = lp.solve_warm(&node.basis, cutoff, options.max_iterations_per_node);
-        iterations += solved.iterations;
         nodes += 1;
-
-        // Whatever this node's LP turned out to be, it is the measured consequence
-        // of the branch that created it; feed that back before doing anything else.
-        if let Some((column, up, parent_objective, fraction)) = node.origin
-            && solved.status == LpStatus::Optimal
+        let outcome = worker.process(&node, incumbent, nodes);
+        if outcome.exhausted {
+            status = Status::NodeLimit;
+            break;
+        }
+        heuristic_solutions += outcome.heuristic_hits;
+        if let Some((objective, x)) = outcome.incumbent
+            && objective < incumbent
         {
-            let step = if up { 1.0 - fraction } else { fraction };
-            let degradation = (solved.objective - parent_objective).max(0.0);
-            pseudocosts.record(column, up, degradation, step);
+            incumbent = objective;
+            incumbent_x = Some(x);
         }
-
-        match solved.status {
-            LpStatus::Infeasible | LpStatus::CutOff => continue,
-            LpStatus::Unbounded => {
-                // Impossible for a bounded binary relaxation; treat defensively.
-                continue;
-            }
-            LpStatus::IterationLimit => {
-                status = Status::NodeLimit;
-                break;
-            }
-            LpStatus::Optimal => {}
-        }
-
-        if !improves(solved.objective, incumbent, options.gap_tolerance) {
-            continue;
-        }
-
-        // Dive from this node every so often. Nodes deep in the tree already have
-        // many columns fixed, so a dive from one is short and often lands somewhere
-        // the search would take a long time to reach.
-        if options.heuristic_frequency > 0
-            && nodes.is_multiple_of(options.heuristic_frequency)
-            && integral_solution(&solved.x, options.integrality_tolerance).is_none()
-        {
-            let cutoff = incumbent.is_finite().then_some(incumbent);
-            let found = heuristic::dive(
-                problem,
-                &mut lp,
-                &solved.basis,
-                &solved.x,
-                cutoff,
-                &options.heuristic_limits,
-                &mut iterations,
-            );
-            if let Some(found) = found
-                && found.objective < incumbent
-            {
-                incumbent = found.objective;
-                incumbent_x = Some(found.x);
-                heuristic_solutions += 1;
-            }
-        }
-
-        match integral_solution(&solved.x, options.integrality_tolerance) {
-            Some(x) => {
-                incumbent = solved.objective;
-                incumbent_x = Some(x);
-            }
-            None => {
-                let decision = branch::select(
-                    &mut lp,
-                    &solved.basis,
-                    &solved.x,
-                    solved.objective,
-                    &mut pseudocosts,
-                    options.integrality_tolerance,
-                    &mut strong_budget,
-                    &mut iterations,
-                );
-                let Some(decision) = decision else { continue };
-                // Strong branching can prove a node has no feasible completion at
-                // all, which prunes it outright.
-                if decision.dead {
-                    continue;
-                }
-
-                // A probe that proved one side infeasible decides the column outright,
-                // so descend into the single surviving child instead of branching.
-                let children: Vec<u8> = match decision.forced {
-                    Some(value) => vec![value],
-                    None => {
-                        // The stack pops last-in first, so the side nearer the
-                        // relaxation's own value is pushed last and explored first.
-                        // Diving towards it reaches a feasible incumbent sooner,
-                        // which makes the bound prune harder.
-                        if decision.fraction > 0.5 {
-                            vec![0, 1]
-                        } else {
-                            vec![1, 0]
-                        }
-                    }
-                };
-
-                for v in children {
-                    let mut fixings = node.fixings.clone();
-                    fixings.push((decision.column as u32, v));
-                    open.push(Node {
-                        fixings,
-                        bound: solved.objective,
-                        basis: solved.basis.clone(),
-                        origin: Some((
-                            decision.column,
-                            v == 1,
-                            solved.objective,
-                            decision.fraction,
-                        )),
-                    });
-                }
-            }
+        for child in outcome.children {
+            open.push(child);
         }
     }
+    iterations += worker.iterations;
 
     // The best bound is the weakest still-open node; with none left, the incumbent
     // is proven and the bound is the incumbent itself.
