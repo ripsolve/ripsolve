@@ -1,4 +1,4 @@
 pub mod basis;
 pub mod simplex;
 
-pub use simplex::{Lp, LpSolution, LpStatus, Tolerances};
+pub use simplex::{BasisState, Lp, LpSolution, LpStatus, Tolerances};

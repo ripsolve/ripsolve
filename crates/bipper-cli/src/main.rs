@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use bipper::Problem;
 use bipper::generate::{Kind, Spec};
+use std::time::Duration;
+
 use bipper::lp::{Lp, LpStatus};
+use bipper::search::{self, Options, Status as SearchStatus};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -23,6 +26,23 @@ enum Command {
     Info {
         /// Model file, `.lp` or `.mps`.
         path: PathBuf,
+    },
+    /// Solve a model to proven optimality.
+    Solve {
+        /// Model file, `.lp` or `.mps`.
+        path: PathBuf,
+        /// Stop after this many nodes.
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        /// Stop after this many seconds.
+        #[arg(long)]
+        time_limit: Option<f64>,
+        /// Stop once the relative optimality gap reaches this.
+        #[arg(long, default_value_t = 0.0)]
+        gap: f64,
+        /// Print the value of every column.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Solve a model's LP relaxation and report the bound.
     Relax {
@@ -81,6 +101,60 @@ fn main() -> Result<()> {
                 problem.matrix.nnz(),
                 problem.matrix.density() * 100.0,
                 problem.sense,
+            );
+        }
+        Command::Solve {
+            path,
+            max_nodes,
+            time_limit,
+            gap,
+            verbose,
+        } => {
+            let problem =
+                Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
+            problem.validate()?;
+
+            let options = Options {
+                max_nodes: max_nodes.unwrap_or(usize::MAX),
+                time_limit: time_limit.map(Duration::from_secs_f64),
+                gap_tolerance: gap,
+                ..Options::default()
+            };
+            let started = std::time::Instant::now();
+            let solution = search::solve(&problem, options);
+            let elapsed = started.elapsed();
+
+            match solution.objective {
+                Some(objective) => {
+                    println!("objective: {objective}");
+                    // Only a search that ran to exhaustion has proven anything; a
+                    // limit-terminated run reports its remaining gap instead.
+                    if solution.status == SearchStatus::Optimal {
+                        println!("status:    optimal");
+                    } else {
+                        println!(
+                            "status:    {:?} (bound {}, gap {:.4}%)",
+                            solution.status,
+                            solution.bound,
+                            solution.gap() * 100.0
+                        );
+                    }
+                    if verbose {
+                        let ones: Vec<&str> = problem
+                            .col_names
+                            .iter()
+                            .zip(&solution.x)
+                            .filter(|(_, v)| **v == 1)
+                            .map(|(n, _)| n.as_str())
+                            .collect();
+                        println!("1: {}", ones.join(" "));
+                    }
+                }
+                None => println!("status:    {:?}", solution.status),
+            }
+            println!(
+                "{} nodes, {} simplex iterations, {elapsed:.3?}",
+                solution.nodes, solution.simplex_iterations
             );
         }
         Command::Relax {

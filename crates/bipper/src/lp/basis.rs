@@ -90,6 +90,17 @@ impl Basis {
         }
     }
 
+    /// BTRAN against a unit vector: row `r` of `B^-1`.
+    ///
+    /// The dual simplex needs this to price a whole pivot row at once. With an
+    /// explicit inverse it is a row copy; behind an LU factorization it would be a
+    /// btran of `e_r`, which is why it lives here rather than being read off the
+    /// representation by the caller.
+    pub fn btran_unit(&self, r: usize, out: &mut Vec<f64>) {
+        out.clear();
+        out.extend_from_slice(self.row(r));
+    }
+
     /// Apply the rank-one update for a pivot on row `r`, where `d = B^-1 a_q` was
     /// computed for the entering column `a_q`.
     ///
@@ -288,6 +299,24 @@ mod tests {
         }
         dense_identity_check(&updated, &columns);
         assert_eq!(updated.updates(), 1);
+    }
+
+    #[test]
+    fn btran_unit_is_a_row_of_the_inverse() {
+        let columns = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let mut b = Basis::all_logical(2);
+        b.refactorize(&columns, 1e-9).unwrap();
+
+        for r in 0..2 {
+            let mut rho = Vec::new();
+            b.btran_unit(r, &mut rho);
+            // rho' B must be e_r'.
+            for (j, col) in columns.iter().enumerate() {
+                let dot: f64 = rho.iter().zip(col).map(|(a, b)| a * b).sum();
+                let expected = if j == r { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1e-9, "row {r}, column {j}: {dot}");
+            }
+        }
     }
 
     #[test]

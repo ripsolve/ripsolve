@@ -19,3 +19,9 @@ lp_parser_rs = "4.1"
 lto = true
 codegen-units = 1
 debug = 1
+
+# The test suite solves real instances to proven optimality, which is thousands of
+# simplex iterations. Unoptimized that takes minutes; optimized it takes seconds.
+# `debug-assertions` stays on, so the debug_assert! invariants still run.
+[profile.test]
+opt-level = 2

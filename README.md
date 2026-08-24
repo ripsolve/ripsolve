@@ -7,12 +7,14 @@ bounded LP relaxation with the simplex method, and the resulting dual bound —
 strengthened by presolve and cutting planes — is what prunes the search. Every
 variable is binary; general integer and continuous variables are out of scope.
 
-Status: **early**. The model layer, LP/MPS readers, instance generator, test
-oracle, and the LP relaxation solver are in place. The branch-and-cut search is
-not yet written.
+Status: **early, but solving**. The model layer, LP/MPS readers, instance
+generator, test oracle, LP relaxation solver, and a depth-first branch-and-bound
+search are in place. Presolve, cutting planes, better branching, and primal
+heuristics are not — those are what would make it competitive rather than merely
+correct.
 
-The simplex reproduces an independent solver's LP relaxation to within 1e-6
-relative on every bundled sample and generated instance.
+Both the relaxation and the integer optimum are checked against an independent
+solver on every bundled sample and generated instance.
 
 ## Why not pure enumeration
 
@@ -26,6 +28,21 @@ The enumeration engine was not slow; at 188M nodes/sec it processed nodes roughl
 them. No amount of SIMD or threading closes a gap of that shape — only a stronger
 bound does, and that means solving an LP relaxation at each node. That measurement
 is the reason this project exists and why the simplex is its centrepiece.
+
+On that same 60-variable instance, `bipper` now proves optimality in **2204 nodes
+and 0.10s** — 4.7 million times fewer nodes than the enumeration approach, and 543x
+faster in wall clock. On a family of dense random instances with 30 rows:
+
+| variables | enumeration | bipper | Gurobi |
+|---:|---:|---:|---:|
+| 60 | 54.7s | 0.10s | 0.15s |
+| 64 | >120s | 0.20s | 0.24s |
+| 80 | — | 0.52s | 0.23s |
+| 200 | — | 19.0s | 0.87s |
+| 500 | — | >400s | 82s |
+
+The gap that remains against Gurobi is roughly 20x in nodes, and it is exactly the
+work that has not been done yet: presolve, cuts, and pseudocost branching.
 
 ## Layout
 

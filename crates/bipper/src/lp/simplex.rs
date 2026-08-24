@@ -64,6 +64,22 @@ pub enum LpStatus {
     Unbounded,
     /// The iteration limit was reached before the search concluded.
     IterationLimit,
+    /// The dual objective rose past the caller's cutoff, so the true optimum is
+    /// worse than a solution the caller already holds. Only the dual simplex can
+    /// report this, since only there does the objective climb monotonically.
+    CutOff,
+}
+
+/// A basis, saved so a related LP can start from it instead of from scratch.
+///
+/// Branch-and-bound lives on this: a child differs from its parent only in one
+/// column's bounds, which leaves the parent's basis dual feasible. Re-solving with
+/// the dual simplex from here typically takes a handful of pivots, where a cold
+/// start would repeat the whole phase-1.
+#[derive(Clone, Debug)]
+pub struct BasisState {
+    basic: Vec<usize>,
+    status: Vec<Status>,
 }
 
 /// The result of solving an LP relaxation.
@@ -76,6 +92,8 @@ pub struct LpSolution {
     /// Values of the structural variables only.
     pub x: Vec<f64>,
     pub iterations: usize,
+    /// The final basis, for warm-starting a related solve.
+    pub basis: BasisState,
 }
 
 /// Where a nonbasic variable is parked.
@@ -91,6 +109,15 @@ enum At {
 enum Status {
     Basic { row: usize },
     NonBasic(At),
+}
+
+/// What a warm-started solve should do first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    /// Repair primal infeasibility with the dual simplex, keeping dual feasibility.
+    Dual,
+    /// Repair primal infeasibility with phase 1, then optimize.
+    Primal,
 }
 
 /// An LP in computational form, ready to solve.
@@ -137,6 +164,22 @@ impl Lp {
         self
     }
 
+    /// Narrow a structural column's bounds, as branching does.
+    pub fn set_column_bounds(&mut self, j: usize, lo: f64, hi: f64) {
+        debug_assert!(j < self.n_structural);
+        self.lower[j] = lo;
+        self.upper[j] = hi;
+    }
+
+    /// The current bounds of a structural column.
+    pub fn column_bounds(&self, j: usize) -> (f64, f64) {
+        (self.lower[j], self.upper[j])
+    }
+
+    pub fn n_columns(&self) -> usize {
+        self.n_structural
+    }
+
     fn n_total(&self) -> usize {
         self.n_structural + self.m
     }
@@ -163,13 +206,28 @@ impl Lp {
         }
     }
 
-    /// Solve, returning the optimum of the internal minimization form.
+    /// Solve from a cold start, returning the optimum of the internal minimization
+    /// form.
     pub fn solve(&self) -> LpSolution {
         self.solve_with_limit(200_000)
     }
 
     pub fn solve_with_limit(&self, max_iterations: usize) -> LpSolution {
-        Solver::new(self).run(max_iterations)
+        Solver::new(self).run(max_iterations, None)
+    }
+
+    /// Re-solve starting from a saved basis.
+    ///
+    /// `cutoff` lets the solve abandon a node early: the dual simplex's objective
+    /// only ever climbs, so once it passes the cutoff the node's true bound must be
+    /// worse still and the result is [`LpStatus::CutOff`].
+    pub fn solve_warm(
+        &self,
+        start: &BasisState,
+        cutoff: Option<f64>,
+        max_iterations: usize,
+    ) -> LpSolution {
+        Solver::warm(self, start).run(max_iterations, cutoff)
     }
 }
 
@@ -188,6 +246,8 @@ struct Solver<'a> {
     y: Vec<f64>,
     cost_b: Vec<f64>,
     rhs: Vec<f64>,
+    /// Which method to try first; see [`Solver::run`].
+    entry_hint: Entry,
 }
 
 /// What the ratio test decided.
@@ -242,6 +302,52 @@ impl<'a> Solver<'a> {
             y: Vec::new(),
             cost_b: vec![0.0; m],
             rhs: vec![0.0; m],
+            entry_hint: Entry::Primal,
+        };
+        solver.recompute_basic_values();
+        solver
+    }
+
+    /// Rebuild a solver around a saved basis.
+    ///
+    /// Nonbasic variables are re-parked on their (possibly just-changed) bounds. A
+    /// variable that has become fixed is pulled onto the fixed value regardless of
+    /// which side it was parked on, so the recomputed basic values reflect the new
+    /// bounds rather than the parent's.
+    fn warm(lp: &'a Lp, start: &BasisState) -> Solver<'a> {
+        let m = lp.m;
+        let mut z = vec![0.0; lp.n_total()];
+        let mut status = start.status.clone();
+
+        for (j, st) in status.iter_mut().enumerate() {
+            if let Status::NonBasic(at) = st {
+                // Re-park anything sitting on a bound that is now infinite, which can
+                // happen only if the caller widened bounds rather than narrowing them.
+                let mut here = *at;
+                if !lp.value_at(j, here).is_finite() {
+                    here = match here {
+                        At::Lower if lp.upper[j].is_finite() => At::Upper,
+                        At::Upper if lp.lower[j].is_finite() => At::Lower,
+                        _ => At::Zero,
+                    };
+                    *at = here;
+                }
+                z[j] = lp.value_at(j, here);
+            }
+        }
+
+        let mut solver = Solver {
+            lp,
+            basis: Basis::all_logical(m),
+            basic: start.basic.clone(),
+            status,
+            z,
+            col: vec![0.0; m],
+            alpha: Vec::new(),
+            y: Vec::new(),
+            cost_b: vec![0.0; m],
+            rhs: vec![0.0; m],
+            entry_hint: Entry::Dual,
         };
         solver.recompute_basic_values();
         solver
@@ -526,12 +632,208 @@ impl<'a> Solver<'a> {
         Err(LpStatus::Infeasible)
     }
 
+    /// Current value of the internal minimization objective.
+    fn objective(&self) -> f64 {
+        (0..self.lp.n_total())
+            .map(|j| self.lp.cost[j] * self.z[j])
+            .sum()
+    }
+
+    /// Is every nonbasic reduced cost on the correct side of zero?
+    ///
+    /// A basis inherited from a parent node is dual feasible, because changing a
+    /// column's *bounds* leaves reduced costs untouched. This checks that rather
+    /// than assuming it, so a caller passing an unrelated basis falls back to the
+    /// primal method instead of getting a wrong answer from the dual one.
+    fn is_dual_feasible(&mut self) -> bool {
+        let tol = self.lp.tol.dual_feasibility;
+        self.load_basic_costs(false);
+        let mut y = std::mem::take(&mut self.y);
+        self.basis.btran(&self.cost_b, &mut y);
+        self.y = y;
+
+        for j in 0..self.lp.n_total() {
+            let Status::NonBasic(at) = self.status[j] else {
+                continue;
+            };
+            // A fixed variable cannot move, so its reduced cost is unconstrained.
+            if self.lp.lower[j] == self.lp.upper[j] {
+                continue;
+            }
+            let d = self.reduced_cost(j, false);
+            let ok = match at {
+                At::Lower => d >= -tol,
+                At::Upper => d <= tol,
+                At::Zero => d.abs() <= tol,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The most primal-infeasible basic variable, with the bound it violates.
+    fn most_infeasible_row(&self) -> Option<(usize, At)> {
+        let tol = self.lp.tol.primal_feasibility;
+        let mut worst = tol;
+        let mut found = None;
+        for i in 0..self.lp.m {
+            let j = self.basic[i];
+            let v = self.z[j];
+            let (below, above) = (self.lp.lower[j] - v, v - self.lp.upper[j]);
+            if below > worst {
+                worst = below;
+                found = Some((i, At::Lower));
+            }
+            if above > worst {
+                worst = above;
+                found = Some((i, At::Upper));
+            }
+        }
+        found
+    }
+
+    /// The dual simplex: repair primal infeasibility while holding dual feasibility.
+    ///
+    /// Each iteration takes the most primal-infeasible basic variable out of the
+    /// basis at the bound it violates, and chooses the entering column by the dual
+    /// ratio test — the smallest `|d_j / alpha_rj|` among columns that can move in
+    /// the required direction. No such column means no assignment can repair the
+    /// violation, which is exactly primal infeasibility.
+    ///
+    /// The objective climbs monotonically here, which is what makes `cutoff` sound:
+    /// once it passes, the node's true bound can only be worse.
+    fn run_dual(
+        &mut self,
+        max_iterations: usize,
+        cutoff: Option<f64>,
+        iterations: &mut usize,
+    ) -> Option<LpStatus> {
+        let tol = self.lp.tol.dual_feasibility;
+        let pivot_tol = self.lp.tol.pivot;
+        let mut rho: Vec<f64> = Vec::new();
+
+        while *iterations < max_iterations {
+            if cutoff.is_some_and(|limit| self.objective() > limit) {
+                return Some(LpStatus::CutOff);
+            }
+
+            // Refresh the duals every iteration. Each pivot changes the basis and so
+            // changes every reduced cost; pricing the ratio test against duals left
+            // over from a previous iteration silently picks the wrong entering column
+            // and the solve converges to a point that is not the optimum.
+            self.load_basic_costs(false);
+            let mut y = std::mem::take(&mut self.y);
+            self.basis.btran(&self.cost_b, &mut y);
+            self.y = y;
+
+            let Some((r, violated)) = self.most_infeasible_row() else {
+                // Primal feasible and still dual feasible, so this is the optimum.
+                return Some(LpStatus::Optimal);
+            };
+
+            self.basis.btran_unit(r, &mut rho);
+            // The leaving variable must rise to its lower bound, or fall to its upper.
+            let rising = violated == At::Lower;
+
+            let mut best: Option<(usize, f64)> = None;
+            let mut best_ratio = f64::INFINITY;
+            let mut best_pivot = 0.0;
+            for j in 0..self.lp.n_total() {
+                let Status::NonBasic(at) = self.status[j] else {
+                    continue;
+                };
+                if self.lp.lower[j] == self.lp.upper[j] {
+                    continue;
+                }
+                let arj = if j < self.lp.n_structural {
+                    let (rows, vals) = self.lp.matrix.column(j);
+                    rows.iter()
+                        .zip(vals)
+                        .map(|(&i, &a)| rho[i] * a)
+                        .sum::<f64>()
+                } else {
+                    -rho[j - self.lp.n_structural]
+                };
+                if arj.abs() <= pivot_tol {
+                    continue;
+                }
+                // Moving z_j by t moves the leaving variable by -arj * t. A column at
+                // its lower bound can only increase, one at its upper only decrease;
+                // keep those that push the leaving variable the way it needs to go.
+                let usable = match at {
+                    At::Lower => (arj < 0.0) == rising,
+                    At::Upper => (arj > 0.0) == rising,
+                    At::Zero => true,
+                };
+                if !usable {
+                    continue;
+                }
+                let d = self.reduced_cost(j, false);
+                let ratio = (d.abs() / arj.abs()).max(0.0);
+                let pivot = arj.abs();
+                if ratio < best_ratio - tol || (ratio <= best_ratio + tol && pivot > best_pivot) {
+                    if ratio < best_ratio {
+                        best_ratio = ratio;
+                    }
+                    best = Some((j, arj));
+                    best_pivot = pivot;
+                }
+            }
+
+            let Some((entering, _)) = best else {
+                // The dual is unbounded, so the primal has no feasible point.
+                return Some(LpStatus::Infeasible);
+            };
+
+            // Pivot the chosen column into row r.
+            let mut col = std::mem::take(&mut self.col);
+            self.lp.column_into(entering, &mut col);
+            let mut alpha = std::mem::take(&mut self.alpha);
+            self.basis.ftran(&col, &mut alpha);
+            self.col = col;
+            self.alpha = alpha;
+
+            if self.alpha[r].abs() <= pivot_tol {
+                // The pivot row and column disagree about this element's magnitude,
+                // which means the inverse has drifted. Rebuild and try again.
+                if self.refactorize().is_err() {
+                    return Some(LpStatus::Infeasible);
+                }
+                *iterations += 1;
+                continue;
+            }
+
+            let leaving = self.basic[r];
+            let target = self.lp.value_at(leaving, violated);
+            // Move the entering variable exactly far enough to place the leaving one
+            // on the bound it was violating.
+            let step = (target - self.z[leaving]) / -self.alpha[r];
+            self.z[entering] += step;
+            for i in 0..self.lp.m {
+                let bj = self.basic[i];
+                self.z[bj] -= self.alpha[i] * step;
+            }
+            self.z[leaving] = target;
+
+            self.basis.update(&self.alpha, r);
+            self.basic[r] = entering;
+            self.status[entering] = Status::Basic { row: r };
+            self.status[leaving] = Status::NonBasic(violated);
+
+            *iterations += 1;
+            if self.basis.updates() >= 50 && self.refactorize().is_err() {
+                return Some(LpStatus::Infeasible);
+            }
+        }
+        None
+    }
+
     fn finish(&self, status: LpStatus, iterations: usize) -> LpSolution {
         let x = self.z[..self.lp.n_structural].to_vec();
         let objective = if status == LpStatus::Optimal {
-            (0..self.lp.n_structural)
-                .map(|j| self.lp.cost[j] * self.z[j])
-                .sum()
+            self.objective()
         } else {
             f64::NAN
         };
@@ -540,10 +842,14 @@ impl<'a> Solver<'a> {
             objective,
             x,
             iterations,
+            basis: BasisState {
+                basic: self.basic.clone(),
+                status: self.status.clone(),
+            },
         }
     }
 
-    fn run(mut self, max_iterations: usize) -> LpSolution {
+    fn run(mut self, max_iterations: usize, cutoff: Option<f64>) -> LpSolution {
         const REFACTOR_EVERY: usize = 50;
         // Degenerate (zero-length) steps in a row before switching to Bland's rule.
         const STALL_LIMIT: usize = 100;
@@ -553,6 +859,23 @@ impl<'a> Solver<'a> {
 
         if self.refactorize().is_err() {
             return self.finish(LpStatus::Infeasible, 0);
+        }
+
+        // A warm start inherits dual feasibility from its parent, so the dual method
+        // repairs the one bound the branch just changed in a few pivots. When that
+        // does not hold -- a cold start, or a basis from an unrelated problem -- fall
+        // through to the primal method, which needs no assumptions.
+        let entry = if self.entry_hint == Entry::Dual && self.is_dual_feasible() {
+            Entry::Dual
+        } else {
+            Entry::Primal
+        };
+        if entry == Entry::Dual {
+            match self.run_dual(max_iterations, cutoff, &mut iterations) {
+                Some(status) => return self.finish(status, iterations),
+                // Ran out of iterations inside the dual method.
+                None => return self.finish(LpStatus::IterationLimit, iterations),
+            }
         }
 
         while iterations < max_iterations {
@@ -792,6 +1115,104 @@ mod tests {
         assert_eq!(s.status, LpStatus::Optimal);
         assert!((s.objective + 2.0).abs() < 1e-9, "{}", s.objective);
         assert!((s.x[0] - 0.0).abs() < 1e-9 && (s.x[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn warm_start_agrees_with_a_cold_solve_on_every_branch() {
+        // The differential test the dual simplex actually needs: for each column,
+        // fix it to 0 and to 1 in turn, then check that re-solving from the parent
+        // basis reaches the same objective as solving that subproblem from scratch.
+        // This is exactly the operation branch-and-bound performs at every node.
+        let p = problem(
+            &[3.0, 5.0, 2.0, 7.0],
+            &[
+                (&[2.0, 3.0, 1.0, 4.0], RowSense::Ge, 5.0),
+                (&[1.0, 1.0, 1.0, 1.0], RowSense::Le, 3.0),
+                (&[4.0, 1.0, 2.0, 1.0], RowSense::Ge, 3.0),
+            ],
+        );
+        let mut lp = Lp::relaxation(&p);
+        let root = lp.solve();
+        assert_eq!(root.status, LpStatus::Optimal);
+
+        for j in 0..p.n_cols() {
+            for fix in [0.0, 1.0] {
+                let saved = lp.column_bounds(j);
+                lp.set_column_bounds(j, fix, fix);
+
+                let warm = lp.solve_warm(&root.basis, None, 10_000);
+                let cold = lp.solve();
+                assert_eq!(warm.status, cold.status, "column {j} fixed to {fix}");
+                if cold.status == LpStatus::Optimal {
+                    assert!(
+                        (warm.objective - cold.objective).abs() < 1e-7,
+                        "column {j} fixed to {fix}: warm {} vs cold {}",
+                        warm.objective,
+                        cold.objective
+                    );
+                    assert_feasible(&p, &warm.x);
+                }
+
+                lp.set_column_bounds(j, saved.0, saved.1);
+            }
+        }
+    }
+
+    #[test]
+    fn warm_start_detects_an_infeasible_branch() {
+        // Fixing both columns to 0 cannot satisfy the row, and the dual simplex must
+        // report that rather than returning a bogus optimum.
+        let p = problem(&[1.0, 1.0], &[(&[1.0, 1.0], RowSense::Ge, 1.0)]);
+        let mut lp = Lp::relaxation(&p);
+        let root = lp.solve();
+        lp.set_column_bounds(0, 0.0, 0.0);
+        lp.set_column_bounds(1, 0.0, 0.0);
+        let warm = lp.solve_warm(&root.basis, None, 10_000);
+        assert_eq!(warm.status, LpStatus::Infeasible);
+    }
+
+    #[test]
+    fn cutoff_abandons_a_node_whose_bound_is_already_too_weak() {
+        // Forcing the expensive column in pushes the bound to 5; a cutoff below that
+        // must stop the solve rather than complete it.
+        let p = problem(&[1.0, 5.0], &[(&[1.0, 1.0], RowSense::Ge, 1.0)]);
+        let mut lp = Lp::relaxation(&p);
+        let root = lp.solve();
+        lp.set_column_bounds(0, 0.0, 0.0);
+
+        let cut = lp.solve_warm(&root.basis, Some(2.0), 10_000);
+        assert_eq!(cut.status, LpStatus::CutOff);
+
+        // With a cutoff above the true bound the same solve completes normally.
+        let full = lp.solve_warm(&root.basis, Some(10.0), 10_000);
+        assert_eq!(full.status, LpStatus::Optimal);
+        assert!((full.objective - 5.0).abs() < 1e-9, "{}", full.objective);
+    }
+
+    #[test]
+    fn warm_start_costs_fewer_iterations_than_a_cold_solve() {
+        // The whole point of warm starting. Not a tight bound -- just that inheriting
+        // the parent basis avoids repeating the work.
+        let rows: Vec<(&[f64], RowSense, f64)> = vec![
+            (&[2.0, 3.0, 1.0, 4.0, 1.0, 2.0][..], RowSense::Ge, 6.0),
+            (&[1.0, 2.0, 3.0, 1.0, 2.0, 1.0][..], RowSense::Ge, 5.0),
+            (&[3.0, 1.0, 2.0, 2.0, 1.0, 3.0][..], RowSense::Ge, 7.0),
+            (&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0][..], RowSense::Le, 4.0),
+        ];
+        let p = problem(&[4.0, 6.0, 3.0, 8.0, 2.0, 5.0], &rows);
+        let mut lp = Lp::relaxation(&p);
+        let root = lp.solve();
+
+        lp.set_column_bounds(3, 1.0, 1.0);
+        let warm = lp.solve_warm(&root.basis, None, 10_000);
+        let cold = lp.solve();
+        assert_eq!(warm.status, LpStatus::Optimal);
+        assert!(
+            warm.iterations < cold.iterations,
+            "warm {} iterations, cold {}",
+            warm.iterations,
+            cold.iterations
+        );
     }
 
     #[test]

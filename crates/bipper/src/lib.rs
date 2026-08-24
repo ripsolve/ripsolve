@@ -8,6 +8,7 @@ pub mod generate;
 pub mod lp;
 pub mod model;
 pub mod reader;
+pub mod search;
 pub mod sparse;
 
 pub use model::{ModelError, Problem, RowSense, Sense};
