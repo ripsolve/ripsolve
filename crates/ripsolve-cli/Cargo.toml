@@ -1,15 +1,15 @@
 [package]
-name = "bipper-cli"
+name = "ripsolve-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "bipper"
+name = "ripsolve"
 path = "src/main.rs"
 
 [dependencies]
-bipper.workspace = true
+ripsolve.workspace = true
 anyhow.workspace = true
 clap.workspace = true

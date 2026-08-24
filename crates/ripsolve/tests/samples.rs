@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use bipper::Problem;
+use ripsolve::Problem;
 
 fn samples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples")

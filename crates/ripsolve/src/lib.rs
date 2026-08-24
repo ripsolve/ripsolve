@@ -1,4 +1,4 @@
-//! bipper — a branch-and-cut solver for binary integer programs.
+//! ripsolve — a branch-and-cut solver for binary integer programs.
 //!
 //! Every variable is binary. The LP relaxations solved inside the search are
 //! ordinary bounded continuous LPs, but the model exposed here is pure BIP: see

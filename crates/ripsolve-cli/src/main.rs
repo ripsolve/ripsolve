@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bipper::Problem;
-use bipper::generate::{Kind, Spec};
+use ripsolve::Problem;
+use ripsolve::generate::{Kind, Spec};
 use std::time::Duration;
 
-use bipper::lp::{Lp, LpStatus};
-use bipper::search::{self, Options, Status as SearchStatus};
 use clap::{Parser, Subcommand, ValueEnum};
+use ripsolve::lp::{Lp, LpStatus};
+use ripsolve::search::{self, Options, Status as SearchStatus};
 
 #[derive(Parser)]
 #[command(
-    name = "bipper",
+    name = "ripsolve",
     version,
     about = "A branch-and-cut solver for binary integer programs"
 )]

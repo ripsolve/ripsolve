@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Regenerate the reference-value fixtures used by bipper's tests.
+"""Regenerate the reference-value fixtures used by ripsolve's tests.
 
 Gurobi is a *test oracle* here, not a dependency of the solver: this script runs
 by hand, writes the expected LP-relaxation and MIP-optimal values into a JSON
-fixture, and `cargo test` afterwards reads only that file. Nothing in bipper
+fixture, and `cargo test` afterwards reads only that file. Nothing in ripsolve
 links against Gurobi, and the test suite runs on machines without it.
 
 Usage:  python3 bench/refresh_fixtures.py [--out PATH]
@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_OUT = ROOT / "crates" / "bipper" / "tests" / "fixtures" / "reference.json"
+DEFAULT_OUT = ROOT / "crates" / "ripsolve" / "tests" / "fixtures" / "reference.json"
 
 # Kept small on purpose: these are correctness fixtures, not a performance suite,
 # so every instance must be solvable by Gurobi in well under a second.
@@ -28,7 +28,7 @@ SPECS = [
 
 
 def lp_digest(text):
-    """FNV-1a (64-bit), matching `bipper::generate::lp_digest`.
+    """FNV-1a (64-bit), matching `ripsolve::generate::lp_digest`.
 
     The Rust test regenerates each instance and compares this digest, so a change
     to the generator is caught as a stale fixture rather than silently pairing new
@@ -40,8 +40,8 @@ def lp_digest(text):
     return h
 
 
-def bipper_gen(kind, cols, rows, seed, path):
-    exe = ROOT / "target" / "release" / "bipper"
+def ripsolve_gen(kind, cols, rows, seed, path):
+    exe = ROOT / "target" / "release" / "ripsolve"
     if not exe.exists():
         sys.exit(f"{exe} not found; run `cargo build --release` first")
     subprocess.run(
@@ -61,7 +61,7 @@ def reference_values(lp_path):
     sense = "maximize" if model.ModelSense == gp.GRB.MAXIMIZE else "minimize"
 
     # Root LP relaxation, with presolve and cuts off so the value is the honest
-    # relaxation of the model as written -- that is what bipper's simplex must
+    # relaxation of the model as written -- that is what ripsolve's simplex must
     # reproduce, before any of its own presolve or cuts exist.
     relaxed = model.relax()
     relaxed.setParam("Presolve", 0)
@@ -91,7 +91,7 @@ def main():
     for kind, cols, rows, seed in SPECS:
         name = f"{kind}_c{cols}_r{rows}_s{seed}"
         lp_path = scratch / f"{name}.lp"
-        bipper_gen(kind, cols, rows, seed, lp_path)
+        ripsolve_gen(kind, cols, rows, seed, lp_path)
         lp_value, mip_value, solution, sense = reference_values(lp_path)
         entries.append({
             "kind": kind, "n_cols": cols, "n_rows": rows, "seed": seed,
@@ -124,7 +124,7 @@ def main():
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(
-        {"generator": "bipper gen", "oracle": "gurobi",
+        {"generator": "ripsolve gen", "oracle": "gurobi",
          "instances": entries, "samples": samples},
         indent=2,
     ) + "\n")

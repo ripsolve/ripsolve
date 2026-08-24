@@ -1,7 +1,7 @@
-use bipper::Problem;
-use bipper::generate::{Kind, Spec};
-use bipper::search::{self, Options};
 use lp_parser_rs::problem::LpProblem;
+use ripsolve::Problem;
+use ripsolve::generate::{Kind, Spec};
+use ripsolve::search::{self, Options};
 use std::time::Instant;
 
 fn run(p: &Problem, label: &str) {

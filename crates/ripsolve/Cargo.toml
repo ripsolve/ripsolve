@@ -1,5 +1,5 @@
 [package]
-name = "bipper"
+name = "ripsolve"
 description = "A branch-and-cut solver for binary integer programs, in pure Rust."
 version.workspace = true
 edition.workspace = true

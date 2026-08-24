@@ -1,5 +1,5 @@
 {
-  "generator": "bipper gen",
+  "generator": "ripsolve gen",
   "oracle": "gurobi",
   "instances": [
     {
@@ -9,7 +9,7 @@
       "seed": 1,
       "name": "knapsack_c20_r10_s1",
       "sense": "minimize",
-      "digest": "30a795f8a0f54db6",
+      "digest": "d4d4638e6bf2a4a2",
       "lp_relaxation": 354.068489019034,
       "mip_optimum": 393.0,
       "solution": [
@@ -42,7 +42,7 @@
       "seed": 2,
       "name": "knapsack_c30_r15_s2",
       "sense": "minimize",
-      "digest": "60cfc7a33ae0815c",
+      "digest": "47b9bc5f03bed9a0",
       "lp_relaxation": 443.695545067766,
       "mip_optimum": 474.0,
       "solution": [
@@ -85,7 +85,7 @@
       "seed": 3,
       "name": "knapsack_c45_r20_s3",
       "sense": "minimize",
-      "digest": "16ede7dd0bb244be",
+      "digest": "635ac647fcb4a662",
       "lp_relaxation": 658.225269745747,
       "mip_optimum": 696.0,
       "solution": [
@@ -143,7 +143,7 @@
       "seed": 1,
       "name": "covering_c25_r30_s1",
       "sense": "minimize",
-      "digest": "8d610c8b2c637cf3",
+      "digest": "147d118b8f66c29f",
       "lp_relaxation": 144.0,
       "mip_optimum": 144.0,
       "solution": [
@@ -181,7 +181,7 @@
       "seed": 2,
       "name": "covering_c40_r50_s2",
       "sense": "minimize",
-      "digest": "3d1759f83a22ba85",
+      "digest": "ed1166f1a5200ec1",
       "lp_relaxation": 141.33333333333331,
       "mip_optimum": 143.0,
       "solution": [
@@ -234,7 +234,7 @@
       "seed": 3,
       "name": "covering_c60_r80_s3",
       "sense": "minimize",
-      "digest": "91eb71a3ddc47584",
+      "digest": "a60acbd112461888",
       "lp_relaxation": 77.0,
       "mip_optimum": 80.0,
       "solution": [
@@ -307,7 +307,7 @@
       "seed": 1,
       "name": "signed_c20_r20_s1",
       "sense": "minimize",
-      "digest": "69c769c9d7897fef",
+      "digest": "2074228f2c3111c3",
       "lp_relaxation": 680.9999999999999,
       "mip_optimum": 681.0,
       "solution": [
@@ -340,7 +340,7 @@
       "seed": 2,
       "name": "signed_c32_r32_s2",
       "sense": "minimize",
-      "digest": "0cd48d8b2cbdcf69",
+      "digest": "d20e064a3b62626d",
       "lp_relaxation": 427.0,
       "mip_optimum": 427.0,
       "solution": [
@@ -385,7 +385,7 @@
       "seed": 3,
       "name": "signed_c48_r48_s3",
       "sense": "minimize",
-      "digest": "53593c18032dae1f",
+      "digest": "56aabc32e77c59fb",
       "lp_relaxation": 1100.0,
       "mip_optimum": 1100.0,
       "solution": [

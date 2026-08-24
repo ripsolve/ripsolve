@@ -8,10 +8,10 @@ mod fixtures;
 
 use std::path::Path;
 
-use bipper::Problem;
-use bipper::lp::{Lp, LpStatus};
 use fixtures::{fixtures, samples_dir, spec_of};
 use lp_parser_rs::problem::LpProblem;
+use ripsolve::Problem;
+use ripsolve::lp::{Lp, LpStatus};
 
 /// Solve a problem's relaxation and return its value in the original sense.
 fn relaxation_value(problem: &Problem, name: &str) -> f64 {

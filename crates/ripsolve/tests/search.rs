@@ -2,10 +2,10 @@
 
 mod fixtures;
 
-use bipper::Problem;
-use bipper::search::{self, Options, Status};
 use fixtures::{fixtures, samples_dir, spec_of};
 use lp_parser_rs::problem::LpProblem;
+use ripsolve::Problem;
+use ripsolve::search::{self, Options, Status};
 
 fn check(problem: &Problem, expected: f64, name: &str) -> search::Solution {
     let solution = search::solve(problem, Options::default());
@@ -88,8 +88,8 @@ fn reports_infeasibility() {
 
 #[test]
 fn a_node_limit_stops_early_without_claiming_optimality() {
-    let spec = bipper::generate::Spec {
-        kind: bipper::generate::Kind::Knapsack,
+    let spec = ripsolve::generate::Spec {
+        kind: ripsolve::generate::Kind::Knapsack,
         n_cols: 45,
         n_rows: 20,
         seed: 3,

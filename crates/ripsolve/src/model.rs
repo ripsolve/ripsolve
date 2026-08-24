@@ -183,7 +183,7 @@ pub enum ModelError {
         ub: f64,
     },
     #[error(
-        "column {index} has bounds [{lb}, {ub}], which is not within [0, 1]; bipper solves binary programs only"
+        "column {index} has bounds [{lb}, {ub}], which is not within [0, 1]; ripsolve solves binary programs only"
     )]
     NotBinary { index: usize, lb: f64, ub: f64 },
     #[error("objective contains a non-finite coefficient")]

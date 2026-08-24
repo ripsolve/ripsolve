@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use bipper::generate::{Kind, Spec, lp_digest};
+use ripsolve::generate::{Kind, Spec, lp_digest};
 
 pub fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference.json")

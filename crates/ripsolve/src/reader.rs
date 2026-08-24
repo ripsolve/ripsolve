@@ -27,14 +27,14 @@ pub enum ReadError {
     UnknownFormat(String),
     #[error("the model has no objective function")]
     NoObjective,
-    #[error("the model has {0} objectives; bipper supports exactly one")]
+    #[error("the model has {0} objectives; ripsolve supports exactly one")]
     MultipleObjectives(usize),
     #[error(
-        "variable {0:?} is {1}, but bipper solves binary programs only; \
+        "variable {0:?} is {1}, but ripsolve solves binary programs only; \
          declare it in a Binary section (LP) or with a BV bound (MPS)"
     )]
     NotBinary(String, String),
-    #[error("constraint {0:?} is a special ordered set, which bipper does not support")]
+    #[error("constraint {0:?} is a special ordered set, which ripsolve does not support")]
     SosConstraint(String),
 }
 
