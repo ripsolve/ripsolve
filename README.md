@@ -1,19 +1,25 @@
 # ripsolve
 
-A branch-and-cut solver for **binary integer programs**, in pure Rust.
+A branch-and-cut solver for **mixed-integer programs**, in pure Rust.
 
 `ripsolve` is an LP-relaxation-based branch-and-cut solver: every node solves a
 bounded LP relaxation with the simplex method, and the resulting dual bound —
-strengthened by presolve and cutting planes — is what prunes the search. Every
-variable is binary; general integer and continuous variables are out of scope.
+strengthened by presolve and cutting planes — is what prunes the search.
 
-Status: **early, but solving**. The model layer, LP/MPS readers, instance
-generator, test oracle, LP relaxation solver, presolve, lifted knapsack cover
-cuts, pseudocost branching, and a depth-first branch-and-bound search are in place.
-The basis is factorized sparsely, and primal heuristics supply early incumbents.
+Columns may be binary, general integer, or continuous. A binary variable is just an
+integer bounded to `[0, 1]`; the solver has no separate notion of one, because
+branching splits a range (`x <= floor(v)` against `x >= ceil(v)`) and that
+degenerates to fixing at 0 or 1 on its own.
 
-Both the relaxation and the integer optimum are checked against an independent
-solver on every bundled sample and generated instance.
+Status: **early, but solving**. LP and MPS readers, presolve, lifted knapsack cover
+cuts, Gomory mixed-integer cuts, pseudocost branching, primal heuristics, a sparse
+LU factorization, best-bound search, parallel tree search, and a `gurobipy`-shaped
+Python API are all in place. Quadratic terms, SOS constraints, callbacks and lazy
+constraints are not.
+
+Correctness is checked against Gurobi as an oracle — relaxation values, integer
+optima, and 400 randomized mixed-integer models — but nothing links against it and
+the test suite runs without it.
 
 ## Why not pure enumeration
 
@@ -28,20 +34,57 @@ them. No amount of SIMD or threading closes a gap of that shape — only a stron
 bound does, and that means solving an LP relaxation at each node. That measurement
 is the reason this project exists and why the simplex is its centrepiece.
 
-On that same 60-variable instance, `ripsolve` now proves optimality in **2204 nodes
-and 0.10s** — 4.7 million times fewer nodes than the enumeration approach, and 543x
-faster in wall clock. On a family of dense random instances with 30 rows:
+On that same 60-variable instance, `ripsolve` now proves optimality in **89ms on a
+single thread** — against the enumeration solver's 49.7s across sixteen. On a family
+of dense random instances with 30 rows, enumeration on sixteen threads against the
+other two on one:
 
-| variables | enumeration | ripsolve | Gurobi |
+| variables | enumeration (16t) | ripsolve (1t) | Gurobi (1t) |
 |---:|---:|---:|---:|
-| 60 | 54.7s | 0.10s | 0.15s |
-| 64 | >120s | 0.20s | 0.24s |
-| 80 | — | 0.52s | 0.23s |
-| 200 | — | 19.0s | 0.87s |
-| 500 | — | >400s | 82s |
+| 60 | 49.7s | **0.09s** | 0.33s |
+| 64 | >120s | **0.16s** | 0.17s |
+| 80 | >120s | **0.24s** | 0.25s |
+| 200 | >120s | 6.8s | 1.6s |
+| 500 | — | 1.7% gap at 300s | 294s |
 
-The gap that remains against Gurobi is roughly 20x in nodes, and the work that
-would close it is better branching and primal heuristics.
+## Against Gurobi
+
+Both solvers given the same thread count and the same 60-second limit, timing only
+the solve. Thirteen of the fourteen models are solved to proven optimality, matching
+Gurobi's objective exactly every time.
+
+| | single-threaded | sixteen threads |
+|---|---|---|
+| within 1x | `v032c032`, `v048c048`, `v048c128`, `v064c064`, `v081c162n018`, `v128c256n100` | those, plus `v064c200`, `v064c1000n100`, `v128c1000n100`, `v081c162n009` |
+| 2–4x | `v081c162n009`, `v256c256n100`, `v064c200`, `v128c1000n100`, `v064c1000n100` | `v048c128`, `v256c256n100` |
+| worst | `mkp_200` at 20x | `mkp_200` at 6x |
+
+`v081c162n009` is *faster* than Gurobi at sixteen threads — 0.4s against 1.0s.
+
+Two models are not solved by either. `v064c1000n020` yields no feasible point to
+anything, Gurobi included. `mkp_500` is solved by Gurobi in 294s single-threaded and
+by `ripsolve` not at all; at the 60-second limit it sits at a 5% gap.
+
+`mkp_200` is the remaining outlier and worth naming rather than averaging away: 91k
+nodes against Gurobi's 18k, and a per-node cost that parallelism improves but does
+not close.
+
+### How these were measured
+
+One machine, 16 cores, `--release`. Gurobi is pinned to the same thread count as
+`ripsolve`; left to itself it takes every core, which would compare deployments
+rather than algorithms. Only the solve is timed on both sides — gurobipy's
+`Runtime` excludes parsing, and so does `ripsolve`'s reported elapsed.
+
+`bench/compare.py <seconds> <threads>` reproduces the table. The `v*` models come
+from `samples/` and from a separate generator; the `mkp_N` models are generated on
+demand by `ripsolve gen --kind knapsack --cols N --rows 30 --seed 42`.
+
+The sections below record what each design decision was worth *at the time it was
+made*, measured against whatever the instance set was then. They are kept as
+reasoning rather than restated as current numbers, so a figure there will not always
+match the table above — `mkp_200` in particular now names a harder generated
+instance than it did earlier in the project.
 
 Presolve reduces in place — a fixed column becomes `lb == ub` and a redundant row
 has its bounds freed — so nothing is renumbered and there is no postsolve pass. It
@@ -243,8 +286,8 @@ ripsolve gen --kind knapsack --cols 60 --rows 30 --seed 42 -o hard.lp
 
 ## Python
 
-A `gurobipy`-shaped interface for binary programs, so a gurobipy script using only
-binary variables runs unchanged after swapping the import:
+A `gurobipy`-shaped interface, so a gurobipy script that stays inside the supported
+feature set runs unchanged after swapping the import:
 
 ```python
 import ripsolve as gp

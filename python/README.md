@@ -1,7 +1,8 @@
 # ripsolve for Python
 
-A `gurobipy`-shaped interface for binary integer programs. A gurobipy script that
-uses only binary variables should run unchanged after swapping the import.
+A `gurobipy`-shaped interface for mixed-integer programs. A gurobipy script that
+stays inside the supported feature set should run unchanged after swapping the
+import.
 
 ```python
 import ripsolve as gp
@@ -30,7 +31,7 @@ Needs a Python with development headers. No maturin required.
 | | |
 |---|---|
 | Model | `Model(name)`, `optimize`, `getVars`, `write`, `setParam` |
-| Variables | `addVar`, `addVars`, `.X`, `.VarName`, `.Obj`, `.LB`, `.UB` |
+| Variables | `addVar`, `addVars`, `.X`, `.VarName`, `.VType`, `.Obj`, `.LB`, `.UB` |
 | Expressions | `+ - *`, unary `-`, `<= >= ==`, `quicksum` |
 | Constraints | `addConstr`, `addConstrs`, `.ConstrName` |
 | Objective | `setObjective(expr, GRB.MINIMIZE / GRB.MAXIMIZE)` |
@@ -40,10 +41,14 @@ Needs a Python with development headers. No maturin required.
 
 ## What is not
 
-Every variable is binary. `addVar` takes `vtype` so that source stays portable, but
-rejects anything other than `GRB.BINARY` rather than silently relaxing a model the
-solver cannot honour. There are no callbacks, no quadratic terms, no SOS
-constraints, no lazy constraints, and no multi-objective support.
+No callbacks, no quadratic terms, no SOS constraints, no lazy constraints, and no
+multi-objective support. `addVar` accepts `GRB.BINARY`, `GRB.INTEGER` and
+`GRB.CONTINUOUS`, and rejects anything else rather than silently solving a model it
+cannot honour.
+
+`vtype` defaults to continuous, as gurobipy's does. Defaulting to binary would suit
+this solver's history and is exactly the wrong trade: a ported script calling
+`addVar()` would silently get a different model.
 
 Unknown parameter names raise `KeyError` rather than being ignored, so a
 misspelling fails loudly.
