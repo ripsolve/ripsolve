@@ -1,0 +1,4 @@
+/target
+*.sol
+*.log
+/bench/out

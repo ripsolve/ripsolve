@@ -1,0 +1,4 @@
+[toolchain]
+# bipper builds on stable. The optional `simd` feature (tree/simplex inner loops)
+# will require nightly when it lands; it is off by default.
+channel = "stable"

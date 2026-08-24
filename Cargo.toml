@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/bipper", "crates/bipper-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/andyhenshaw/bipper"
+
+[workspace.dependencies]
+bipper = { path = "crates/bipper", version = "0.1.0" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+lp_parser_rs = "4.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = 1

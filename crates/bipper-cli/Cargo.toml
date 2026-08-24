@@ -1,0 +1,15 @@
+[package]
+name = "bipper-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bipper"
+path = "src/main.rs"
+
+[dependencies]
+bipper.workspace = true
+anyhow.workspace = true
+clap.workspace = true
