@@ -55,6 +55,9 @@ pub struct Options {
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
+    /// Product-form updates before refactorizing the basis; see
+    /// [`crate::lp::Tolerances::refactor_interval`].
+    pub refactor_interval: usize,
     /// Worker threads for the tree search. One (or zero) runs the serial driver.
     ///
     /// Only the tree is parallel: presolve, cut generation and the root heuristics
@@ -102,6 +105,7 @@ impl Default for Options {
             // measured; a larger budget finds no more cuts and only costs time.
             cut_rounds: 3,
             cuts_per_round: 32,
+            refactor_interval: 50,
             threads: 1,
             plunge_limit: 0,
             heuristic_frequency: 100,
@@ -711,7 +715,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     };
 
     let _ = problem.n_cols();
-    let mut lp = Lp::relaxation(problem);
+    let mut lp = Lp::relaxation(problem).with_tolerances(crate::lp::Tolerances {
+        refactor_interval: options.refactor_interval,
+        ..Default::default()
+    });
     // Cuts add rows but never columns, so `n` stays valid across the cut loop.
 
     let mut nodes = 0usize;

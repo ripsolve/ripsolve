@@ -42,6 +42,12 @@ pub struct Tolerances {
     pub dual_feasibility: f64,
     /// Pivots smaller than this are rejected as numerically unsafe.
     pub pivot: f64,
+    /// Product-form updates to accumulate before refactorizing.
+    ///
+    /// Trades two costs against each other: every solve replays the whole eta file,
+    /// so a long interval makes solves expensive, while refactorizing is a fixed
+    /// cost amortized over the interval.
+    pub refactor_interval: usize,
 }
 
 impl Default for Tolerances {
@@ -50,6 +56,7 @@ impl Default for Tolerances {
             primal_feasibility: 1e-7,
             dual_feasibility: 1e-7,
             pivot: 1e-9,
+            refactor_interval: 50,
         }
     }
 }
@@ -879,7 +886,8 @@ impl<'a> Solver<'a> {
             self.status[leaving] = Status::NonBasic(violated);
 
             *iterations += 1;
-            if self.basis.updates() >= 50 && self.refactorize().is_err() {
+            if self.basis.updates() >= self.lp.tol.refactor_interval && self.refactorize().is_err()
+            {
                 return Some(LpStatus::Infeasible);
             }
         }
@@ -1055,7 +1063,6 @@ impl<'a> Solver<'a> {
     }
 
     fn run(mut self, max_iterations: usize, cutoff: Option<f64>) -> LpSolution {
-        const REFACTOR_EVERY: usize = 50;
         // Degenerate (zero-length) steps in a row before switching to Bland's rule.
         const STALL_LIMIT: usize = 100;
 
@@ -1150,7 +1157,8 @@ impl<'a> Solver<'a> {
             }
 
             iterations += 1;
-            if self.basis.updates() >= REFACTOR_EVERY && self.refactorize().is_err() {
+            if self.basis.updates() >= self.lp.tol.refactor_interval && self.refactorize().is_err()
+            {
                 return self.finish(LpStatus::Infeasible, iterations);
             }
         }
