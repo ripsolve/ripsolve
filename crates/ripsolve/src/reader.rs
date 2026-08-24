@@ -74,6 +74,64 @@ fn declared_integer(text: &str) -> HashSet<String> {
     names
 }
 
+/// Names declared integral by an MPS file, recovered from the source text.
+///
+/// The same workaround as [`declared_integer`], for the other format. MPS carries
+/// integrality two ways and `lp_parser_rs` reports neither: `MARKER` lines bracket
+/// runs of integer columns inside `COLUMNS`, and the `BOUNDS` section can mark a
+/// column directly with `BV` (binary), `LI` or `UI` (integer bounds).
+///
+/// Losing this is not a small matter. A model whose integrality vanishes solves as
+/// a pure LP and reports the relaxation as a proven optimum — silently, and with a
+/// better objective than the true one, which is exactly what makes it hard to
+/// notice. MIPLIB's `flugpl` came back at 1167185.73 against a true optimum of
+/// 1201500 before this existed.
+fn declared_integer_mps(text: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut section = "";
+    let mut inside_marker = false;
+
+    for line in text.lines() {
+        if line.starts_with('*') {
+            continue;
+        }
+        // A section header starts in column one; data lines are indented.
+        if !line.starts_with([' ', '\t']) {
+            section = line.split_whitespace().next().unwrap_or("");
+            inside_marker = false;
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty() {
+            continue;
+        }
+
+        match section {
+            "COLUMNS" => {
+                // MARKER lines carry INTORG/INTEND rather than matrix data.
+                if line.contains("'MARKER'") {
+                    if line.contains("'INTORG'") {
+                        inside_marker = true;
+                    } else if line.contains("'INTEND'") {
+                        inside_marker = false;
+                    }
+                    continue;
+                }
+                if inside_marker {
+                    names.insert(fields[0].to_string());
+                }
+            }
+            // `<type> <bound-set> <column> [value]`; three of the bound types imply
+            // integrality regardless of any MARKER block.
+            "BOUNDS" if matches!(fields[0], "BV" | "LI" | "UI") && fields.len() >= 3 => {
+                names.insert(fields[2].to_string());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 /// Failure to turn a model file into a [`Problem`].
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -127,7 +185,7 @@ impl Problem {
         // see `declared_integer`.
         let integral = match format {
             Format::Lp => declared_integer(&content),
-            Format::Mps => HashSet::new(),
+            Format::Mps => declared_integer_mps(&content),
         };
         Problem::from_lp_with_integrality(&lp, &integral)
     }

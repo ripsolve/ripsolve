@@ -197,3 +197,39 @@ End
     assert!((solution.x[0] - 4.0).abs() < 1e-6, "x = {}", solution.x[0]);
     assert!((solution.objective.unwrap() + 4.0).abs() < 1e-6);
 }
+
+#[test]
+fn mps_integrality_survives_the_parser() {
+    // Regression. `lp_parser_rs` reports neither form of MPS integrality: a MARKER
+    // block around a run of columns, nor a BV/LI/UI bound naming one. A model that
+    // loses it solves as a pure LP and reports the relaxation as a proven optimum —
+    // silently, and with a *better* objective than the truth, which is what makes it
+    // hard to notice. MIPLIB's flugpl came back at 1167185.73 against a true 1201500.
+    let problem = Problem::from_file(&samples_dir().join("mip/markers.mps")).unwrap();
+
+    let by_name = |name: &str| problem.col_names.iter().position(|n| n == name).unwrap();
+    let (xint, xcont, xbin) = (by_name("XINT"), by_name("XCONT"), by_name("XBIN"));
+
+    assert!(problem.is_integer(xint), "MARKER block did not survive");
+    assert!(!problem.is_binary(xint), "XINT is bounded to 9, not binary");
+    assert!(problem.is_integer(xbin), "BV bound did not survive");
+    assert!(problem.is_binary(xbin));
+    assert!(!problem.is_integer(xcont), "XCONT is continuous");
+
+    // And the solve honours it: the integer column must land on an integer while
+    // the continuous one need not.
+    let solution = search::solve(
+        &problem,
+        Options {
+            threads: 1,
+            ..Options::default()
+        },
+    );
+    assert_eq!(solution.status, Status::Optimal);
+    assert_valid(
+        &problem,
+        &solution.x,
+        solution.objective.unwrap(),
+        "markers.mps",
+    );
+}
