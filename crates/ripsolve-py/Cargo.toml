@@ -1,0 +1,16 @@
+[package]
+name = "ripsolve-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Named for the module Python will import; `cdylib` because CPython loads it as a
+# shared object rather than linking it as a Rust library.
+name = "ripsolve"
+crate-type = ["cdylib"]
+
+[dependencies]
+ripsolve.workspace = true
+pyo3 = { workspace = true, features = ["extension-module"] }

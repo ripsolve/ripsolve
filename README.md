@@ -215,6 +215,8 @@ node counts.
 | `crates/ripsolve` | The solver library |
 | `crates/ripsolve-cli` | The `ripsolve` command-line application |
 | `samples/` | Example models in LP and MPS format |
+| `crates/ripsolve-py` | The Python extension module |
+| `python/` | Python build script and test suite |
 | `bench/` | Benchmark and fixture-refresh tooling |
 
 Inside the library, `lp` holds the simplex: `lp::basis` is the basis inverse and
@@ -238,6 +240,26 @@ ripsolve info  samples/v064c064.lp
 ripsolve relax samples/v064c064.lp
 ripsolve gen --kind knapsack --cols 60 --rows 30 --seed 42 -o hard.lp
 ```
+
+## Python
+
+A `gurobipy`-shaped interface for binary programs, so a gurobipy script using only
+binary variables runs unchanged after swapping the import:
+
+```python
+import ripsolve as gp
+from ripsolve import GRB
+
+m = gp.Model("knapsack")
+x = m.addVars(n, vtype=GRB.BINARY, name="x")
+m.setObjective(gp.quicksum(value[j] * x[j] for j in range(n)), GRB.MAXIMIZE)
+m.addConstr(gp.quicksum(weight[j] * x[j] for j in range(n)) <= capacity)
+m.optimize()
+```
+
+Build it with `python/build.sh` and see `python/README.md` for what is and is not
+supported. The test suite runs the same model through both solvers and requires the
+answers to match.
 
 ## Testing against a reference solver
 

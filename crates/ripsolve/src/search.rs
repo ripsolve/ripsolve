@@ -851,7 +851,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     // Consider the root itself first, so an integral relaxation is picked up without
     // a branching step.
     if let Some(x) = integral_solution(&root.x, options.integrality_tolerance) {
-        incumbent = root.objective;
+        // Scored from the rounded point, not the relaxation value; see
+        // `objective_at`.
+        incumbent = objective_at(problem, &x);
         incumbent_x = Some(x);
         open = OpenNodes::new(options.plunge_limit);
     }
@@ -975,6 +977,16 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         root_bound: problem.objective_value(first_bound),
         root_bound_after_cuts: problem.objective_value(root_bound),
     }
+}
+
+/// The internal-form objective of a binary assignment.
+fn objective_at(problem: &Problem, x: &[u8]) -> f64 {
+    problem
+        .obj
+        .iter()
+        .zip(x)
+        .map(|(c, &v)| c * f64::from(v))
+        .sum()
 }
 
 /// Would a node with this bound improve on the incumbent by enough to be worth
