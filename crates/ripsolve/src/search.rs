@@ -737,6 +737,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         refactor_interval: options.refactor_interval,
         ..Default::default()
     });
+    // The budget belongs to the LP as well as the node loop. Checking only between
+    // nodes is no limit at all once a single solve outlives the whole budget.
+    let deadline = options.time_limit.map(|limit| started + limit);
+    lp.set_deadline(deadline);
     // Cuts add rows but never columns, so `n` stays valid across the cut loop.
 
     let mut nodes = 0usize;
@@ -751,10 +755,13 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     nodes += 1;
 
     if root.status != LpStatus::Optimal {
-        let status = if root.status == LpStatus::Infeasible {
-            Status::Infeasible
-        } else {
-            Status::NodeLimit
+        // The LP reports only that it gave up, not why. If the budget has run out,
+        // that is what stopped it, and saying NodeLimit would send the caller
+        // looking for a node limit they never set.
+        let status = match root.status {
+            LpStatus::Infeasible => Status::Infeasible,
+            _ if deadline.is_some_and(|d| Instant::now() >= d) => Status::TimeLimit,
+            _ => Status::NodeLimit,
         };
         return Solution {
             status,
@@ -782,6 +789,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut with_cuts;
     let mut problem = problem;
     for _ in 0..options.cut_rounds {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         if root.status != LpStatus::Optimal
             || integral_solution(problem, &root.x, options.integrality_tolerance).is_some()
         {
@@ -791,7 +801,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         // knapsack, while GMI comes off the tableau and applies to any fractional
         // basic column. On dense random rows the second is usually the only one that
         // finds anything.
-        let mut found = cuts::separate(problem, &root.x, options.cuts_per_round);
+        let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
         found.extend(cuts::separate_gomory(
             &lp,
             &root.basis,
@@ -806,6 +816,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         cuts_added += found.len();
 
         let mut candidate = Lp::relaxation(&with_cuts);
+        candidate.set_deadline(deadline);
         let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
         iterations += resolved.iterations;
         if resolved.status != LpStatus::Optimal {

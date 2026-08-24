@@ -30,7 +30,13 @@
 
 use crate::lp::basis::{Basis, BasisError};
 use crate::model::Problem;
+use std::time::Instant;
+
 use crate::sparse::SparseMatrix;
+
+/// Pivots between clock checks. Small enough to bound the overrun, large enough
+/// that reading the clock does not show up in a profile.
+const CLOCK_INTERVAL: usize = 256;
 
 /// Factorizations kept per LP.
 ///
@@ -149,6 +155,13 @@ pub struct Lp {
     matrix: SparseMatrix,
     /// Which structural columns must take integer values. Logicals are continuous.
     integer: Vec<bool>,
+    /// When to give up, if the caller set a wall-clock budget.
+    ///
+    /// Checked inside the pivot loops, not only between solves. A single LP on a
+    /// large model can outlive the whole budget: on MIPLIB's atlanta-ip (48738
+    /// columns) the solver ran four times past a sixty-second limit because nothing
+    /// below the node loop had any notion of time.
+    deadline: Option<Instant>,
     tol: Tolerances,
     /// Recently used factorizations, most recent first, keyed by basis columns.
     ///
@@ -178,6 +191,7 @@ impl Clone for Lp {
             upper: self.upper.clone(),
             matrix: self.matrix.clone(),
             integer: self.integer.clone(),
+            deadline: self.deadline,
             tol: self.tol,
             factors: Vec::new(),
         }
@@ -211,6 +225,7 @@ impl Lp {
             upper,
             matrix: problem.matrix.clone(),
             integer,
+            deadline: None,
             tol: Tolerances::default(),
             factors: Vec::new(),
         }
@@ -226,6 +241,18 @@ impl Lp {
         debug_assert!(j < self.n_structural);
         self.lower[j] = lo;
         self.upper[j] = hi;
+    }
+
+    /// Give the solver a wall-clock budget, after which a solve gives up and
+    /// reports [`LpStatus::IterationLimit`] — the node is unresolved either way,
+    /// and the search treats both the same.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Has the budget run out?
+    pub fn out_of_time(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Discard any cached factorization.
@@ -891,6 +918,11 @@ impl<'a> Solver<'a> {
         let mut stalled = 0usize;
 
         while *iterations < max_iterations {
+            // Polled rather than checked every pivot: reading the clock is not free,
+            // and this granularity bounds the overrun to a few hundred pivots.
+            if iterations.is_multiple_of(CLOCK_INTERVAL) && self.lp.out_of_time() {
+                return Some(LpStatus::IterationLimit);
+            }
             let bland = stalled > STALL_LIMIT;
             if cutoff.is_some_and(|limit| self.objective() > limit) {
                 return Some(LpStatus::CutOff);
@@ -1052,6 +1084,10 @@ impl<'a> Solver<'a> {
 
         for i in 0..lp.m {
             if cuts.len() >= max_cuts {
+                break;
+            }
+            // Generating cuts on a large model is itself a long operation.
+            if i.is_multiple_of(CLOCK_INTERVAL) && lp.out_of_time() {
                 break;
             }
             // Only an integer column carries a requirement to exploit.
@@ -1245,6 +1281,9 @@ impl<'a> Solver<'a> {
         }
 
         while iterations < max_iterations {
+            if iterations.is_multiple_of(CLOCK_INTERVAL) && self.lp.out_of_time() {
+                return self.done(LpStatus::IterationLimit, iterations);
+            }
             let infeasibility = self.infeasibility();
             let phase_one = infeasibility > self.lp.tol.primal_feasibility;
 
@@ -1325,6 +1364,8 @@ impl<'a> Solver<'a> {
 mod tests {
     use super::*;
     use crate::model::{RowSense, Sense};
+    use std::time::Instant;
+
     use crate::sparse::SparseMatrix;
 
     /// Build a problem from dense rows, for readable test cases.

@@ -389,10 +389,25 @@ pub fn separate_gomory(
 ///
 /// Returns at most `limit` cuts, strongest violation first.
 pub fn separate(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
+    separate_until(problem, x, limit, None)
+}
+
+/// As [`separate`], stopping early if `deadline` passes.
+pub fn separate_until(
+    problem: &Problem,
+    x: &[f64],
+    limit: usize,
+    deadline: Option<std::time::Instant>,
+) -> Vec<Cut> {
     let csr = problem.matrix.to_csr();
     let mut found: Vec<Cut> = Vec::new();
 
     for i in 0..problem.n_rows() {
+        // Separation over a large model is itself a long operation; stop rather
+        // than run past a budget the caller set.
+        if i.is_multiple_of(256) && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
         let (cols, vals) = csr.column(i);
         if cols.is_empty() {
             continue;
