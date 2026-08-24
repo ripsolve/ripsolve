@@ -225,7 +225,17 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         {
             break;
         }
-        let found = cuts::separate(problem, &root.x, options.cuts_per_round);
+        // Two families with different reach: covers need a row that reads as a
+        // knapsack, while GMI comes off the tableau and applies to any fractional
+        // basic column. On dense random rows the second is usually the only one that
+        // finds anything.
+        let mut found = cuts::separate(problem, &root.x, options.cuts_per_round);
+        found.extend(cuts::separate_gomory(
+            &lp,
+            &root.basis,
+            &root.x,
+            options.cuts_per_round,
+        ));
         if found.is_empty() {
             break;
         }

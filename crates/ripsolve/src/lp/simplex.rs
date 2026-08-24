@@ -244,6 +244,37 @@ impl Lp {
         Solver::new(self).run(max_iterations, None)
     }
 
+    /// Generate Gomory mixed-integer cuts from the tableau at `basis`.
+    ///
+    /// Returned in terms of the *structural* columns, as `(coefficients, lower
+    /// bound)` pairs meaning `sum a_j x_j >= lb`.
+    ///
+    /// # Derivation
+    ///
+    /// Each tableau row reads `z_B(i) + sum_j a_j w_j = beta`, where `w_j >= 0` is
+    /// the nonbasic's distance from the bound it sits on — `z_j - l_j` at a lower
+    /// bound, `u_j - z_j` at an upper one. That shift is what lets a
+    /// bounded-variable simplex use the textbook formula, which assumes nonbasics at
+    /// zero, and it is also where the sign of `a_j` flips for an at-upper column.
+    ///
+    /// With `f0` the fractional part of `beta`, the cut is `sum_j c_j w_j >= 1` for
+    /// coefficients `c_j` that differ between integer and continuous `w_j`. Every
+    /// structural here is binary and so integer; the logicals are continuous.
+    ///
+    /// Substituting `w_j` back gives a row over `z = [x; s]`, and the logical part
+    /// is eliminated with `s = A x`, leaving a cut over the structural columns only.
+    pub fn gomory_cuts(
+        &self,
+        basis: &BasisState,
+        max_cuts: usize,
+    ) -> Vec<(Vec<(usize, f64)>, f64)> {
+        let mut solver = Solver::warm(self, basis);
+        if solver.refactorize().is_err() {
+            return Vec::new();
+        }
+        solver.gomory_cuts(max_cuts)
+    }
+
     /// Re-solve starting from a saved basis.
     ///
     /// `cutoff` lets the solve abandon a node early: the dual simplex's objective
@@ -849,6 +880,151 @@ impl<'a> Solver<'a> {
             }
         }
         None
+    }
+
+    /// See [`Lp::gomory_cuts`].
+    fn gomory_cuts(&mut self, max_cuts: usize) -> Vec<(Vec<(usize, f64)>, f64)> {
+        // A fractionality this close to an integer makes the cut's coefficients blow
+        // up: they carry 1/f0 and 1/(1 - f0) factors.
+        const MIN_FRACTIONALITY: f64 = 0.01;
+        // Cuts whose coefficients span more than this are numerically worthless and
+        // actively harmful to the LPs that must then carry them.
+        const MAX_DYNAMISM: f64 = 1e6;
+        const TINY: f64 = 1e-11;
+
+        let lp = self.lp;
+        let mut rho: Vec<f64> = Vec::new();
+        let mut cuts = Vec::new();
+
+        for i in 0..lp.m {
+            if cuts.len() >= max_cuts {
+                break;
+            }
+            // Only a structural column carries an integrality requirement to exploit.
+            let basic = self.basic[i];
+            if basic >= lp.n_structural {
+                continue;
+            }
+            let beta = self.z[basic];
+            let f0 = beta - beta.floor();
+            if !(MIN_FRACTIONALITY..=1.0 - MIN_FRACTIONALITY).contains(&f0) {
+                continue;
+            }
+
+            self.basis.btran_unit(i, &mut rho);
+
+            // Accumulate the cut over z = [x; s], then fold the logicals into x.
+            let mut z_coeff = vec![0.0f64; lp.n_total()];
+            let mut rhs = 1.0f64;
+            let mut usable = true;
+
+            for j in 0..lp.n_total() {
+                let Status::NonBasic(at) = self.status[j] else {
+                    continue;
+                };
+                if lp.lower[j] == lp.upper[j] {
+                    // Fixed: contributes a constant, and w_j is identically zero.
+                    continue;
+                }
+                let alpha = if j < lp.n_structural {
+                    let (rows, vals) = lp.matrix.column(j);
+                    rows.iter()
+                        .zip(vals)
+                        .map(|(&r, &v)| rho[r] * v)
+                        .sum::<f64>()
+                } else {
+                    -rho[j - lp.n_structural]
+                };
+                // At an upper bound the shift w_j = u_j - z_j reverses the sign.
+                let a = match at {
+                    At::Upper => -alpha,
+                    _ => alpha,
+                };
+                if a.abs() <= TINY {
+                    continue;
+                }
+
+                let c = if j < lp.n_structural {
+                    // Integer column: the piecewise-linear integer coefficient.
+                    let f = a - a.floor();
+                    if f <= f0 {
+                        f / f0
+                    } else {
+                        (1.0 - f) / (1.0 - f0)
+                    }
+                } else {
+                    // Continuous column.
+                    if a >= 0.0 { a / f0 } else { -a / (1.0 - f0) }
+                };
+                if c.abs() <= TINY {
+                    continue;
+                }
+
+                // Undo the shift: w_j = z_j - l_j, or u_j - z_j at an upper bound.
+                match at {
+                    At::Upper => {
+                        let u = lp.upper[j];
+                        if !u.is_finite() {
+                            usable = false;
+                            break;
+                        }
+                        z_coeff[j] -= c;
+                        rhs -= c * u;
+                    }
+                    _ => {
+                        let l = lp.lower[j];
+                        if !l.is_finite() {
+                            usable = false;
+                            break;
+                        }
+                        z_coeff[j] += c;
+                        rhs += c * l;
+                    }
+                }
+            }
+            if !usable {
+                continue;
+            }
+
+            // Eliminate the logicals with s_k = sum_j A[k][j] x_j.
+            let mut x_coeff = z_coeff[..lp.n_structural].to_vec();
+            for k in 0..lp.m {
+                let h = z_coeff[lp.n_structural + k];
+                if h == 0.0 {
+                    continue;
+                }
+                for (j, coeff) in x_coeff.iter_mut().enumerate() {
+                    let (rows, vals) = lp.matrix.column(j);
+                    if let Some(pos) = rows.iter().position(|&r| r == k) {
+                        *coeff += h * vals[pos];
+                    }
+                }
+            }
+
+            let coefficients: Vec<(usize, f64)> = x_coeff
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v.abs() > 1e-9)
+                .map(|(j, &v)| (j, v))
+                .collect();
+            if coefficients.is_empty() {
+                continue;
+            }
+            let largest = coefficients
+                .iter()
+                .map(|&(_, v)| v.abs())
+                .fold(0.0f64, f64::max);
+            let smallest = coefficients
+                .iter()
+                .map(|&(_, v)| v.abs())
+                .fold(f64::INFINITY, f64::min);
+            if largest / smallest > MAX_DYNAMISM || !rhs.is_finite() {
+                continue;
+            }
+
+            cuts.push((coefficients, rhs));
+        }
+        cuts
     }
 
     fn finish(&self, status: LpStatus, iterations: usize) -> LpSolution {

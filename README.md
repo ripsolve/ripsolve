@@ -50,13 +50,21 @@ is worth a great deal on structured models (`v006c*` is solved outright;
 families above. That is not a shortfall in the implementation: Gurobi's presolve
 also reduces those instances to exactly their original dimensions.
 
-Lifted knapsack cover cuts raise the root bound substantially where presolve finds
-nothing — on `v064c064` from 72.47 to 84.83 against an optimum of 137, and on
+Two cut families run at the root. Lifted knapsack covers are combinatorial and need
+a row that reads as a knapsack; Gomory mixed-integer cuts come off the simplex
+tableau and need no structure at all, which is what reaches the dense random rows
+covers cannot see. Together they raise the root bound substantially where presolve
+finds nothing — on `v064c064` from 72.47 to 84.83 against an optimum of 137, and on
 `v064c200` from 72.13 to 82.70 against 225. Converting that bound into a smaller
 tree is another matter: with most-fractional branching the node counts do not track
 the bound at all. On `v064c200`, successive cut budgets give 9304, then 16918, then
 6230 nodes while the bound only improves. Branching choice, not the bound,
 dominated the tree's shape.
+
+Adding GMI cuts to covers moved `v128c1000n100` from a 63% gap after 60s to proven
+optimal in 6s, and cut `v256c256n100` from 2290 nodes to 250 and `v128c256n100`
+from 368 to 1. Two instances regressed instead — the node counts still do not track
+the bound, which improves monotonically with every cut added.
 
 Pseudocost branching addresses that, scoring a column by the objective degradation
 it has actually caused rather than by how fractional it looks. It is a large win on

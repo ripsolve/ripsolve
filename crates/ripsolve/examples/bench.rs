@@ -4,44 +4,45 @@ use std::time::Instant;
 
 fn main() {
     let home = std::env::var("HOME").unwrap();
-    let cases: Vec<(String, String)> = vec![
-        (
-            "v081c162n009",
-            format!("{home}/repos/bip-gen/v081c162n009.lp"),
-        ),
+    for (name, path) in [
+        ("v064c200", "samples/v064c200.mps".to_string()),
         (
             "v081c162n018",
             format!("{home}/repos/bip-gen/v081c162n018.lp"),
         ),
         (
-            "v128c256n100",
-            format!("{home}/repos/bip-gen/v128c256n100.lp"),
+            "v128c1000n100",
+            format!("{home}/repos/bip-gen/v128c1000n100.lp"),
         ),
         (
             "v256c256n100",
             format!("{home}/repos/bip-gen/v256c256n100.lp"),
         ),
-        ("v064c064", "samples/v064c064.lp".into()),
-        ("v064c200", "samples/v064c200.mps".into()),
-        ("v048c048", "samples/v048c048.lp".into()),
-    ]
-    .into_iter()
-    .map(|(a, b)| (a.to_string(), b))
-    .collect();
-
-    println!(
-        "{:16} {:>9} {:>10}   objective",
-        "instance", "nodes", "time"
-    );
-    for (name, path) in cases {
+    ] {
         let p = Problem::from_file(std::path::Path::new(&path)).unwrap();
-        let t = Instant::now();
-        let s = search::solve(&p, Options::default());
-        println!(
-            "{name:16} {:>9} {:>10.2?}   {}",
-            s.nodes,
-            t.elapsed(),
-            s.objective.unwrap_or(f64::NAN)
-        );
+        println!("--- {name}");
+        for (rounds, per) in [(1usize, 8usize), (2, 12), (3, 32), (5, 32)] {
+            let o = Options {
+                cut_rounds: rounds,
+                cuts_per_round: per,
+                time_limit: Some(std::time::Duration::from_secs(60)),
+                ..Options::default()
+            };
+            let t = Instant::now();
+            let s = search::solve(&p, o);
+            println!(
+                "  rounds={rounds} per={per:<3} cuts={:<4} root {:.1}->{:.1} {:>8} nodes {:>8.2?} {}",
+                s.cuts_added,
+                s.root_bound,
+                s.root_bound_after_cuts,
+                s.nodes,
+                t.elapsed(),
+                if s.status == search::Status::Optimal {
+                    "optimal"
+                } else {
+                    "LIMIT"
+                }
+            );
+        }
     }
 }

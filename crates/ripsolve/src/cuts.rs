@@ -305,6 +305,39 @@ fn cover_to_cut(knapsack: &Knapsack, cover: &[usize]) -> Cut {
     }
 }
 
+/// Separate Gomory mixed-integer cuts from the tableau at `basis`.
+///
+/// Covers are combinatorial and need a row that reads as a knapsack; GMI cuts come
+/// from the simplex tableau and need no structure at all, so they reach models the
+/// cover separator cannot see. The derivation lives in [`crate::lp::Lp::gomory_cuts`],
+/// which has the tableau; this wraps the result and applies the same
+/// worth-adding test as every other family.
+pub fn separate_gomory(
+    lp: &crate::lp::Lp,
+    basis: &crate::lp::BasisState,
+    x: &[f64],
+    limit: usize,
+) -> Vec<Cut> {
+    let mut found: Vec<Cut> = lp
+        .gomory_cuts(basis, limit * 4)
+        .into_iter()
+        .map(|(coefficients, lb)| Cut {
+            coefficients,
+            lb,
+            ub: f64::INFINITY,
+        })
+        .filter(|cut| cut.violation(x) > MIN_VIOLATION)
+        .collect();
+
+    found.sort_by(|a, b| {
+        b.violation(x)
+            .partial_cmp(&a.violation(x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    found.truncate(limit);
+    found
+}
+
 /// Separate knapsack cover cuts violated by `x`.
 ///
 /// Returns at most `limit` cuts, strongest violation first.
@@ -507,6 +540,84 @@ mod tests {
             &[(&[2.5, 2.5, 2.5], RowSense::Le, 4.2)],
         );
         assert_cuts_are_valid(&p, "fractional weights");
+    }
+
+    /// GMI cuts get the same exhaustive treatment as covers: no feasible binary
+    /// point may be cut off. They are derived from floating-point tableau entries
+    /// rather than from combinatorial reasoning, so they are the family most likely
+    /// to produce a subtly invalid inequality.
+    fn assert_gomory_is_valid(p: &Problem, label: &str) -> usize {
+        let lp = Lp::relaxation(p);
+        let relaxed = lp.solve();
+        if relaxed.status != LpStatus::Optimal {
+            return 0;
+        }
+        let cuts = separate_gomory(&lp, &relaxed.basis, &relaxed.x, 32);
+        let points = feasible_points(p);
+        for cut in &cuts {
+            for point in &points {
+                assert!(
+                    cut.violation(point) <= 1e-6,
+                    "{label}: gomory cut {:?} >= {} removes feasible point {point:?}",
+                    cut.coefficients,
+                    cut.lb
+                );
+            }
+            assert!(
+                cut.violation(&relaxed.x) > MIN_VIOLATION,
+                "{label}: gomory cut does not separate the relaxation"
+            );
+        }
+        cuts.len()
+    }
+
+    #[test]
+    fn gomory_cuts_never_remove_a_feasible_point() {
+        let mut total = 0;
+        for kind in [Kind::Knapsack, Kind::Covering, Kind::Signed] {
+            for seed in 0..14u64 {
+                let spec = Spec {
+                    kind,
+                    n_cols: 13,
+                    n_rows: 7,
+                    seed,
+                };
+                let p = Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap();
+                total += assert_gomory_is_valid(&p, &spec.name());
+            }
+        }
+        assert!(
+            total > 0,
+            "no gomory cuts generated anywhere, so nothing was tested"
+        );
+    }
+
+    #[test]
+    fn gomory_cuts_tighten_the_relaxation() {
+        let spec = Spec {
+            kind: Kind::Knapsack,
+            n_cols: 16,
+            n_rows: 8,
+            seed: 5,
+        };
+        let mut p = Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap();
+        let lp = Lp::relaxation(&p);
+        let before = lp.solve();
+        let cuts = separate_gomory(&lp, &before.basis, &before.x, 16);
+        assert!(
+            !cuts.is_empty(),
+            "expected gomory cuts on a fractional relaxation"
+        );
+
+        p.add_cuts(&cuts);
+        let after = Lp::relaxation(&p).solve();
+        assert_eq!(after.status, LpStatus::Optimal);
+        assert!(
+            after.objective > before.objective + 1e-9,
+            "bound did not improve: {} -> {}",
+            before.objective,
+            after.objective
+        );
     }
 
     #[test]
