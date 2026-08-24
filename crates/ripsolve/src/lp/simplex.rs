@@ -899,6 +899,9 @@ impl<'a> Solver<'a> {
         let lp = self.lp;
         let mut rho: Vec<f64> = Vec::new();
         let mut cuts = Vec::new();
+        // Row-major view of A, built once. Substituting the logicals out needs the
+        // rows of A, and the matrix is stored by column.
+        let rows_of_a = lp.matrix.to_csr();
 
         for i in 0..lp.m {
             if cuts.len() >= max_cuts {
@@ -990,18 +993,19 @@ impl<'a> Solver<'a> {
                 continue;
             }
 
-            // Eliminate the logicals with s_k = sum_j A[k][j] x_j.
+            // Eliminate the logicals with s_k = sum_j A[k][j] x_j, walking row k of A
+            // directly. Searching every column for row k instead turns this into
+            // O(columns * nonzeros-per-column) per logical, which on a dense 256x256
+            // model was most of the solve time.
             let mut x_coeff = z_coeff[..lp.n_structural].to_vec();
             for k in 0..lp.m {
                 let h = z_coeff[lp.n_structural + k];
                 if h == 0.0 {
                     continue;
                 }
-                for (j, coeff) in x_coeff.iter_mut().enumerate() {
-                    let (rows, vals) = lp.matrix.column(j);
-                    if let Some(pos) = rows.iter().position(|&r| r == k) {
-                        *coeff += h * vals[pos];
-                    }
+                let (columns, values) = rows_of_a.column(k);
+                for (&j, &v) in columns.iter().zip(values) {
+                    x_coeff[j] += h * v;
                 }
             }
 

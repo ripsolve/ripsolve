@@ -196,9 +196,23 @@ fn find_cover(knapsack: &Knapsack, x: &[f64], seed: Option<usize>) -> Option<Vec
     }
 }
 
-/// Largest capacity a lifting DP will be built over. Beyond this the table costs
-/// more than the stronger cut is worth.
-const MAX_LIFT_CAPACITY: usize = 100_000;
+/// Largest capacity a lifting DP will be built over.
+const MAX_LIFT_CAPACITY: usize = 20_000;
+/// Ceiling on the total work one lifting pass may do, as `terms * capacity` summed
+/// over the columns lifted.
+///
+/// The DP is `O(terms * capacity)` *per column lifted*, and both grow with the
+/// model, so on a dense 256-column knapsack the unbounded version reached billions
+/// of operations per cover — separation cost 1.3 seconds a round to save a handful
+/// of nodes. Lifting is an improvement to a cut that is already valid, so running
+/// out of budget just means a weaker cut, never a wrong one.
+const MAX_LIFT_WORK: usize = 400_000;
+/// Fractional columns used to seed cover searches in a single row.
+///
+/// Every fractional column was a seed originally, which is quadratic in the row's
+/// support and bought very little: the covers found from the most fractional few
+/// are the ones that separate.
+const MAX_SEEDS_PER_ROW: usize = 4;
 
 /// Sequential up-lifting of the columns outside the cover.
 ///
@@ -231,6 +245,9 @@ fn lift(knapsack: &Knapsack, cover: &[usize]) -> Option<(Vec<(usize, f64)>, f64)
         .iter()
         .map(|&i| (i, knapsack.terms[i].1.round() as usize, 1i64))
         .collect();
+    let mut work = 0usize;
+    // Reused across columns; reallocating a table per column was most of the cost.
+    let mut dp: Vec<i64> = Vec::new();
 
     // Heaviest first is the conventional lifting order and tends to give the
     // strongest coefficients to the columns that matter most.
@@ -253,7 +270,14 @@ fn lift(knapsack: &Knapsack, cover: &[usize]) -> Option<(Vec<(usize, f64)>, f64)
             rhs as i64
         } else {
             let budget = capacity - wj;
-            let mut dp = vec![0i64; budget + 1];
+            work = work.saturating_add(inequality.len().saturating_mul(budget));
+            if work > MAX_LIFT_WORK {
+                // Out of budget: stop lifting and keep what has been lifted so far,
+                // which is still a valid inequality.
+                break;
+            }
+            dp.clear();
+            dp.resize(budget + 1, 0);
             for &(_, w, a) in &inequality {
                 if w > budget {
                     continue;
@@ -366,14 +390,21 @@ pub fn separate(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
             };
             // One unseeded pass, then one seeded by each fractional term. Distinct
             // seeds usually produce distinct covers, and only some of them separate.
-            let seeds = std::iter::once(None).chain(
-                (0..knapsack.terms.len())
-                    .filter(|&t| {
-                        let v = y_value(&knapsack, t, x);
-                        v > 1e-6 && v < 1.0 - 1e-6
-                    })
-                    .map(Some),
-            );
+            // Seeded by the most fractional columns only. Seeding from every
+            // fractional column is quadratic in the row's support and finds little
+            // the top few do not.
+            let mut fractional: Vec<usize> = (0..knapsack.terms.len())
+                .filter(|&t| {
+                    let v = y_value(&knapsack, t, x);
+                    v > 1e-6 && v < 1.0 - 1e-6
+                })
+                .collect();
+            fractional.sort_by(|&a, &b| {
+                let d = |t: usize| (y_value(&knapsack, t, x) - 0.5).abs();
+                d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            fractional.truncate(MAX_SEEDS_PER_ROW);
+            let seeds = std::iter::once(None).chain(fractional.into_iter().map(Some));
             for seed in seeds {
                 if let Some(cover) = find_cover(&knapsack, x, seed) {
                     let cut = cover_to_cut(&knapsack, &cover);
