@@ -8,10 +8,10 @@ strengthened by presolve and cutting planes — is what prunes the search. Every
 variable is binary; general integer and continuous variables are out of scope.
 
 Status: **early, but solving**. The model layer, LP/MPS readers, instance
-generator, test oracle, LP relaxation solver, presolve, and a depth-first
-branch-and-bound search are in place. Cutting planes, better branching, and primal
-heuristics are not — those are what would make it competitive rather than merely
-correct.
+generator, test oracle, LP relaxation solver, presolve, lifted knapsack cover
+cuts, and a depth-first branch-and-bound search are in place. Better branching and
+primal heuristics are not, and the evidence now says branching is the binding
+constraint.
 
 Both the relaxation and the integer optimum are checked against an independent
 solver on every bundled sample and generated instance.
@@ -41,16 +41,23 @@ faster in wall clock. On a family of dense random instances with 30 rows:
 | 200 | — | 19.0s | 0.87s |
 | 500 | — | >400s | 82s |
 
-The gap that remains against Gurobi is roughly 20x in nodes, and it is exactly the
-work that has not been done yet: cuts and pseudocost branching.
+The gap that remains against Gurobi is roughly 20x in nodes, and the work that
+would close it is better branching and primal heuristics.
 
 Presolve reduces in place — a fixed column becomes `lb == ub` and a redundant row
 has its bounds freed — so nothing is renumbered and there is no postsolve pass. It
 is worth a great deal on structured models (`v006c*` is solved outright;
 `bin_10var_5con` drops from 24 nodes to 1) and nothing at all on the dense random
 families above. That is not a shortfall in the implementation: Gurobi's presolve
-also reduces those instances to exactly their original dimensions. On that family
-the entire advantage is cutting planes.
+also reduces those instances to exactly their original dimensions.
+
+Lifted knapsack cover cuts raise the root bound substantially where presolve finds
+nothing — on `v064c064` from 72.47 to 84.83 against an optimum of 137, and on
+`v064c200` from 72.13 to 82.70 against 225. Converting that bound into a smaller
+tree is another matter: with most-fractional branching the node counts do not track
+the bound at all. On `v064c200`, successive cut budgets give 9304, then 16918, then
+6230 nodes while the bound only improves. Branching choice, not the bound, now
+dominates the tree's shape, which is what pseudocost branching exists to fix.
 
 ## Layout
 

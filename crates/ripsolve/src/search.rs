@@ -14,6 +14,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::cuts;
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
 use crate::presolve::{self, Outcome};
@@ -44,6 +45,10 @@ pub struct Options {
     pub max_iterations_per_node: usize,
     /// Tighten the model before searching.
     pub presolve: bool,
+    /// Rounds of cut separation at the root. Zero disables cuts.
+    pub cut_rounds: usize,
+    /// Most cuts to add in a single round.
+    pub cuts_per_round: usize,
 }
 
 impl Default for Options {
@@ -55,6 +60,10 @@ impl Default for Options {
             gap_tolerance: 0.0,
             max_iterations_per_node: 100_000,
             presolve: true,
+            // Separation converges after two or three rounds on every instance
+            // measured; a larger budget finds no more cuts and only costs time.
+            cut_rounds: 3,
+            cuts_per_round: 32,
         }
     }
 }
@@ -73,6 +82,12 @@ pub struct Solution {
     pub simplex_iterations: usize,
     /// What presolve achieved, if it ran.
     pub presolve: Option<presolve::Stats>,
+    /// Cuts added at the root.
+    pub cuts_added: usize,
+    /// The root relaxation before any cuts, in the user's original sense.
+    pub root_bound: f64,
+    /// The root relaxation after cutting, in the user's original sense.
+    pub root_bound_after_cuts: f64,
 }
 
 impl Solution {
@@ -122,6 +137,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     nodes: 0,
                     simplex_iterations: 0,
                     presolve: None,
+                    cuts_added: 0,
+                    root_bound: f64::NAN,
+                    root_bound_after_cuts: f64::NAN,
                 };
             }
             Outcome::Reduced(stats) => (&reduced, Some(stats)),
@@ -132,6 +150,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
     let n = problem.n_cols();
     let mut lp = Lp::relaxation(problem);
+    // Cuts add rows but never columns, so `n` stays valid across the cut loop.
 
     let mut nodes = 0usize;
     let mut iterations = 0usize;
@@ -158,7 +177,48 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             nodes,
             simplex_iterations: iterations,
             presolve: presolve_stats,
+            cuts_added: 0,
+            root_bound: f64::NAN,
+            root_bound_after_cuts: f64::NAN,
         };
+    }
+
+    let first_bound = root.objective;
+
+    // Cut at the root only. Separating deeper in the tree ("local cuts") is
+    // stronger still, but it needs the cut pool to track which nodes each cut is
+    // valid for; these are globally valid, so adding them once to the model is
+    // both simpler and correct everywhere.
+    let mut cuts_added = 0usize;
+    let mut root = root;
+    let mut with_cuts;
+    let mut problem = problem;
+    for _ in 0..options.cut_rounds {
+        if root.status != LpStatus::Optimal
+            || integral_solution(&root.x, options.integrality_tolerance).is_some()
+        {
+            break;
+        }
+        let found = cuts::separate(problem, &root.x, options.cuts_per_round);
+        if found.is_empty() {
+            break;
+        }
+        with_cuts = problem.clone();
+        with_cuts.add_cuts(&found);
+        cuts_added += found.len();
+
+        let candidate = Lp::relaxation(&with_cuts);
+        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        iterations += resolved.iterations;
+        if resolved.status != LpStatus::Optimal {
+            // Keep the model that is known to solve rather than pressing on with one
+            // that does not; the bound already gained is still sound.
+            break;
+        }
+        reduced = with_cuts;
+        problem = &reduced;
+        lp = candidate;
+        root = resolved;
     }
 
     let root_bound = root.objective;
@@ -293,6 +353,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         nodes,
         simplex_iterations: iterations,
         presolve: presolve_stats,
+        cuts_added,
+        root_bound: problem.objective_value(first_bound),
+        root_bound_after_cuts: problem.objective_value(root_bound),
     }
 }
 

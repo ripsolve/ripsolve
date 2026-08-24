@@ -6,21 +6,20 @@ use std::time::Instant;
 
 fn run(p: &Problem, label: &str) {
     let mut line = format!("{label:22}");
-    for presolve in [false, true] {
+    for cuts in [0usize, 20] {
         let options = Options {
-            presolve,
+            cut_rounds: cuts,
             ..Options::default()
         };
         let t = Instant::now();
         let s = search::solve(p, options);
-        line.push_str(&format!(" | {:>8} nodes {:>9.3?}", s.nodes, t.elapsed()));
-        if presolve {
-            let st = s.presolve.unwrap_or_default();
+        line.push_str(&format!(" |{:>8} nodes {:>9.3?}", s.nodes, t.elapsed()));
+        if cuts > 0 {
             line.push_str(&format!(
-                "  fixed={:<4} rows={:<4} coef={:<5} obj={}",
-                st.fixed_columns,
-                st.redundant_rows,
-                st.tightened_coefficients,
+                " {:>3} cuts  root {:.2}->{:.2} opt {}",
+                s.cuts_added,
+                s.root_bound,
+                s.root_bound_after_cuts,
                 s.objective.unwrap_or(f64::NAN)
             ));
         }
@@ -29,17 +28,13 @@ fn run(p: &Problem, label: &str) {
 }
 
 fn main() {
-    println!(
-        "{:22} | {:^28} | {:^28}",
-        "", "no presolve", "with presolve"
-    );
+    println!("{:22} |{:^26}|{:^26}", "", "no cuts", "with cuts");
     for (kind, c, r, seed) in [
         (Kind::Knapsack, 30, 15, 2u64),
         (Kind::Knapsack, 45, 20, 3),
         (Kind::Covering, 40, 50, 2),
         (Kind::Covering, 60, 80, 3),
         (Kind::Signed, 32, 32, 2),
-        (Kind::Signed, 48, 48, 3),
     ] {
         let spec = Spec {
             kind,

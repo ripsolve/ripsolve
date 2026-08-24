@@ -138,3 +138,37 @@ fn presolve_does_not_change_any_optimum() {
         }
     }
 }
+
+#[test]
+fn cuts_do_not_change_any_optimum() {
+    // Cuts may only remove fractional points. If one ever removes an integer
+    // solution the answer changes silently, so every sample is solved both ways.
+    let data = fixtures();
+    for entry in data["samples"].as_array().unwrap() {
+        let file = entry["file"].as_str().unwrap();
+        let problem = Problem::from_file(&samples_dir().join(file)).unwrap();
+
+        let with = search::solve(&problem, Options::default());
+        let without = search::solve(
+            &problem,
+            Options {
+                cut_rounds: 0,
+                ..Options::default()
+            },
+        );
+
+        assert_eq!(with.status, without.status, "{file}");
+        match (with.objective, without.objective) {
+            (Some(a), Some(b)) => assert!((a - b).abs() < 1e-6, "{file}: cuts {a}, plain {b}"),
+            (None, None) => {}
+            (a, b) => panic!("{file}: cuts {a:?}, plain {b:?}"),
+        }
+        // Cuts can only tighten the root relaxation, never weaken it.
+        assert!(
+            with.root_bound_after_cuts >= with.root_bound - 1e-6,
+            "{file}: root bound fell from {} to {}",
+            with.root_bound,
+            with.root_bound_after_cuts
+        );
+    }
+}
