@@ -3,21 +3,36 @@
 //! Pseudocost scoring is the default and is a clear win: on v081c162n018 it takes
 //! 3828 nodes where most-fractional branching took 14602.
 //!
-//! Strong branching is implemented here too, and is **off by default**, because
-//! measurement said it should be. Probing made every instance tried markedly worse
-//! — v128c256n100 from 10 nodes to 917, v081c162n018 from 3828 to 23686 — and two
-//! plausible explanations were tested and ruled out: forced fixings creating
-//! single-child chains (no effect when disabled), and unclamped division by tiny
-//! fractional values inflating recorded degradations (no effect when clamped, and
-//! the clamp was kept because it is right regardless).
+//! # Strong branching, and why it is off
 //!
-//! The remaining suspicion is that these instances are dual degenerate enough that
-//! most probes return a zero degradation, leaving the score to break ties
-//! arbitrarily — worse than the fractionality heuristic it replaced. Confirming
-//! that means instrumenting the probe outcome distribution, which has not been done
-//! yet. Until it is, the honest default is the one that measures better.
+//! Strong branching probes a column by actually solving both child LPs. It is
+//! implemented here and defaults to **off**, but the reason changed once the search
+//! around it changed, and the history is worth keeping because the first
+//! explanation was wrong.
+//!
+//! Under depth-first node selection it was catastrophic — v128c256n100 went from 10
+//! nodes to 917, v081c162n018 from 3828 to 23686. The suspicion at the time was
+//! that these instances are dual degenerate enough that most probes return a zero
+//! degradation, leaving the score to break ties arbitrarily.
+//!
+//! That was measured and is false. Instrumenting the probe outcomes shows *every*
+//! probe returning a finite, strictly positive degradation: zero of them come back
+//! degenerate, truncated, or infeasible. The probes were always informative.
+//!
+//! The real cause was the interaction with depth-first selection. Under a plunge a
+//! branching decision compounds: the search descends into whichever subtree the
+//! rule chose and stays there, so any change to the rule swings the tree enormously
+//! and a locally better decision can be globally much worse. Best-bound selection
+//! is self-correcting, because the next node comes from the global pool regardless
+//! of what the last decision was. Re-measured under best-bound, strong branching
+//! reduces node counts on seven of eight instances, by 10% to 32%.
+//!
+//! It stays off because the node savings do not pay for the probes: two extra LPs
+//! per candidate costs more wall-clock time than 10-30% fewer nodes saves, on five
+//! of eight instances. Worth enabling on large models — v128c1000n100 goes from
+//! 13.3s to 9.5s at a budget of 100 — which is what the budget option is for.
 
-/// Per-column history of how much branching on it actually cost.
+/// Per-column history of how much branching on it actually cost./// Per-column history of how much branching on it actually cost.
 ///
 /// A pseudocost is the objective degradation per unit of fractionality, averaged
 /// over the times a column has been branched on. It is a far better predictor of a

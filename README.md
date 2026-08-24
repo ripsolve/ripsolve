@@ -72,10 +72,26 @@ the hardest instances and roughly neutral elsewhere — `v081c162n018` drops fro
 14602 nodes to 3828, `v081c162n009` from 87138 to 74570, while `v048c048` and
 `v064c200` move slightly the wrong way.
 
-Strong branching is implemented alongside it and is **off by default**, because
-measurement said so: probing made every instance tried markedly worse, taking
-`v128c256n100` from 10 nodes to 917. Two explanations were tested and ruled out.
-See `branch.rs` for what is and is not yet known about why.
+Strong branching is implemented alongside it and is **off by default**, though the
+reason changed once best-bound node selection landed.
+
+Under depth-first selection it was catastrophic — `v128c256n100` went from 10 nodes
+to 917. The suspicion at the time was dual degeneracy making the probes
+uninformative. That was measured and is false: instrumenting the probe outcomes
+shows every probe returning a finite, strictly positive degradation, none of them
+degenerate, truncated, or infeasible.
+
+The real cause was the interaction with depth-first search. Under a plunge a
+branching decision compounds — the search descends into whichever subtree the rule
+picked and stays there — so any change to the rule swings the tree enormously.
+Best-bound selection is self-correcting, since the next node comes from the global
+pool regardless of the last decision. Re-measured under best-bound, strong branching
+*reduces* node counts on seven of eight instances, by 10% to 32%.
+
+It stays off because those savings do not pay for the probes: two extra LPs per
+candidate cost more than 10-30% fewer nodes saves, on five of eight instances. It is
+worth enabling on large models — `v128c1000n100` goes from 13.3s to 9.5s at a budget
+of 100 — which is what `strong_branching_budget` is for.
 
 ## Parallelism
 

@@ -78,11 +78,12 @@ pub struct Options {
     pub heuristic_limits: Limits,
     /// Total strong-branching probes allowed across the whole search.
     ///
-    /// Defaults to zero — strong branching is implemented but **off**, because on
-    /// every instance measured it made the search substantially worse, not better:
-    /// v081c162n018 goes from 3828 nodes to 23686, and v128c256n100 from 10 to 917.
-    /// Pure pseudocost scoring is the better default here. See the module docs on
-    /// why the probes are suspected to be uninformative on these instances.
+    /// Defaults to zero. Under best-bound selection strong branching does reduce
+    /// node counts — by 10% to 32% on seven of eight instances — but two extra LPs
+    /// per candidate cost more time than those nodes save. Worth raising on large
+    /// models, where it pays: v128c1000n100 goes from 13.3s to 9.5s at a budget of
+    /// 100. See `branch.rs` for why it was catastrophic under depth-first search
+    /// and is merely unprofitable now.
     pub strong_branching_budget: usize,
 }
 
