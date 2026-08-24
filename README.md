@@ -8,8 +8,8 @@ strengthened by presolve and cutting planes — is what prunes the search. Every
 variable is binary; general integer and continuous variables are out of scope.
 
 Status: **early, but solving**. The model layer, LP/MPS readers, instance
-generator, test oracle, LP relaxation solver, and a depth-first branch-and-bound
-search are in place. Presolve, cutting planes, better branching, and primal
+generator, test oracle, LP relaxation solver, presolve, and a depth-first
+branch-and-bound search are in place. Cutting planes, better branching, and primal
 heuristics are not — those are what would make it competitive rather than merely
 correct.
 
@@ -42,7 +42,15 @@ faster in wall clock. On a family of dense random instances with 30 rows:
 | 500 | — | >400s | 82s |
 
 The gap that remains against Gurobi is roughly 20x in nodes, and it is exactly the
-work that has not been done yet: presolve, cuts, and pseudocost branching.
+work that has not been done yet: cuts and pseudocost branching.
+
+Presolve reduces in place — a fixed column becomes `lb == ub` and a redundant row
+has its bounds freed — so nothing is renumbered and there is no postsolve pass. It
+is worth a great deal on structured models (`v006c*` is solved outright;
+`bin_10var_5con` drops from 24 nodes to 1) and nothing at all on the dense random
+families above. That is not a shortfall in the implementation: Gurobi's presolve
+also reduces those instances to exactly their original dimensions. On that family
+the entire advantage is cutting planes.
 
 ## Layout
 

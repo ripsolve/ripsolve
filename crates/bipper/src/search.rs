@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
+use crate::presolve::{self, Outcome};
 
 /// How a search ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct Options {
     pub gap_tolerance: f64,
     /// Simplex iteration limit for a single node.
     pub max_iterations_per_node: usize,
+    /// Tighten the model before searching.
+    pub presolve: bool,
 }
 
 impl Default for Options {
@@ -51,6 +54,7 @@ impl Default for Options {
             integrality_tolerance: 1e-6,
             gap_tolerance: 0.0,
             max_iterations_per_node: 100_000,
+            presolve: true,
         }
     }
 }
@@ -67,6 +71,8 @@ pub struct Solution {
     pub bound: f64,
     pub nodes: usize,
     pub simplex_iterations: usize,
+    /// What presolve achieved, if it ran.
+    pub presolve: Option<presolve::Stats>,
 }
 
 impl Solution {
@@ -98,6 +104,32 @@ struct Node {
 /// Solve a binary integer program to proven optimality.
 pub fn solve(problem: &Problem, options: Options) -> Solution {
     let started = Instant::now();
+
+    // Presolve reduces in place and introduces no renumbering, so the reduced
+    // model's solution vector is directly the original's -- there is no postsolve.
+    // It is sound (it never admits a point the original rejects) and preserves the
+    // optimum, so searching the reduced model answers the original question.
+    let mut reduced;
+    let (problem, presolve_stats) = if options.presolve {
+        reduced = problem.clone();
+        match presolve::presolve(&mut reduced, 20) {
+            Outcome::Infeasible => {
+                return Solution {
+                    status: Status::Infeasible,
+                    objective: None,
+                    x: Vec::new(),
+                    bound: f64::NAN,
+                    nodes: 0,
+                    simplex_iterations: 0,
+                    presolve: None,
+                };
+            }
+            Outcome::Reduced(stats) => (&reduced, Some(stats)),
+        }
+    } else {
+        (problem, None)
+    };
+
     let n = problem.n_cols();
     let mut lp = Lp::relaxation(problem);
 
@@ -125,7 +157,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             bound: f64::NAN,
             nodes,
             simplex_iterations: iterations,
-            // `bound` is meaningless when the root did not solve.
+            presolve: presolve_stats,
         };
     }
 
@@ -260,6 +292,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         bound: problem.objective_value(internal_bound),
         nodes,
         simplex_iterations: iterations,
+        presolve: presolve_stats,
     }
 }
 

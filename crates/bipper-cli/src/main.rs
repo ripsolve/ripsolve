@@ -43,6 +43,9 @@ enum Command {
         /// Print the value of every column.
         #[arg(short, long)]
         verbose: bool,
+        /// Skip presolve.
+        #[arg(long)]
+        no_presolve: bool,
     },
     /// Solve a model's LP relaxation and report the bound.
     Relax {
@@ -109,6 +112,7 @@ fn main() -> Result<()> {
             time_limit,
             gap,
             verbose,
+            no_presolve,
         } => {
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -118,6 +122,7 @@ fn main() -> Result<()> {
                 max_nodes: max_nodes.unwrap_or(usize::MAX),
                 time_limit: time_limit.map(Duration::from_secs_f64),
                 gap_tolerance: gap,
+                presolve: !no_presolve,
                 ..Options::default()
             };
             let started = std::time::Instant::now();
@@ -151,6 +156,12 @@ fn main() -> Result<()> {
                     }
                 }
                 None => println!("status:    {:?}", solution.status),
+            }
+            if let Some(stats) = solution.presolve {
+                println!(
+                    "presolve:  {} columns fixed, {} rows removed, {} coefficients tightened",
+                    stats.fixed_columns, stats.redundant_rows, stats.tightened_coefficients
+                );
             }
             println!(
                 "{} nodes, {} simplex iterations, {elapsed:.3?}",

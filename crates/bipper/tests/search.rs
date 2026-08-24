@@ -103,3 +103,38 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
     assert_eq!(solution.status, Status::NodeLimit);
     assert!(solution.nodes <= 6, "{} nodes", solution.nodes);
 }
+
+#[test]
+fn presolve_does_not_change_any_optimum() {
+    // Presolve is allowed to reduce the model however it likes, provided the answer
+    // is identical. Checked on every sample, both ways.
+    let data = fixtures();
+    for entry in data["samples"].as_array().unwrap() {
+        let file = entry["file"].as_str().unwrap();
+        let problem = Problem::from_file(&samples_dir().join(file)).unwrap();
+
+        let with = search::solve(
+            &problem,
+            Options {
+                presolve: true,
+                ..Options::default()
+            },
+        );
+        let without = search::solve(
+            &problem,
+            Options {
+                presolve: false,
+                ..Options::default()
+            },
+        );
+
+        assert_eq!(with.status, without.status, "{file}");
+        match (with.objective, without.objective) {
+            (Some(a), Some(b)) => {
+                assert!((a - b).abs() < 1e-6, "{file}: presolve {a}, plain {b}")
+            }
+            (None, None) => {}
+            (a, b) => panic!("{file}: presolve {a:?}, plain {b:?}"),
+        }
+    }
+}
