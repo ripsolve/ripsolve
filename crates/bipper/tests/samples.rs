@@ -11,7 +11,8 @@ fn samples_dir() -> PathBuf {
 fn read(name: &str) -> Problem {
     let path = samples_dir().join(name);
     let p = Problem::from_file(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
-    p.validate().unwrap_or_else(|e| panic!("validating {name}: {e}"));
+    p.validate()
+        .unwrap_or_else(|e| panic!("validating {name}: {e}"));
     p
 }
 

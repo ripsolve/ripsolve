@@ -1,12 +1,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bipper::generate::{Kind, Spec};
 use bipper::Problem;
+use bipper::generate::{Kind, Spec};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "bipper", version, about = "A branch-and-cut solver for binary integer programs")]
+#[command(
+    name = "bipper",
+    version,
+    about = "A branch-and-cut solver for binary integer programs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -70,8 +74,19 @@ fn main() -> Result<()> {
                 problem.sense,
             );
         }
-        Command::Gen { kind, cols, rows, seed, out } => {
-            let spec = Spec { kind: kind.into(), n_cols: cols, n_rows: rows, seed };
+        Command::Gen {
+            kind,
+            cols,
+            rows,
+            seed,
+            out,
+        } => {
+            let spec = Spec {
+                kind: kind.into(),
+                n_cols: cols,
+                n_rows: rows,
+                seed,
+            };
             let text = spec.to_lp();
             match out {
                 Some(path) => std::fs::write(&path, text)

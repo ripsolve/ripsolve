@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use bipper::generate::{lp_digest, Kind, Spec};
+use bipper::generate::{Kind, Spec, lp_digest};
 
 fn fixtures() -> serde_json::Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference.json");
@@ -65,7 +65,10 @@ fn fixture_values_are_self_consistent() {
         let mip = entry["mip_optimum"].as_f64().unwrap();
         // The relaxation drops the integrality restriction, so for a minimization it
         // can never be worse than the integer optimum.
-        assert!(lp <= mip + 1e-6, "{name}: relaxation {lp} exceeds optimum {mip}");
+        assert!(
+            lp <= mip + 1e-6,
+            "{name}: relaxation {lp} exceeds optimum {mip}"
+        );
 
         let solution = entry["solution"].as_array().unwrap();
         assert_eq!(
@@ -74,7 +77,9 @@ fn fixture_values_are_self_consistent() {
             "{name}: solution length disagrees with n_cols"
         );
         assert!(
-            solution.iter().all(|v| matches!(v.as_i64(), Some(0) | Some(1))),
+            solution
+                .iter()
+                .all(|v| matches!(v.as_i64(), Some(0) | Some(1))),
             "{name}: reference solution is not binary"
         );
     }

@@ -82,7 +82,11 @@ impl Problem {
         if lp.objectives.len() > 1 {
             return Err(ReadError::MultipleObjectives(lp.objectives.len()));
         }
-        let objective = lp.objectives.values().next().ok_or(ReadError::NoObjective)?;
+        let objective = lp
+            .objectives
+            .values()
+            .next()
+            .ok_or(ReadError::NoObjective)?;
         let name = |id| lp.interner.resolve(id).to_string();
 
         // Reject anything non-binary up front. A General or Free variable quietly
@@ -91,13 +95,20 @@ impl Problem {
         let mut col_names = Vec::with_capacity(lp.variables.len());
         for var in lp.variables.values() {
             if var.var_type != VariableType::Binary {
-                return Err(ReadError::NotBinary(name(var.name), var.var_type.to_string()));
+                return Err(ReadError::NotBinary(
+                    name(var.name),
+                    var.var_type.to_string(),
+                ));
             }
             col_names.push(name(var.name));
         }
         // Position within the IndexMap is the column index, so a name lookup is just
         // `get_index_of` — no side table to build or keep consistent.
-        let col_of = |id| lp.variables.get_index_of(&id).expect("variable is interned and present");
+        let col_of = |id| {
+            lp.variables
+                .get_index_of(&id)
+                .expect("variable is interned and present")
+        };
 
         let negate = lp.sense == LpSense::Maximize;
         let flip = |v: f64| if negate { -v } else { v };
@@ -118,7 +129,13 @@ impl Problem {
 
         for (i, constraint) in lp.constraints.values().enumerate() {
             match constraint {
-                Constraint::Standard { name: row_name, coefficients, operator, rhs, .. } => {
+                Constraint::Standard {
+                    name: row_name,
+                    coefficients,
+                    operator,
+                    rhs,
+                    ..
+                } => {
                     let sense = match operator {
                         // Neither format has strict inequalities; some writers emit
                         // them anyway and every solver reads them as non-strict.
@@ -142,7 +159,11 @@ impl Problem {
 
         Ok(Problem {
             name: lp.name.clone().unwrap_or_else(|| "unnamed".to_string()),
-            sense: if negate { Sense::Maximize } else { Sense::Minimize },
+            sense: if negate {
+                Sense::Maximize
+            } else {
+                Sense::Minimize
+            },
             obj,
             obj_offset: flip(objective.constant),
             matrix: SparseMatrix::from_triplets(n_rows, n_cols, triplets),
@@ -199,7 +220,8 @@ End
 
     #[test]
     fn maximize_is_negated_and_reported_back() {
-        let p = parse("Maximize\n obj: 3 x1\nSubject To\n c1: x1 <= 1\nBinary\n x1\nEnd\n").unwrap();
+        let p =
+            parse("Maximize\n obj: 3 x1\nSubject To\n c1: x1 <= 1\nBinary\n x1\nEnd\n").unwrap();
         assert_eq!(p.sense, Sense::Maximize);
         // Stored negated for the minimizing solver...
         assert_eq!(p.obj, [-3.0]);
@@ -209,10 +231,9 @@ End
 
     #[test]
     fn repeated_terms_accumulate() {
-        let p = parse(
-            "Minimize\n obj: 2 x1 + 3 x1\nSubject To\n c1: x1 + x1 >= 1\nBinary\n x1\nEnd\n",
-        )
-        .unwrap();
+        let p =
+            parse("Minimize\n obj: 2 x1 + 3 x1\nSubject To\n c1: x1 + x1 >= 1\nBinary\n x1\nEnd\n")
+                .unwrap();
         assert_eq!(p.obj, [5.0]);
         assert_eq!(p.matrix.column(0), (&[0usize][..], &[2.0][..]));
     }
@@ -232,8 +253,8 @@ End
 
     #[test]
     fn rejects_non_binary_variables() {
-        let err = parse("Minimize\n obj: x1\nSubject To\n c1: x1 >= 1\nGeneral\n x1\nEnd\n")
-            .unwrap_err();
+        let err =
+            parse("Minimize\n obj: x1\nSubject To\n c1: x1 >= 1\nGeneral\n x1\nEnd\n").unwrap_err();
         assert!(matches!(err, ReadError::NotBinary(..)), "got {err:?}");
     }
 
@@ -241,7 +262,10 @@ End
     fn rejects_a_model_with_no_objective() {
         // `Subject To` alone is not a complete LP file, so build the case directly.
         let empty = LpProblem::default();
-        assert!(matches!(Problem::from_lp(&empty), Err(ReadError::NoObjective)));
+        assert!(matches!(
+            Problem::from_lp(&empty),
+            Err(ReadError::NoObjective)
+        ));
     }
 
     #[test]

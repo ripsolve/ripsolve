@@ -61,7 +61,13 @@ impl SparseMatrix {
         }
         col_start.push(row_idx.len());
 
-        Self { n_rows, n_cols, col_start, row_idx, values }
+        Self {
+            n_rows,
+            n_cols,
+            col_start,
+            row_idx,
+            values,
+        }
     }
 
     pub fn n_rows(&self) -> usize {
@@ -89,7 +95,11 @@ impl SparseMatrix {
     /// The simplex uses this to decide between dense and sparse kernels.
     pub fn density(&self) -> f64 {
         let cells = self.n_rows * self.n_cols;
-        if cells == 0 { 0.0 } else { self.nnz() as f64 / cells as f64 }
+        if cells == 0 {
+            0.0
+        } else {
+            self.nnz() as f64 / cells as f64
+        }
     }
 
     /// Transpose into compressed sparse *row* form, returned as a `SparseMatrix`
@@ -139,7 +149,14 @@ mod tests {
         let m = SparseMatrix::from_triplets(
             3,
             2,
-            [(0, 0, 1.0), (0, 0, 2.0), (2, 0, 5.0), (1, 1, 4.0), (2, 1, -4.0), (2, 1, 4.0)],
+            [
+                (0, 0, 1.0),
+                (0, 0, 2.0),
+                (2, 0, 5.0),
+                (1, 1, 4.0),
+                (2, 1, -4.0),
+                (2, 1, 4.0),
+            ],
         );
         // (0,0) summed to 3.0; (2,1) cancelled to zero and was dropped.
         assert_eq!(m.nnz(), 3);

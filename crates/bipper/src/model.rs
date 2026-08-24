@@ -103,7 +103,11 @@ impl Problem {
             (self.col_names.len(), "col_names"),
         ] {
             if len != n {
-                return Err(ModelError::LengthMismatch { what, got: len, expected: n });
+                return Err(ModelError::LengthMismatch {
+                    what,
+                    got: len,
+                    expected: n,
+                });
             }
         }
         for (len, what) in [
@@ -111,7 +115,11 @@ impl Problem {
             (self.row_names.len(), "row_names"),
         ] {
             if len != m {
-                return Err(ModelError::LengthMismatch { what, got: len, expected: m });
+                return Err(ModelError::LengthMismatch {
+                    what,
+                    got: len,
+                    expected: m,
+                });
             }
         }
         // A NaN bound would silently poison every comparison in the simplex, so it is
@@ -119,17 +127,31 @@ impl Problem {
         for j in 0..n {
             let (lo, hi) = (self.col_lb[j], self.col_ub[j]);
             if lo.is_nan() || hi.is_nan() || lo > hi {
-                return Err(ModelError::InvalidBounds { what: "column", index: j, lb: lo, ub: hi });
+                return Err(ModelError::InvalidBounds {
+                    what: "column",
+                    index: j,
+                    lb: lo,
+                    ub: hi,
+                });
             }
             // Binary columns may only be relaxed to [0,1] or fixed within it.
             if lo < 0.0 || hi > 1.0 {
-                return Err(ModelError::NotBinary { index: j, lb: lo, ub: hi });
+                return Err(ModelError::NotBinary {
+                    index: j,
+                    lb: lo,
+                    ub: hi,
+                });
             }
         }
         for i in 0..m {
             let (lo, hi) = (self.row_lb[i], self.row_ub[i]);
             if lo.is_nan() || hi.is_nan() || lo > hi {
-                return Err(ModelError::InvalidBounds { what: "row", index: i, lb: lo, ub: hi });
+                return Err(ModelError::InvalidBounds {
+                    what: "row",
+                    index: i,
+                    lb: lo,
+                    ub: hi,
+                });
             }
         }
         if self.obj.iter().any(|v| !v.is_finite()) || !self.obj_offset.is_finite() {
@@ -143,12 +165,26 @@ impl Problem {
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("matrix is {}x{} but the model describes {}x{}", matrix.0, matrix.1, vectors.0, vectors.1)]
-    ShapeMismatch { matrix: (usize, usize), vectors: (usize, usize) },
+    ShapeMismatch {
+        matrix: (usize, usize),
+        vectors: (usize, usize),
+    },
     #[error("{what} has length {got}, expected {expected}")]
-    LengthMismatch { what: &'static str, got: usize, expected: usize },
+    LengthMismatch {
+        what: &'static str,
+        got: usize,
+        expected: usize,
+    },
     #[error("{what} {index} has invalid bounds [{lb}, {ub}]")]
-    InvalidBounds { what: &'static str, index: usize, lb: f64, ub: f64 },
-    #[error("column {index} has bounds [{lb}, {ub}], which is not within [0, 1]; bipper solves binary programs only")]
+    InvalidBounds {
+        what: &'static str,
+        index: usize,
+        lb: f64,
+        ub: f64,
+    },
+    #[error(
+        "column {index} has bounds [{lb}, {ub}], which is not within [0, 1]; bipper solves binary programs only"
+    )]
     NotBinary { index: usize, lb: f64, ub: f64 },
     #[error("objective contains a non-finite coefficient")]
     NonFiniteObjective,
@@ -197,7 +233,10 @@ mod tests {
     fn validate_rejects_non_binary_columns() {
         let mut p = tiny(Sense::Minimize, 0.0);
         p.col_ub[1] = 4.0;
-        assert!(matches!(p.validate(), Err(ModelError::NotBinary { index: 1, .. })));
+        assert!(matches!(
+            p.validate(),
+            Err(ModelError::NotBinary { index: 1, .. })
+        ));
     }
 
     #[test]
@@ -205,21 +244,36 @@ mod tests {
         let mut p = tiny(Sense::Minimize, 0.0);
         p.col_lb[0] = 1.0;
         p.col_ub[0] = 0.0;
-        assert!(matches!(p.validate(), Err(ModelError::InvalidBounds { .. })));
+        assert!(matches!(
+            p.validate(),
+            Err(ModelError::InvalidBounds { .. })
+        ));
 
         let mut p = tiny(Sense::Minimize, 0.0);
         p.row_lb[0] = f64::NAN;
-        assert!(matches!(p.validate(), Err(ModelError::InvalidBounds { .. })));
+        assert!(matches!(
+            p.validate(),
+            Err(ModelError::InvalidBounds { .. })
+        ));
     }
 
     #[test]
     fn validate_rejects_shape_and_length_errors() {
         let mut p = tiny(Sense::Minimize, 0.0);
         p.obj.push(3.0);
-        assert!(matches!(p.validate(), Err(ModelError::ShapeMismatch { .. })));
+        assert!(matches!(
+            p.validate(),
+            Err(ModelError::ShapeMismatch { .. })
+        ));
 
         let mut p = tiny(Sense::Minimize, 0.0);
         p.col_names.pop();
-        assert!(matches!(p.validate(), Err(ModelError::LengthMismatch { what: "col_names", .. })));
+        assert!(matches!(
+            p.validate(),
+            Err(ModelError::LengthMismatch {
+                what: "col_names",
+                ..
+            })
+        ));
     }
 }
