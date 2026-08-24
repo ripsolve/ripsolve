@@ -1364,7 +1364,6 @@ impl<'a> Solver<'a> {
 mod tests {
     use super::*;
     use crate::model::{RowSense, Sense};
-    use std::time::Instant;
 
     use crate::sparse::SparseMatrix;
 
