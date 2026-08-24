@@ -101,7 +101,7 @@ impl Schedule {
 /// form.
 #[derive(Clone, Debug)]
 pub struct Incumbent {
-    pub x: Vec<u8>,
+    pub x: Vec<f64>,
     pub objective: f64,
 }
 
@@ -152,16 +152,33 @@ fn objective_of(problem: &Problem, x: &[f64]) -> f64 {
     problem.obj.iter().zip(x).map(|(c, v)| c * v).sum()
 }
 
-/// Round a relaxation to the nearest binary point and keep it if it is feasible.
+/// Round the integer columns of a relaxation and keep the point if it is feasible.
+///
+/// Continuous columns are left exactly as the relaxation put them: they are already
+/// allowed to take those values, and moving them would only break feasibility.
 ///
 /// Deliberately does not try to repair an infeasible rounding: that is diving's
 /// job, and doing it here would duplicate the machinery badly.
 pub fn round(problem: &Problem, x: &[f64], limits: &Limits) -> Option<Incumbent> {
-    let rounded: Vec<f64> = x.iter().map(|v| v.round().clamp(0.0, 1.0)).collect();
+    let rounded = snap(problem, x);
     is_feasible(problem, &rounded, limits.feasibility_tolerance).then(|| Incumbent {
-        x: rounded.iter().map(|&v| v as u8).collect(),
         objective: objective_of(problem, &rounded),
+        x: rounded,
     })
+}
+
+/// Round every integer column to the nearest integer inside its bounds.
+fn snap(problem: &Problem, x: &[f64]) -> Vec<f64> {
+    x.iter()
+        .enumerate()
+        .map(|(j, &v)| {
+            if problem.is_integer(j) {
+                v.round().clamp(problem.col_lb[j], problem.col_ub[j])
+            } else {
+                v
+            }
+        })
+        .collect()
 }
 
 /// Dive from a relaxation towards a feasible binary point.
@@ -209,6 +226,7 @@ fn dive_inner(
         let next = x
             .iter()
             .enumerate()
+            .filter(|&(j, _)| problem.is_integer(j))
             .filter_map(|(j, &v)| {
                 let distance = (v - v.round()).abs();
                 (distance > tol).then_some((j, v, distance))
@@ -216,14 +234,14 @@ fn dive_inner(
             .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
         let Some((j, value, _)) = next else {
-            // Nothing fractional left: the relaxation is a binary point.
-            let rounded: Vec<f64> = x.iter().map(|v| v.round().clamp(0.0, 1.0)).collect();
+            // Every integer column has landed on an integer.
+            let rounded = snap(problem, &x);
             if !is_feasible(problem, &rounded, limits.feasibility_tolerance) {
                 return None;
             }
             return Some(Incumbent {
-                x: rounded.iter().map(|&v| v as u8).collect(),
                 objective: objective_of(problem, &rounded),
+                x: rounded,
             });
         };
 
@@ -231,9 +249,17 @@ fn dive_inner(
         // preferred value turns out infeasible, try the other one before giving up.
         // Without this the dive fails on essentially every model tested; with it,
         // one extra LP rescues the descent.
-        let preferred = value.round().clamp(0.0, 1.0);
+        // Fix towards the nearer integer, and if that proves infeasible try the
+        // other side of the split rather than abandoning the dive.
+        let (lo, hi) = lp.column_bounds(j);
+        let nearer = value.round().clamp(lo, hi);
+        let other = if nearer > value {
+            value.floor()
+        } else {
+            value.ceil()
+        };
         let mut advanced = false;
-        for target in [preferred, 1.0 - preferred] {
+        for target in [nearer, other.clamp(lo, hi)] {
             lp.set_column_bounds(j, target, target);
             let solved = lp.solve_warm(&warm, cutoff, limits.max_iterations_per_solve);
             *iterations += solved.iterations;
@@ -308,12 +334,12 @@ fn pump_inner(
     let mut tick = 0usize;
 
     for _ in 0..limits.max_pump_rounds {
-        let mut target: Vec<f64> = x.iter().map(|v| v.round().clamp(0.0, 1.0)).collect();
+        let mut target = snap(problem, &x);
 
         if is_feasible(problem, &target, limits.feasibility_tolerance) {
             return Some(Incumbent {
-                x: target.iter().map(|&v| v as u8).collect(),
                 objective: objective_of(problem, &target),
+                x: target,
             });
         }
 
@@ -321,7 +347,7 @@ fn pump_inner(
         // hardest to round — the ones furthest from the integer they landed on —
         // which is the standard escape and keeps the walk deterministic.
         if previous.as_ref() == Some(&target) {
-            let mut by_distance: Vec<usize> = (0..n).collect();
+            let mut by_distance: Vec<usize> = (0..n).filter(|&j| problem.is_integer(j)).collect();
             by_distance.sort_by(|&a, &b| {
                 let d = |j: usize| (x[j] - x[j].round()).abs();
                 d(b).partial_cmp(&d(a)).unwrap_or(std::cmp::Ordering::Equal)
@@ -329,13 +355,40 @@ fn pump_inner(
             tick += 1;
             let flips = (1 + tick % 5).min(n);
             for &j in by_distance.iter().take(flips) {
-                target[j] = 1.0 - target[j];
+                // Push the column to the other side of its fractional value, staying
+                // inside its bounds.
+                let away = if target[j] > x[j] {
+                    x[j].floor()
+                } else {
+                    x[j].ceil()
+                };
+                target[j] = away.clamp(problem.col_lb[j], problem.col_ub[j]);
             }
         }
         previous = Some(target.clone());
 
         // Minimize the distance to the target over the original constraint set.
-        let costs: Vec<f64> = target.iter().map(|&t| 1.0 - 2.0 * t).collect();
+        //
+        // For a column at one of its bounds the distance is linear in one direction,
+        // so a cost of +/-1 expresses it exactly. A general integer sitting strictly
+        // inside its range has a V-shaped distance that no single linear cost can
+        // represent; those columns are left uncosted rather than pulled the wrong
+        // way, which weakens the pump but never misdirects it.
+        let costs: Vec<f64> = target
+            .iter()
+            .enumerate()
+            .map(|(j, &t)| {
+                if !problem.is_integer(j) {
+                    0.0
+                } else if t <= problem.col_lb[j] + 0.5 {
+                    1.0
+                } else if t >= problem.col_ub[j] - 0.5 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         lp.set_costs(&costs);
         let solved = lp.solve_warm(&warm, None, limits.max_iterations_per_solve);
         *iterations += solved.iterations;
@@ -368,7 +421,7 @@ mod tests {
     /// A heuristic that returns an infeasible point does not fail loudly — it
     /// installs a bogus incumbent and the search prunes the real optimum away.
     fn assert_valid(problem: &Problem, found: &Incumbent, label: &str) {
-        let x: Vec<f64> = found.x.iter().map(|&v| f64::from(v)).collect();
+        let x: Vec<f64> = found.x.clone();
         assert_eq!(x.len(), problem.n_cols(), "{label}: wrong length");
         assert!(
             is_feasible(problem, &x, 1e-6),

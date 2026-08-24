@@ -1,0 +1,91 @@
+{
+  "oracle": "gurobi",
+  "instances": [
+    {
+      "file": "mip/mixed_s123.lp",
+      "mip_optimum": 46.0,
+      "integer_columns": [
+        "x0",
+        "x1",
+        "x2",
+        "x3"
+      ]
+    },
+    {
+      "file": "mip/mixed_s17.lp",
+      "mip_optimum": 63.900000000000006,
+      "integer_columns": [
+        "x0",
+        "x1",
+        "x2",
+        "x3",
+        "x8",
+        "x9",
+        "x10",
+        "x11"
+      ]
+    },
+    {
+      "file": "mip/mixed_s200.lp",
+      "mip_optimum": 23.46969696969697,
+      "integer_columns": [
+        "x2",
+        "x3"
+      ]
+    },
+    {
+      "file": "mip/mixed_s271.lp",
+      "mip_optimum": 86.68571428571428,
+      "integer_columns": [
+        "x0",
+        "x2",
+        "x3",
+        "x7",
+        "x8",
+        "x9"
+      ]
+    },
+    {
+      "file": "mip/mixed_s3.lp",
+      "mip_optimum": 71.5,
+      "integer_columns": [
+        "x1",
+        "x2",
+        "x4"
+      ]
+    },
+    {
+      "file": "mip/mixed_s314.lp",
+      "mip_optimum": 20.72222222222222,
+      "integer_columns": [
+        "x0",
+        "x1",
+        "x2",
+        "x5",
+        "x6"
+      ]
+    },
+    {
+      "file": "mip/mixed_s42.lp",
+      "mip_optimum": 24.4,
+      "integer_columns": [
+        "x1",
+        "x2",
+        "x3",
+        "x4"
+      ]
+    },
+    {
+      "file": "mip/mixed_s88.lp",
+      "mip_optimum": 37.0,
+      "integer_columns": [
+        "x0",
+        "x1",
+        "x3",
+        "x6",
+        "x7",
+        "x9"
+      ]
+    }
+  ]
+}

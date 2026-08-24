@@ -9,14 +9,70 @@
 //! order and degenerate pivot choices, so an order that varied between runs would
 //! make node counts irreproducible on identical input.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use lp_parser_rs::model::{ComparisonOp, Constraint, Sense as LpSense, VariableType};
 use lp_parser_rs::parser::parse_file;
 use lp_parser_rs::problem::LpProblem;
 
-use crate::model::{Problem, RowSense, Sense};
+use crate::model::{Problem, RowSense, Sense, VarType};
 use crate::sparse::SparseMatrix;
+
+/// Names declared integral by an LP file's `Binary`, `General` or `Integer`
+/// sections, recovered from the source text.
+///
+/// This exists to work around `lp_parser_rs`: a `Bounds` section overwrites a
+/// variable's type, so `x` declared under `General` and then bounded to `[0, 10]`
+/// comes back as a plain double-bounded *continuous* variable, its integrality
+/// gone. The bounds it reports are right; only the type is lost. Rather than
+/// re-parse the file, this recovers the one fact the parser drops and leaves
+/// everything else to it.
+///
+/// Section headers end the list, so it stops at `Bounds`, `End`, and the rest.
+fn declared_integer(text: &str) -> HashSet<String> {
+    // Headers that begin a list of integral variables.
+    const INTEGRAL: [&str; 9] = [
+        "binaries", "binary", "bin", "generals", "general", "gen", "integers", "integer", "int",
+    ];
+    // Any other header ends one. `subject` and `such` cover the two spellings of
+    // the constraint header without matching a variable named `st`.
+    const OTHER: [&str; 12] = [
+        "bounds", "bound", "end", "maximize", "maximise", "minimize", "minimise", "max", "min",
+        "subject", "such", "sos",
+    ];
+
+    let mut names = HashSet::new();
+    let mut collecting = false;
+    for line in text.lines() {
+        // Strip comments, which run from a backslash to the end of the line.
+        let line = line.split('\\').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let first = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let first = first.trim_end_matches(':').to_string();
+
+        if INTEGRAL.contains(&first.as_str()) {
+            collecting = true;
+            // A header may carry names on the same line.
+            names.extend(line.split_whitespace().skip(1).map(str::to_string));
+            continue;
+        }
+        if OTHER.contains(&first.as_str()) {
+            collecting = false;
+            continue;
+        }
+        if collecting {
+            names.extend(line.split_whitespace().map(str::to_string));
+        }
+    }
+    names
+}
 
 /// Failure to turn a model file into a [`Problem`].
 #[derive(Debug, thiserror::Error)]
@@ -29,11 +85,10 @@ pub enum ReadError {
     NoObjective,
     #[error("the model has {0} objectives; ripsolve supports exactly one")]
     MultipleObjectives(usize),
-    #[error(
-        "variable {0:?} is {1}, but ripsolve solves binary programs only; \
-         declare it in a Binary section (LP) or with a BV bound (MPS)"
-    )]
-    NotBinary(String, String),
+    #[error("variable {0:?} is {1}, which ripsolve does not support")]
+    UnsupportedVariable(String, String),
+    #[error("integer variable {0:?} has the fractional bound {1}")]
+    FractionalIntegerBound(String, f64),
     #[error("constraint {0:?} is a special ordered set, which ripsolve does not support")]
     SosConstraint(String),
 }
@@ -70,7 +125,13 @@ impl Problem {
             Format::Mps => LpProblem::parse_mps(&content),
         }
         .map_err(|e| ReadError::Parse(e.to_string()))?;
-        Problem::from_lp(&lp)
+        // The LP source is consulted only to recover integrality the parser drops;
+        // see `declared_integer`.
+        let integral = match format {
+            Format::Lp => declared_integer(&content),
+            Format::Mps => HashSet::new(),
+        };
+        Problem::from_lp_with_integrality(&lp, &integral)
     }
 
     /// Translate an already-parsed [`LpProblem`].
@@ -79,6 +140,14 @@ impl Problem {
     /// minimization form; [`Problem::sense`] records what was asked for and
     /// [`Problem::objective_value`] converts results back.
     pub fn from_lp(lp: &LpProblem) -> Result<Problem, ReadError> {
+        Problem::from_lp_with_integrality(lp, &HashSet::new())
+    }
+
+    /// As [`Problem::from_lp`], with extra names known to be integral.
+    pub fn from_lp_with_integrality(
+        lp: &LpProblem,
+        integral: &HashSet<String>,
+    ) -> Result<Problem, ReadError> {
         if lp.objectives.len() > 1 {
             return Err(ReadError::MultipleObjectives(lp.objectives.len()));
         }
@@ -89,21 +158,52 @@ impl Problem {
             .ok_or(ReadError::NoObjective)?;
         let name = |id| lp.interner.resolve(id).to_string();
 
-        // Reject anything non-binary up front. A General or Free variable quietly
-        // treated as binary would produce a confidently wrong answer, so this is a
-        // hard error rather than a warning.
+        // Column types and bounds, from whichever section declared them.
+        //
+        // A variable's *type* and its *bounds* are separate in both formats: an
+        // integer declared with no bounds is `[0, inf)`, a binary one is an integer
+        // pinned to `[0, 1]`, and a bounds section can narrow either. Reading them
+        // as one thing is how a model silently becomes the wrong model.
         let mut col_names = Vec::with_capacity(lp.variables.len());
+        let mut col_type = Vec::with_capacity(lp.variables.len());
+        let mut col_lb = Vec::with_capacity(lp.variables.len());
+        let mut col_ub = Vec::with_capacity(lp.variables.len());
+
         for var in lp.variables.values() {
-            if var.var_type != VariableType::Binary {
-                return Err(ReadError::NotBinary(
-                    name(var.name),
-                    var.var_type.to_string(),
-                ));
+            let label = name(var.name);
+            let (mut kind, lo, hi) = match &var.var_type {
+                VariableType::Binary => (VarType::Integer, 0.0, 1.0),
+                VariableType::Integer | VariableType::General => {
+                    (VarType::Integer, 0.0, f64::INFINITY)
+                }
+                VariableType::Free => (VarType::Continuous, f64::NEG_INFINITY, f64::INFINITY),
+                VariableType::LowerBound(lo) => (VarType::Continuous, *lo, f64::INFINITY),
+                VariableType::UpperBound(hi) => (VarType::Continuous, 0.0, *hi),
+                VariableType::DoubleBound(lo, hi) => (VarType::Continuous, *lo, *hi),
+                other => {
+                    return Err(ReadError::UnsupportedVariable(label, other.to_string()));
+                }
+            };
+            // A `Bounds` entry replaces the declared type, so the section lists are
+            // the only surviving evidence that the column is integral.
+            if integral.contains(&label) {
+                kind = VarType::Integer;
             }
-            col_names.push(name(var.name));
+            if kind == VarType::Integer {
+                for bound in [lo, hi] {
+                    if bound.is_finite() && (bound - bound.round()).abs() > 1e-9 {
+                        return Err(ReadError::FractionalIntegerBound(label, bound));
+                    }
+                }
+            }
+            col_names.push(label);
+            col_type.push(kind);
+            col_lb.push(lo);
+            col_ub.push(hi);
         }
+
         // Position within the IndexMap is the column index, so a name lookup is just
-        // `get_index_of` — no side table to build or keep consistent.
+        // `get_index_of` -- no side table to build or keep consistent.
         let col_of = |id| {
             lp.variables
                 .get_index_of(&id)
@@ -169,8 +269,9 @@ impl Problem {
             matrix: SparseMatrix::from_triplets(n_rows, n_cols, triplets),
             row_lb,
             row_ub,
-            col_lb: vec![0.0; n_cols],
-            col_ub: vec![1.0; n_cols],
+            col_lb,
+            col_ub,
+            col_type,
             col_names,
             row_names,
         })
@@ -252,10 +353,19 @@ End
     }
 
     #[test]
-    fn rejects_non_binary_variables() {
-        let err =
-            parse("Minimize\n obj: x1\nSubject To\n c1: x1 >= 1\nGeneral\n x1\nEnd\n").unwrap_err();
-        assert!(matches!(err, ReadError::NotBinary(..)), "got {err:?}");
+    fn reads_a_general_integer_variable() {
+        // No bounds section, so a General integer is [0, inf) -- not binary.
+        let p = parse("Minimize\n obj: x1\nSubject To\n c1: x1 >= 1\nGeneral\n x1\nEnd\n").unwrap();
+        assert!(p.is_integer(0));
+        assert!(!p.is_binary(0), "an unbounded integer is not binary");
+        assert_eq!((p.col_lb[0], p.col_ub[0]), (0.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn a_binary_declaration_is_an_integer_bounded_to_one() {
+        let p = parse(SIMPLE).unwrap();
+        assert!((0..p.n_cols()).all(|j| p.is_binary(j)));
+        assert_eq!(p.col_ub, vec![1.0; p.n_cols()]);
     }
 
     #[test]

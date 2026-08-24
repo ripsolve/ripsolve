@@ -27,9 +27,18 @@ fn check(problem: &Problem, expected: f64, name: &str) -> search::Solution {
 }
 
 /// Check the reported assignment is genuinely feasible and attains the objective.
-fn assert_solution_is_valid(problem: &Problem, x: &[u8], objective: f64, name: &str) {
+fn assert_solution_is_valid(problem: &Problem, x: &[f64], objective: f64, name: &str) {
     assert_eq!(x.len(), problem.n_cols(), "{name}: solution length");
-    let values: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+    let values: Vec<f64> = x.to_vec();
+    // Integer columns must actually be integral.
+    for (j, &v) in values.iter().enumerate() {
+        if problem.is_integer(j) {
+            assert!(
+                (v - v.round()).abs() < 1e-6,
+                "{name}: integer column {j} is {v}"
+            );
+        }
+    }
 
     let csr = problem.matrix.to_csr();
     for i in 0..problem.n_rows() {

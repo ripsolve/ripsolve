@@ -6,11 +6,26 @@
 //! rows all become one case for the simplex, and presolve's bound tightening is
 //! just an update to `lb`/`ub` instead of a change of sense.
 //!
-//! Every column is binary. Bounds are still carried explicitly per column so that
-//! presolve fixing and branching can express `x_j = 0` / `x_j = 1` as `lb == ub`
-//! without a separate mechanism.
+//! Columns carry a type — continuous or integer — and their own bounds. A binary
+//! variable is simply an integer one bounded to `[0, 1]`, which is why the solver
+//! has no separate notion of it: the branching rule `x <= floor(v)` / `x >= ceil(v)`
+//! degenerates to fixing at 0 or 1 on its own.
+//!
+//! Bounds are carried explicitly per column so that presolve fixing and branching
+//! both express themselves as bound changes, with no separate mechanism.
 
 use crate::sparse::SparseMatrix;
+
+/// Whether a column must take an integer value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VarType {
+    /// May take any value within its bounds.
+    Continuous,
+    /// Must be integral. A column bounded to `[0, 1]` is what other solvers call
+    /// binary; nothing here treats that as a distinct case.
+    #[default]
+    Integer,
+}
 
 /// Optimization direction of the *original* problem as the user stated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +55,8 @@ pub struct Problem {
     pub row_ub: Vec<f64>,
     pub col_lb: Vec<f64>,
     pub col_ub: Vec<f64>,
+    /// Per-column integrality requirement.
+    pub col_type: Vec<VarType>,
     pub col_names: Vec<String>,
     pub row_names: Vec<String>,
 }
@@ -85,6 +102,24 @@ impl Problem {
         }
     }
 
+    /// Is this column required to be integral?
+    pub fn is_integer(&self, j: usize) -> bool {
+        self.col_type[j] == VarType::Integer
+    }
+
+    /// Is this column integral and bounded to `[0, 1]`?
+    ///
+    /// Several reductions — cover cuts, coefficient tightening — are stated for
+    /// binary columns specifically, and check this rather than assuming it.
+    pub fn is_binary(&self, j: usize) -> bool {
+        self.is_integer(j) && self.col_lb[j] >= 0.0 && self.col_ub[j] <= 1.0
+    }
+
+    /// The columns whose values the search must drive to integers.
+    pub fn integer_columns(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.n_cols()).filter(|&j| self.is_integer(j))
+    }
+
     /// Check the internal invariants a freshly built problem must satisfy.
     ///
     /// Readers and presolve both go through this, so a malformed model is caught at
@@ -100,6 +135,7 @@ impl Problem {
         for (len, what) in [
             (self.col_lb.len(), "col_lb"),
             (self.col_ub.len(), "col_ub"),
+            (self.col_type.len(), "col_type"),
             (self.col_names.len(), "col_names"),
         ] {
             if len != n {
@@ -134,13 +170,15 @@ impl Problem {
                     ub: hi,
                 });
             }
-            // Binary columns may only be relaxed to [0,1] or fixed within it.
-            if lo < 0.0 || hi > 1.0 {
-                return Err(ModelError::NotBinary {
-                    index: j,
-                    lb: lo,
-                    ub: hi,
-                });
+            // An integer column's bounds must themselves be integral, or branching
+            // could never reach them: `x <= floor(2.5)` and `x >= ceil(2.5)` would
+            // both exclude values the bounds admit.
+            if self.col_type[j] == VarType::Integer {
+                for bound in [lo, hi] {
+                    if bound.is_finite() && (bound - bound.round()).abs() > 1e-9 {
+                        return Err(ModelError::FractionalIntegerBound { index: j, bound });
+                    }
+                }
             }
         }
         for i in 0..m {
@@ -182,10 +220,8 @@ pub enum ModelError {
         lb: f64,
         ub: f64,
     },
-    #[error(
-        "column {index} has bounds [{lb}, {ub}], which is not within [0, 1]; ripsolve solves binary programs only"
-    )]
-    NotBinary { index: usize, lb: f64, ub: f64 },
+    #[error("integer column {index} has the fractional bound {bound}")]
+    FractionalIntegerBound { index: usize, bound: f64 },
     #[error("objective contains a non-finite coefficient")]
     NonFiniteObjective,
 }
@@ -205,6 +241,7 @@ mod tests {
             row_ub: vec![f64::INFINITY],
             col_lb: vec![0.0, 0.0],
             col_ub: vec![1.0, 1.0],
+            col_type: vec![VarType::Integer; 2],
             col_names: vec!["x0".into(), "x1".into()],
             row_names: vec!["c0".into()],
         }
@@ -230,13 +267,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_binary_columns() {
+    fn validate_accepts_a_general_integer_column() {
         let mut p = tiny(Sense::Minimize, 0.0);
         p.col_ub[1] = 4.0;
+        assert!(
+            p.validate().is_ok(),
+            "a [0, 4] integer column is legitimate"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_fractional_integer_bound() {
+        // Branching splits at an integer, so a bound of 2.5 is unreachable from
+        // either side and the model is ill-posed rather than merely unusual.
+        let mut p = tiny(Sense::Minimize, 0.0);
+        p.col_ub[1] = 2.5;
         assert!(matches!(
             p.validate(),
-            Err(ModelError::NotBinary { index: 1, .. })
+            Err(ModelError::FractionalIntegerBound { index: 1, .. })
         ));
+        // The same bound on a continuous column is fine.
+        p.col_type[1] = VarType::Continuous;
+        assert!(p.validate().is_ok());
     }
 
     #[test]

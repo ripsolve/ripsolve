@@ -147,11 +147,14 @@ fn branch_score(down: f64, up: f64) -> f64 {
 }
 
 use crate::lp::{BasisState, Lp, LpStatus};
+use crate::model::Problem;
 
-/// The columns eligible for branching at a node, with their fractional values.
-fn candidates(x: &[f64], tolerance: f64) -> Vec<(usize, f64)> {
+/// The columns eligible for branching: integer columns sitting at a fractional
+/// value. A continuous column is never a candidate, however fractional it is.
+fn candidates(problem: &Problem, x: &[f64], tolerance: f64) -> Vec<(usize, f64)> {
     x.iter()
         .enumerate()
+        .filter(|&(j, _)| problem.is_integer(j))
         .filter_map(|(j, &v)| {
             let fraction = v - v.floor();
             (fraction > tolerance && fraction < 1.0 - tolerance).then_some((j, fraction))
@@ -198,6 +201,7 @@ pub struct Decision {
 /// measured at 10 nodes to 917 on v128c256n100.
 #[allow(clippy::too_many_arguments)]
 pub fn select(
+    problem: &Problem,
     lp: &mut Lp,
     basis: &BasisState,
     x: &[f64],
@@ -207,7 +211,7 @@ pub fn select(
     strong_budget: &mut usize,
     iterations: &mut usize,
 ) -> Option<Decision> {
-    let candidates = candidates(x, tolerance);
+    let candidates = candidates(problem, x, tolerance);
     if candidates.is_empty() {
         return None;
     }
@@ -232,10 +236,13 @@ pub fn select(
         } else {
             *strong_budget -= 1;
 
+            // The same split the search itself would make, so what the probe
+            // measures is what branching would actually cost.
             let saved = lp.column_bounds(j);
-            lp.set_column_bounds(j, 0.0, 0.0);
+            let value = x[j];
+            lp.set_column_bounds(j, saved.0, value.floor());
             let down_probe = lp.solve_warm(basis, None, STRONG_ITERATIONS);
-            lp.set_column_bounds(j, 1.0, 1.0);
+            lp.set_column_bounds(j, value.ceil(), saved.1);
             let up_probe = lp.solve_warm(basis, None, STRONG_ITERATIONS);
             lp.set_column_bounds(j, saved.0, saved.1);
             *iterations += down_probe.iterations + up_probe.iterations;
@@ -378,9 +385,30 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_the_fractional_columns_only() {
-        let found = candidates(&[0.0, 0.5, 1.0, 0.25, 1e-9], 1e-6);
-        assert_eq!(found, vec![(1, 0.5), (3, 0.25)]);
+    fn candidates_are_the_fractional_integer_columns_only() {
+        use crate::model::{Sense, VarType};
+        use crate::sparse::SparseMatrix;
+        let n = 5;
+        let mut problem = Problem {
+            name: "t".into(),
+            sense: Sense::Minimize,
+            obj: vec![0.0; n],
+            obj_offset: 0.0,
+            matrix: SparseMatrix::from_triplets(0, n, []),
+            row_lb: Vec::new(),
+            row_ub: Vec::new(),
+            col_lb: vec![0.0; n],
+            col_ub: vec![1.0; n],
+            col_type: vec![VarType::Integer; n],
+            col_names: (0..n).map(|j| format!("x{j}")).collect(),
+            row_names: Vec::new(),
+        };
+        let x = [0.0, 0.5, 1.0, 0.25, 1e-9];
+        assert_eq!(candidates(&problem, &x, 1e-6), vec![(1, 0.5), (3, 0.25)]);
+
+        // A continuous column is never a branching candidate, however fractional.
+        problem.col_type[1] = VarType::Continuous;
+        assert_eq!(candidates(&problem, &x, 1e-6), vec![(3, 0.25)]);
     }
 
     #[test]

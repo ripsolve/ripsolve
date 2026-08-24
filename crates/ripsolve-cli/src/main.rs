@@ -160,14 +160,16 @@ fn main() -> Result<()> {
                         );
                     }
                     if verbose {
-                        let ones: Vec<&str> = problem
+                        // Print every column that is not at zero, with its value:
+                        // a general integer can be 3, not just 0 or 1.
+                        let nonzero: Vec<String> = problem
                             .col_names
                             .iter()
                             .zip(&solution.x)
-                            .filter(|(_, v)| **v == 1)
-                            .map(|(n, _)| n.as_str())
+                            .filter(|(_, v)| v.abs() > 1e-9)
+                            .map(|(n, v)| format!("{n}={v}"))
                             .collect();
-                        println!("1: {}", ones.join(" "));
+                        println!("nonzero: {}", nonzero.join(" "));
                     }
                 }
                 None => println!("status:    {:?}", solution.status),

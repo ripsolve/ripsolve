@@ -147,6 +147,8 @@ pub struct Lp {
     upper: Vec<f64>,
     /// The original `A`, column-major, `m x n_structural`.
     matrix: SparseMatrix,
+    /// Which structural columns must take integer values. Logicals are continuous.
+    integer: Vec<bool>,
     tol: Tolerances,
     /// Recently used factorizations, most recent first, keyed by basis columns.
     ///
@@ -175,6 +177,7 @@ impl Clone for Lp {
             lower: self.lower.clone(),
             upper: self.upper.clone(),
             matrix: self.matrix.clone(),
+            integer: self.integer.clone(),
             tol: self.tol,
             factors: Vec::new(),
         }
@@ -187,6 +190,9 @@ impl Lp {
     /// Column bounds are taken from the problem, so a problem whose bounds have
     /// already been narrowed by presolve or branching relaxes accordingly.
     pub fn relaxation(problem: &Problem) -> Lp {
+        let integer: Vec<bool> = (0..problem.n_cols())
+            .map(|j| problem.is_integer(j))
+            .collect();
         let n = problem.n_cols();
         let m = problem.n_rows();
         let mut cost = problem.obj.clone();
@@ -204,6 +210,7 @@ impl Lp {
             lower,
             upper,
             matrix: problem.matrix.clone(),
+            integer,
             tol: Tolerances::default(),
             factors: Vec::new(),
         }
@@ -1005,9 +1012,9 @@ impl<'a> Solver<'a> {
             if cuts.len() >= max_cuts {
                 break;
             }
-            // Only a structural column carries an integrality requirement to exploit.
+            // Only an integer column carries a requirement to exploit.
             let basic = self.basic[i];
-            if basic >= lp.n_structural {
+            if basic >= lp.n_structural || !lp.integer[basic] {
                 continue;
             }
             let beta = self.z[basic];
@@ -1049,7 +1056,10 @@ impl<'a> Solver<'a> {
                     continue;
                 }
 
-                let c = if j < lp.n_structural {
+                // The two coefficient formulas differ, and picking by position
+                // rather than by declared integrality would silently produce an
+                // invalid cut on any model with continuous columns.
+                let c = if j < lp.n_structural && lp.integer[j] {
                     // Integer column: the piecewise-linear integer coefficient.
                     let f = a - a.floor();
                     if f <= f0 {
@@ -1299,6 +1309,7 @@ mod tests {
             row_ub,
             col_lb: vec![0.0; n],
             col_ub: vec![1.0; n],
+            col_type: vec![crate::model::VarType::Integer; n],
             col_names: (0..n).map(|j| format!("x{j}")).collect(),
             row_names: (0..m).map(|i| format!("c{i}")).collect(),
         }

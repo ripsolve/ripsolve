@@ -76,16 +76,23 @@ const TOL: f64 = 1e-9;
 /// A cut must beat this violation to be worth adding; smaller ones are noise.
 const MIN_VIOLATION: f64 = 1e-4;
 
-/// Rewrite one side of a row as a knapsack, or `None` if it cannot be one.
+/// Rewrite one side of a row as a knapsack over its *binary* columns, or `None` if
+/// it cannot be one.
 ///
 /// `negate` selects the `>=` side, which becomes `<=` under negation.
+///
+/// A cover argument counts how many columns can be switched on at once, which only
+/// means anything for 0/1 columns. A general integer or continuous column in the
+/// row is therefore folded into the capacity at its most favourable value, so the
+/// resulting cut stays valid whatever that column does. A row with no binary
+/// columns yields nothing.
 fn to_knapsack(
+    problem: &Problem,
     coefficients: &[(usize, f64)],
     bound: f64,
     negate: bool,
-    col_lb: &[f64],
-    col_ub: &[f64],
 ) -> Option<Knapsack> {
+    let (col_lb, col_ub) = (&problem.col_lb, &problem.col_ub);
     if !bound.is_finite() {
         return None;
     }
@@ -101,6 +108,21 @@ fn to_knapsack(
         // A fixed column is a constant, not a decision: fold it into the capacity.
         if col_lb[j] == col_ub[j] {
             capacity -= a * col_lb[j];
+            continue;
+        }
+        // A non-binary column is not something a cover can reason about. Charge the
+        // capacity for the least it could contribute, so the cut holds for every
+        // value it might take. An infinite worst case means no usable bound.
+        if !problem.is_binary(j) {
+            let least = if a > 0.0 {
+                a * col_lb[j]
+            } else {
+                a * col_ub[j]
+            };
+            if !least.is_finite() {
+                return None;
+            }
+            capacity -= least;
             continue;
         }
         if a > 0.0 {
@@ -379,13 +401,7 @@ pub fn separate(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
 
         // Each finite side of the row is its own knapsack.
         for (bound, negate) in [(problem.row_ub[i], false), (problem.row_lb[i], true)] {
-            let Some(knapsack) = to_knapsack(
-                &coefficients,
-                bound,
-                negate,
-                &problem.col_lb,
-                &problem.col_ub,
-            ) else {
+            let Some(knapsack) = to_knapsack(problem, &coefficients, bound, negate) else {
                 continue;
             };
             // One unseeded pass, then one seeded by each fractional term. Distinct
@@ -492,6 +508,7 @@ mod tests {
             row_ub,
             col_lb: vec![0.0; n],
             col_ub: vec![1.0; n],
+            col_type: vec![crate::model::VarType::Integer; n],
             col_names: (0..n).map(|j| format!("x{j}")).collect(),
             row_names: (0..m).map(|i| format!("c{i}")).collect(),
         }

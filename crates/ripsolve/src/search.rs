@@ -122,7 +122,7 @@ pub struct Solution {
     /// Objective in the user's original sense; `None` if no solution was found.
     pub objective: Option<f64>,
     /// The incumbent assignment, in column order.
-    pub x: Vec<u8>,
+    pub x: Vec<f64>,
     /// Best proven bound, in the user's original sense.
     pub bound: f64,
     pub nodes: usize,
@@ -270,7 +270,7 @@ impl OpenNodes {
 struct NodeOutcome {
     /// A feasible assignment found here, by the LP landing integral or by a
     /// heuristic.
-    incumbent: Option<(f64, Vec<u8>)>,
+    incumbent: Option<(f64, Vec<f64>)>,
     children: Vec<Node>,
     /// The node's LP hit its iteration limit, so the search cannot claim to have
     /// examined this subtree and must not report optimality.
@@ -330,9 +330,8 @@ impl<'a> Worker<'a> {
             self.lp
                 .set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
         }
-        for &(j, v) in &node.fixings {
-            self.lp
-                .set_column_bounds(j as usize, f64::from(v), f64::from(v));
+        for &(j, lo, hi) in &node.fixings {
+            self.lp.set_column_bounds(j as usize, lo, hi);
         }
 
         let cutoff = incumbent.is_finite().then_some(incumbent);
@@ -370,7 +369,7 @@ impl<'a> Worker<'a> {
         // many columns fixed, so a dive from one is short and often lands somewhere
         // the search would take a long time to reach.
         if self.dives.due(index)
-            && integral_solution(&solved.x, options.integrality_tolerance).is_none()
+            && integral_solution(problem, &solved.x, options.integrality_tolerance).is_none()
         {
             let found = heuristic::dive(
                 problem,
@@ -392,7 +391,7 @@ impl<'a> Worker<'a> {
             self.dives.record(index, improved);
         }
 
-        match integral_solution(&solved.x, options.integrality_tolerance) {
+        match integral_solution(problem, &solved.x, options.integrality_tolerance) {
             Some(x) => {
                 let better = out
                     .incumbent
@@ -404,6 +403,7 @@ impl<'a> Worker<'a> {
             }
             None => {
                 let decision = branch::select(
+                    problem,
                     &mut self.lp,
                     &solved.basis,
                     &solved.x,
@@ -420,30 +420,38 @@ impl<'a> Worker<'a> {
                     return out;
                 }
 
-                // A probe that proved one side infeasible decides the column
-                // outright, so descend into the single surviving child.
-                let values: Vec<u8> = match decision.forced {
-                    Some(value) => vec![value],
-                    // Under a plunge, the stack pops last-in first, so the side
-                    // nearer the relaxation's own value goes last and is explored
-                    // first. Under best-bound selection the order is immaterial.
-                    None if decision.fraction > 0.5 => vec![0, 1],
-                    None => vec![1, 0],
-                };
+                let column = decision.column;
+                let value = solved.x[column];
+                let (lo, hi) = self.lp.column_bounds(column);
+                // Split the column's range at the fractional value: `x <= floor(v)`
+                // against `x >= ceil(v)`. Together these cover every integer the
+                // column could take and overlap in none, so no solution is lost and
+                // none is counted twice. On a binary column this is exactly fixing
+                // to 0 and to 1.
+                let down = (lo, value.floor());
+                let up = (value.ceil(), hi);
 
-                for v in values {
+                let mut sides = match decision.forced {
+                    Some(0) => vec![down],
+                    Some(_) => vec![up],
+                    // Explored last-pushed first under a plunge, so the side nearer
+                    // the relaxation's own value goes last. Immaterial under
+                    // best-bound selection.
+                    None if value - value.floor() > 0.5 => vec![down, up],
+                    None => vec![up, down],
+                };
+                sides.retain(|&(lo, hi)| lo <= hi);
+
+                for (lo, hi) in sides {
                     let mut fixings = node.fixings.clone();
-                    fixings.push((decision.column as u32, v));
+                    fixings.push((column as u32, lo, hi));
+                    // `up` is the side that raised the lower bound.
+                    let went_up = lo > value.floor();
                     out.children.push(Node {
                         fixings,
                         bound: solved.objective,
                         basis: solved.basis.clone(),
-                        origin: Some((
-                            decision.column,
-                            v == 1,
-                            solved.objective,
-                            decision.fraction,
-                        )),
+                        origin: Some((column, went_up, solved.objective, decision.fraction)),
                     });
                 }
             }
@@ -456,7 +464,7 @@ impl<'a> Worker<'a> {
 struct TreeResult {
     status: Status,
     incumbent: f64,
-    incumbent_x: Option<Vec<u8>>,
+    incumbent_x: Option<Vec<f64>>,
     nodes: usize,
     iterations: usize,
     heuristic_hits: usize,
@@ -482,7 +490,7 @@ struct Shared {
     /// Signalled whenever a worker pushes children or goes idle.
     wake: Condvar,
     /// The incumbent, guarded for writing.
-    best: Mutex<(f64, Option<Vec<u8>>)>,
+    best: Mutex<(f64, Option<Vec<f64>>)>,
     /// The incumbent objective again, as raw bits, for lock-free reads on the hot
     /// path. Always written under `best`, so it can only lag, never lead — and a
     /// stale-but-worse cutoff prunes less, never wrongly.
@@ -509,7 +517,7 @@ impl Shared {
     ///
     /// Two workers can find improvements concurrently, so the comparison is redone
     /// under the lock rather than trusted from the atomic read that motivated it.
-    fn offer(&self, objective: f64, x: Vec<u8>) -> bool {
+    fn offer(&self, objective: f64, x: Vec<f64>) -> bool {
         let mut best = self.best.lock().expect("incumbent lock");
         if objective < best.0 {
             best.0 = objective;
@@ -571,7 +579,7 @@ fn run_parallel(
     options: Options,
     started: Instant,
     incumbent: f64,
-    incumbent_x: Option<Vec<u8>>,
+    incumbent_x: Option<Vec<f64>>,
     threads: usize,
 ) -> TreeResult {
     let shared = Shared {
@@ -666,11 +674,16 @@ fn run_parallel(
 
 /// One open subproblem: the columns fixed so far, and where to resume from.
 struct Node {
-    /// Every column fixed on the path from the root, as `(column, value)`.
+    /// Every bound change on the path from the root, as `(column, lower, upper)`.
+    ///
+    /// Bound changes rather than fixings, because branching on a general integer
+    /// splits a range — `x <= floor(v)` against `x >= ceil(v)` — instead of pinning
+    /// a value. On a binary column that split *is* a fixing, so the binary case
+    /// needs no separate handling.
     ///
     /// Held in full rather than as a delta against a parent, which costs a little
     /// memory and removes a whole class of undo bugs from the search loop.
-    fixings: Vec<(u32, u8)>,
+    fixings: Vec<(u32, f64, f64)>,
     /// The parent's relaxation value, used to prune before solving anything.
     bound: f64,
     /// The parent's final basis, to warm start from.
@@ -726,7 +739,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     // Everything below is in the internal minimization form; conversion to the
     // user's sense happens once, on the way out.
     let mut incumbent = f64::INFINITY;
-    let mut incumbent_x: Option<Vec<u8>> = None;
+    let mut incumbent_x: Option<Vec<f64>> = None;
 
     let root = lp.solve_with_limit(options.max_iterations_per_node);
     iterations += root.iterations;
@@ -765,7 +778,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut problem = problem;
     for _ in 0..options.cut_rounds {
         if root.status != LpStatus::Optimal
-            || integral_solution(&root.x, options.integrality_tolerance).is_some()
+            || integral_solution(problem, &root.x, options.integrality_tolerance).is_some()
         {
             break;
         }
@@ -850,7 +863,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
     // Consider the root itself first, so an integral relaxation is picked up without
     // a branching step.
-    if let Some(x) = integral_solution(&root.x, options.integrality_tolerance) {
+    if let Some(x) = integral_solution(problem, &root.x, options.integrality_tolerance) {
         // Scored from the rounded point, not the relaxation value; see
         // `objective_at`.
         incumbent = objective_at(problem, &x);
@@ -979,14 +992,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     }
 }
 
-/// The internal-form objective of a binary assignment.
-fn objective_at(problem: &Problem, x: &[u8]) -> f64 {
-    problem
-        .obj
-        .iter()
-        .zip(x)
-        .map(|(c, &v)| c * f64::from(v))
-        .sum()
+/// The internal-form objective of an assignment.
+fn objective_at(problem: &Problem, x: &[f64]) -> f64 {
+    problem.obj.iter().zip(x).map(|(c, &v)| c * v).sum()
 }
 
 /// Would a node with this bound improve on the incumbent by enough to be worth
@@ -1001,15 +1009,24 @@ fn improves(bound: f64, incumbent: f64, gap_tolerance: f64) -> bool {
     bound < incumbent - slack
 }
 
-/// Round a relaxation to a binary assignment, or `None` if it is fractional.
-fn integral_solution(x: &[f64], tolerance: f64) -> Option<Vec<u8>> {
+/// Snap a relaxation to an integral assignment, or `None` if some integer column is
+/// still fractional.
+///
+/// Continuous columns pass through untouched: a MIP solution is integral in its
+/// integer columns only, and rounding a continuous one would leave the point
+/// infeasible.
+fn integral_solution(problem: &Problem, x: &[f64], tolerance: f64) -> Option<Vec<f64>> {
     let mut out = Vec::with_capacity(x.len());
-    for &v in x {
-        let rounded = v.round();
-        if (v - rounded).abs() > tolerance {
-            return None;
+    for (j, &v) in x.iter().enumerate() {
+        if problem.is_integer(j) {
+            let rounded = v.round();
+            if (v - rounded).abs() > tolerance {
+                return None;
+            }
+            out.push(rounded);
+        } else {
+            out.push(v);
         }
-        out.push(rounded as u8);
     }
     Some(out)
 }
@@ -1025,7 +1042,7 @@ mod tests {
         // A node's basis is irrelevant to the ordering under test.
         let mut lp = Lp::relaxation(&trivial());
         Node {
-            fixings: (0..depth).map(|j| (j as u32, 0u8)).collect(),
+            fixings: (0..depth).map(|j| (j as u32, 0.0, 0.0)).collect(),
             bound,
             basis: lp.solve().basis,
             origin: None,
@@ -1043,6 +1060,7 @@ mod tests {
             row_ub: vec![RowSense::Ge.bounds(0.0).1],
             col_lb: vec![0.0],
             col_ub: vec![1.0],
+            col_type: vec![crate::model::VarType::Integer],
             col_names: vec!["x".into()],
             row_names: vec!["c".into()],
         }

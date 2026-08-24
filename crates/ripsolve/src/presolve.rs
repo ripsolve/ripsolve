@@ -248,8 +248,20 @@ fn propagate(
             (contribution_hi / a, contribution_lo / a)
         };
 
-        let new_lb = problem.col_lb[j].max(ceil_with_tolerance(implied_lo));
-        let new_ub = problem.col_ub[j].min(floor_with_tolerance(implied_hi));
+        // An integer column's implied bound rounds inwards, which is what turns a
+        // weak implication into a fixing. A continuous column must not be rounded:
+        // doing so cuts off values it is entitled to take, and the search then
+        // proves a worse solution optimal.
+        let (implied_lo, implied_hi) = if problem.is_integer(j) {
+            (
+                ceil_with_tolerance(implied_lo),
+                floor_with_tolerance(implied_hi),
+            )
+        } else {
+            (implied_lo, implied_hi)
+        };
+        let new_lb = problem.col_lb[j].max(implied_lo);
+        let new_ub = problem.col_ub[j].min(implied_hi);
         if new_lb > new_ub + TOL {
             return Propagation::Infeasible;
         }
@@ -331,8 +343,11 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
     let mut changed = false;
     for k in 0..row.len() {
         let (j, a) = row[k];
-        // Only free binaries: a fixed column contributes a constant, not a choice.
-        if a == 0.0 || problem.col_lb[j] != 0.0 || problem.col_ub[j] != 1.0 {
+        // Only free binaries. The reduction reasons about a column being switched
+        // fully on or fully off, which is meaningless for a continuous column and
+        // wrong for a general integer that can land in between.
+        if a == 0.0 || !problem.is_binary(j) || problem.col_lb[j] != 0.0 || problem.col_ub[j] != 1.0
+        {
             continue;
         }
         let (min_activity, max_activity) = activity(row, &problem.col_lb, &problem.col_ub);
@@ -407,6 +422,7 @@ mod tests {
             row_ub,
             col_lb: vec![0.0; n],
             col_ub: vec![1.0; n],
+            col_type: vec![crate::model::VarType::Integer; n],
             col_names: (0..n).map(|j| format!("x{j}")).collect(),
             row_names: (0..m).map(|i| format!("c{i}")).collect(),
         }

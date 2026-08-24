@@ -95,8 +95,8 @@ def test_an_integer_objective_is_exact():
 
 def test_expression_arithmetic():
     m = ripsolve.Model()
-    x = m.addVar(name="x")
-    y = m.addVar(name="y")
+    x = m.addVar(vtype=GRB.BINARY, name="x")
+    y = m.addVar(vtype=GRB.BINARY, name="y")
     # Every form a gurobipy user might reasonably write.
     m.setObjective(2 * x + 3 * y - 1, GRB.MINIMIZE)
     m.addConstr(x + y >= 1)
@@ -112,7 +112,7 @@ def test_expression_arithmetic():
 
 def test_repeated_terms_accumulate():
     m = ripsolve.Model()
-    x = m.addVar()
+    x = m.addVar(vtype=GRB.BINARY)
     m.setObjective(x + x, GRB.MINIMIZE)
     m.addConstr(x + x >= 2)
     m.optimize()
@@ -121,7 +121,7 @@ def test_repeated_terms_accumulate():
 
 def test_infeasible_is_reported():
     m = ripsolve.Model()
-    x = m.addVar()
+    x = m.addVar(vtype=GRB.BINARY)
     m.addConstr(x >= 1)
     m.addConstr(x <= 0)
     m.optimize()
@@ -131,13 +131,12 @@ def test_infeasible_is_reported():
         _ = m.ObjVal
 
 
-def test_non_binary_is_rejected():
-    # Better to refuse than to silently relax a model the solver cannot honour.
+def test_continuous_is_the_default_vtype():
+    # As in gurobipy. Defaulting to binary would be more convenient for this
+    # solver's history and would silently change the meaning of a ported script.
     m = ripsolve.Model()
-    with pytest.raises(ValueError):
-        m.addVar(vtype=GRB.CONTINUOUS)
-    with pytest.raises(ValueError):
-        m.addVar(vtype=GRB.INTEGER)
+    v = m.addVar()
+    assert v.VType == "C"
 
 
 def test_unknown_parameter_is_rejected():
@@ -148,14 +147,14 @@ def test_unknown_parameter_is_rejected():
 
 def test_attributes_before_optimize_raise():
     m = ripsolve.Model()
-    m.addVar()
+    m.addVar(vtype=GRB.BINARY)
     with pytest.raises(ValueError):
         _ = m.Status
 
 
 def test_model_shape_attributes():
     m = ripsolve.Model("shape")
-    a, b = m.addVar(name="a"), m.addVar(name="b")
+    a, b = m.addVar(vtype=GRB.BINARY, name="a"), m.addVar(vtype=GRB.BINARY, name="b")
     m.addConstr(a + b <= 1, name="together")
     assert m.ModelName == "shape"
     assert m.NumVars == 2
@@ -176,7 +175,7 @@ def test_read_lp_file():
 
 def test_write_round_trips(tmp_path):
     m = ripsolve.Model("rt")
-    x = m.addVars(3, name="x")
+    x = m.addVars(3, vtype=GRB.BINARY, name="x")
     m.setObjective(ripsolve.quicksum(x[j] for j in range(3)), GRB.MINIMIZE)
     m.addConstr(ripsolve.quicksum(x[j] for j in range(3)) >= 2)
     path = str(tmp_path / "model.lp")
@@ -201,9 +200,107 @@ def test_time_limit_is_honoured():
 
 def test_bounds_can_fix_a_variable():
     m = ripsolve.Model()
-    x, y = m.addVar(name="x"), m.addVar(name="y")
+    x, y = m.addVar(vtype=GRB.BINARY, name="x"), m.addVar(vtype=GRB.BINARY, name="y")
     m.setObjective(x + 5 * y, GRB.MINIMIZE)
     m.addConstr(x + y >= 1)
     x.UB = 0.0  # forces the expensive column in
     m.optimize()
     assert m.ObjVal == pytest.approx(5.0)
+
+
+# --- mixed-integer models -------------------------------------------------
+
+
+def mixed(gp, grb):
+    """Binary, general-integer and continuous columns in the same model."""
+    m = gp.Model("mixed")
+    m.setParam("OutputFlag", 0)
+    b = m.addVar(vtype=grb.BINARY, name="b")
+    i = m.addVar(vtype=grb.INTEGER, ub=6, name="i")
+    c = m.addVar(vtype=grb.CONTINUOUS, ub=4.0, name="c")
+    m.setObjective(4 * b + 3 * i + 1.5 * c, grb.MINIMIZE)
+    m.addConstr(2 * b + 3 * i + c >= 7.5)
+    m.addConstr(i + c >= 3)
+    m.optimize()
+    return m.Status, m.ObjVal, (b.X, i.X, c.X)
+
+
+def test_mixed_integer_is_solved():
+    status, objective, (b, i, c) = mixed(ripsolve, GRB)
+    assert status == GRB.OPTIMAL
+    # The integer columns must land on integers; the continuous one need not.
+    assert b == pytest.approx(round(b))
+    assert i == pytest.approx(round(i))
+    assert 2 * b + 3 * i + c >= 7.5 - 1e-6
+    assert objective == pytest.approx(4 * b + 3 * i + 1.5 * c)
+
+
+@needs_gurobi
+def test_mixed_integer_matches_gurobi():
+    mine = mixed(ripsolve, GRB)
+    theirs = mixed(gurobipy, GGRB)
+    assert mine[0] == theirs[0]
+    assert mine[1] == pytest.approx(theirs[1])
+
+
+def test_general_integer_takes_a_value_above_one():
+    # Branching splits a range rather than fixing to 0/1, so 4 must be reachable.
+    m = ripsolve.Model()
+    x = m.addVar(vtype=GRB.INTEGER, ub=9, name="x")
+    m.setObjective(-x, GRB.MINIMIZE)
+    m.addConstr(3 * x <= 13)
+    m.optimize()
+    assert x.X == pytest.approx(4.0)
+
+
+def test_continuous_variables_stay_fractional():
+    # The distinguishing MIP case: an optimum that is fractional in a continuous
+    # column is a valid answer, not something to branch away.
+    m = ripsolve.Model()
+    a = m.addVar(vtype=GRB.BINARY, name="a")
+    b = m.addVar(vtype=GRB.CONTINUOUS, ub=5.0, name="b")
+    m.setObjective(2 * a + 3 * b, GRB.MINIMIZE)
+    m.addConstr(a + b >= 1.5)
+    m.optimize()
+    assert m.ObjVal == pytest.approx(3.5)
+    assert b.X == pytest.approx(0.5)
+
+
+def test_vtype_is_reported_back():
+    m = ripsolve.Model()
+    assert m.addVar(vtype=GRB.BINARY).VType == "B"
+    assert m.addVar(vtype=GRB.INTEGER, ub=5).VType == "I"
+    assert m.addVar(vtype=GRB.CONTINUOUS).VType == "C"
+
+
+def test_unsupported_vtype_is_rejected():
+    m = ripsolve.Model()
+    with pytest.raises(ValueError):
+        m.addVar(vtype="S")  # semi-continuous
+
+
+def test_fractional_integer_bound_is_rejected():
+    # Branching splits at an integer, so a bound of 2.5 is unreachable from either
+    # side; better to refuse than to solve a subtly different model.
+    m = ripsolve.Model()
+    with pytest.raises(ValueError):
+        m.addVar(vtype=GRB.INTEGER, ub=2.5)
+    # The same bound on a continuous column is fine.
+    m.addVar(vtype=GRB.CONTINUOUS, ub=2.5)
+
+
+def test_mixed_model_round_trips_through_a_file(tmp_path):
+    m = ripsolve.Model("rt")
+    a = m.addVar(vtype=GRB.INTEGER, ub=5, name="a")
+    b = m.addVar(vtype=GRB.CONTINUOUS, ub=3.0, name="b")
+    m.setObjective(2 * a + b, GRB.MINIMIZE)
+    m.addConstr(a + b >= 2.5)
+    path = str(tmp_path / "mixed.lp")
+    m.write(path)
+
+    again = ripsolve.read(path)
+    # Types must survive the trip; a Bounds section must not silently relax `a`.
+    assert [v.VType for v in again.getVars()] == ["I", "C"]
+    again.optimize()
+    m.optimize()
+    assert again.ObjVal == pytest.approx(m.ObjVal)

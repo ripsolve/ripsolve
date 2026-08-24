@@ -5,3 +5,4 @@
 python/ripsolve.so
 python/tests/__pycache__
 python/.pytest_cache
+bench/__pycache__/

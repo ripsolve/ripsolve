@@ -16,9 +16,9 @@
 //! print(m.ObjVal, [x[j].X for j in range(n)])
 //! ```
 //!
-//! Everything here is binary-only. `addVar` accepts `vtype` for source
-//! compatibility but rejects any type other than `GRB.BINARY`, rather than
-//! silently relaxing a model the solver cannot honour.
+//! Binary, general-integer and continuous variables are all supported, so the
+//! models this accepts are ordinary MIPs rather than pure BIPs. Quadratic terms,
+//! SOS constraints, callbacks and lazy constraints are not.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-use ripsolve::model::{Problem, RowSense, Sense};
+use ripsolve::model::{Problem, RowSense, Sense, VarType};
 use ripsolve::search::{self, Options, Status as SearchStatus};
 use ripsolve::sparse::SparseMatrix;
 
@@ -44,6 +44,7 @@ struct Row {
 struct ModelData {
     name: String,
     var_names: Vec<String>,
+    var_types: Vec<VarType>,
     objective: Vec<f64>,
     objective_constant: f64,
     sense: Sense,
@@ -90,6 +91,7 @@ impl ModelData {
         Self {
             name,
             var_names: Vec::new(),
+            var_types: Vec::new(),
             objective: Vec::new(),
             objective_constant: 0.0,
             // Gurobi minimizes unless told otherwise.
@@ -328,6 +330,18 @@ impl Var {
         self.data.lock().expect("model lock").var_names[self.index].clone()
     }
 
+    #[getter(VType)]
+    fn vtype(&self) -> char {
+        let data = self.data.lock().expect("model lock");
+        match data.var_types[self.index] {
+            VarType::Continuous => 'C',
+            VarType::Integer if data.upper[self.index] <= 1.0 && data.lower[self.index] >= 0.0 => {
+                'B'
+            }
+            VarType::Integer => 'I',
+        }
+    }
+
     #[getter(Obj)]
     fn obj(&self) -> f64 {
         self.data.lock().expect("model lock").objective[self.index]
@@ -464,6 +478,7 @@ impl Model {
             row_ub,
             col_lb: data.lower.clone(),
             col_ub: data.upper.clone(),
+            col_type: data.var_types.clone(),
             col_names: data.var_names.clone(),
             row_names,
         };
@@ -497,13 +512,43 @@ impl Model {
         }
     }
 
-    /// Add one binary variable.
-    #[pyo3(signature = (obj = 0.0, vtype = 'B', name = "", lb = 0.0, ub = 1.0))]
-    fn addVar(&self, obj: f64, vtype: char, name: &str, lb: f64, ub: f64) -> PyResult<Var> {
-        if vtype != 'B' {
-            return Err(PyValueError::new_err(
-                "ripsolve solves binary programs only; vtype must be GRB.BINARY",
-            ));
+    /// Add one variable.
+    ///
+    /// `vtype` follows Gurobi: `GRB.BINARY`, `GRB.INTEGER` or `GRB.CONTINUOUS`,
+    /// defaulting to continuous as Gurobi's does. Defaulting to binary instead
+    /// would be more convenient here and is exactly the wrong trade: a ported
+    /// script calling `addVar()` would silently get a different model.
+    ///
+    /// Binary is an integer pinned to `[0, 1]`, so the default bounds depend on the
+    /// type -- as in Gurobi, where an unbounded integer is `[0, inf)`.
+    #[pyo3(signature = (obj = 0.0, vtype = 'C', name = "", lb = None, ub = None))]
+    fn addVar(
+        &self,
+        obj: f64,
+        vtype: char,
+        name: &str,
+        lb: Option<f64>,
+        ub: Option<f64>,
+    ) -> PyResult<Var> {
+        let (kind, default_lb, default_ub) = match vtype {
+            'B' => (VarType::Integer, 0.0, 1.0),
+            'I' => (VarType::Integer, 0.0, f64::INFINITY),
+            'C' => (VarType::Continuous, 0.0, f64::INFINITY),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported vtype {other:?}; expected GRB.BINARY, GRB.INTEGER or GRB.CONTINUOUS"
+                )));
+            }
+        };
+        let (lb, ub) = (lb.unwrap_or(default_lb), ub.unwrap_or(default_ub));
+        if kind == VarType::Integer {
+            for bound in [lb, ub] {
+                if bound.is_finite() && (bound - bound.round()).abs() > 1e-9 {
+                    return Err(PyValueError::new_err(format!(
+                        "integer variable has the fractional bound {bound}"
+                    )));
+                }
+            }
         }
         let mut data = self.data.lock().expect("model lock");
         let index = data.var_names.len();
@@ -513,6 +558,7 @@ impl Model {
             name.to_string()
         };
         data.var_names.push(name);
+        data.var_types.push(kind);
         data.objective.push(obj);
         data.lower.push(lb);
         data.upper.push(ub);
@@ -527,7 +573,10 @@ impl Model {
     ///
     /// An integer count gives integer keys `0..n`; an iterable of keys gives those
     /// keys, so `addVars(range(n))` and `addVars(pairs)` both behave as expected.
-    #[pyo3(signature = (keys, obj = 0.0, vtype = 'B', name = ""))]
+    // Mirrors gurobipy's signature; splitting it into a struct would make the
+    // binding read nothing like the API it exists to imitate.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (keys, obj = 0.0, vtype = 'C', name = "", lb = None, ub = None))]
     fn addVars<'py>(
         &self,
         py: Python<'py>,
@@ -535,6 +584,8 @@ impl Model {
         obj: f64,
         vtype: char,
         name: &str,
+        lb: Option<f64>,
+        ub: Option<f64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let key_list: Vec<Py<PyAny>> = if let Ok(count) = keys.extract::<usize>() {
             (0..count)
@@ -554,7 +605,7 @@ impl Model {
             } else {
                 format!("{name}[{}]", bound.str()?)
             };
-            let var = self.addVar(obj, vtype, &label, 0.0, 1.0)?;
+            let var = self.addVar(obj, vtype, &label, lb, ub)?;
             out.set_item(bound, Py::new(py, var)?)?;
         }
         Ok(out)
@@ -675,7 +726,7 @@ impl Model {
             status,
             objective: solution.objective,
             bound: solution.bound,
-            values: solution.x.iter().map(|&v| f64::from(v)).collect(),
+            values: solution.x.clone(),
             nodes: solution.nodes,
             runtime,
             gap: solution.gap(),
@@ -822,11 +873,42 @@ fn problem_to_lp(problem: &Problem) -> String {
             }
         }
     }
-    out.push_str("Binary\n");
-    for name in &problem.col_names {
-        let _ = write!(out, " {name}");
+    // Bounds first, then integrality: every column needs its range stated, and only
+    // the integer ones get declared.
+    out.push_str("Bounds\n");
+    for (j, name) in problem.col_names.iter().enumerate() {
+        let lo = problem.col_lb[j];
+        let hi = problem.col_ub[j];
+        match (lo.is_finite(), hi.is_finite()) {
+            (true, true) => {
+                let _ = writeln!(out, " {lo} <= {name} <= {hi}");
+            }
+            (true, false) => {
+                let _ = writeln!(out, " {name} >= {lo}");
+            }
+            (false, true) => {
+                let _ = writeln!(out, " -inf <= {name} <= {hi}");
+            }
+            (false, false) => {
+                let _ = writeln!(out, " {name} free");
+            }
+        }
     }
-    out.push_str("\nEnd\n");
+    let integers: Vec<&String> = problem
+        .col_names
+        .iter()
+        .enumerate()
+        .filter(|&(j, _)| problem.is_integer(j))
+        .map(|(_, n)| n)
+        .collect();
+    if !integers.is_empty() {
+        out.push_str("General\n");
+        for name in integers {
+            let _ = write!(out, " {name}");
+        }
+        out.push('\n');
+    }
+    out.push_str("End\n");
     out
 }
 
@@ -864,6 +946,7 @@ fn read(py: Python<'_>, path: &str) -> PyResult<Py<Model>> {
         data.objective_constant = flip(problem.obj_offset);
         data.lower = problem.col_lb.clone();
         data.upper = problem.col_ub.clone();
+        data.var_types = problem.col_type.clone();
 
         let csr = problem.matrix.to_csr();
         for i in 0..problem.n_rows() {
