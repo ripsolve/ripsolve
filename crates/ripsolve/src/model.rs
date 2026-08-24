@@ -2,7 +2,7 @@
 //!
 //! Rows are stored in *range* form (`lb <= a'x <= ub`, with infinite bounds
 //! allowed) rather than as a sense plus a right-hand side. That is what HiGHS and
-//! Gurobi keep internally, and it pays off twice: `<=`, `>=`, `=` and true range
+//! other solvers keep internally, and it pays off twice: `<=`, `>=`, `=` and true range
 //! rows all become one case for the simplex, and presolve's bound tightening is
 //! just an update to `lb`/`ub` instead of a change of sense.
 //!

@@ -17,7 +17,7 @@ LU factorization, best-bound search, parallel tree search, and a `gurobipy`-shap
 Python API are all in place. Quadratic terms, SOS constraints, callbacks and lazy
 constraints are not.
 
-Correctness is checked against Gurobi as an oracle — relaxation values, integer
+Correctness is checked against a leading commercial solver as an oracle — relaxation values, integer
 optima, and 400 randomized mixed-integer models — but nothing links against it and
 the test suite runs without it.
 
@@ -26,10 +26,10 @@ the test suite runs without it.
 The predecessor to this project implemented Balas' additive algorithm — implicit
 enumeration with a feasibility-based bound. Measured on a dense 60-variable
 instance, that approach explored 10.3 billion nodes in 54.7s across 16 threads.
-Gurobi solved the same instance in 125 nodes and 0.15s.
+A leading commercial solver did the same instance in 125 nodes and 0.15s.
 
 The enumeration engine was not slow; at 188M nodes/sec it processed nodes roughly
-1000x faster than Gurobi does. It lost because it visited 82 million times more of
+1000x faster than the commercial solver does. It lost because it visited 82 million times more of
 them. No amount of SIMD or threading closes a gap of that shape — only a stronger
 bound does, and that means solving an LP relaxation at each node. That measurement
 is the reason this project exists and why the simplex is its centrepiece.
@@ -39,7 +39,7 @@ single thread** — against the enumeration solver's 49.7s across sixteen. On a 
 of dense random instances with 30 rows, enumeration on sixteen threads against the
 other two on one:
 
-| variables | enumeration (16t) | ripsolve (1t) | Gurobi (1t) |
+| variables | enumeration (16t) | ripsolve (1t) | commercial (1t) |
 |---:|---:|---:|---:|
 | 60 | 49.7s | **0.09s** | 0.33s |
 | 64 | >120s | **0.16s** | 0.17s |
@@ -47,11 +47,11 @@ other two on one:
 | 200 | >120s | 6.8s | 1.6s |
 | 500 | — | 1.7% gap at 300s | 294s |
 
-## Against Gurobi
+## Against a commercial solver
 
 Both solvers given the same thread count and the same 60-second limit, timing only
 the solve. Thirteen of the fourteen models are solved to proven optimality, matching
-Gurobi's objective exactly every time.
+the commercial solver's objective exactly every time.
 
 | | single-threaded | sixteen threads |
 |---|---|---|
@@ -59,19 +59,25 @@ Gurobi's objective exactly every time.
 | 2–4x | `v081c162n009`, `v256c256n100`, `v064c200`, `v128c1000n100`, `v064c1000n100` | `v048c128`, `v256c256n100` |
 | worst | `mkp_200` at 20x | `mkp_200` at 6x |
 
-`v081c162n009` is *faster* than Gurobi at sixteen threads — 0.4s against 1.0s.
+`v081c162n009` is *faster* than the commercial solver at sixteen threads — 0.4s against 1.0s.
 
 Two models are not solved by either. `v064c1000n020` yields no feasible point to
-anything, Gurobi included. `mkp_500` is solved by Gurobi in 294s single-threaded and
+anything, the commercial solver included. `mkp_500` it solves in 294s single-threaded and
 by `ripsolve` not at all; at the 60-second limit it sits at a 5% gap.
 
 `mkp_200` is the remaining outlier and worth naming rather than averaging away: 91k
-nodes against Gurobi's 18k, and a per-node cost that parallelism improves but does
+nodes against the commercial solver's 18k, and a per-node cost that parallelism improves but does
 not close.
 
 ### How these were measured
 
-One machine, 16 cores, `--release`. Gurobi is pinned to the same thread count as
+The commercial solver is deliberately unnamed. Its licence here is an academic one,
+and rather than read its terms as permission to publish benchmarks under its name,
+the comparison omits it. Nothing else is withheld: every number is real and
+reproducible by anyone holding a licence, and `bench/compare.py` names the solver it
+calls.
+
+One machine, 16 cores, `--release`. The commercial solver is pinned to the same thread count as
 `ripsolve`; left to itself it takes every core, which would compare deployments
 rather than algorithms. Only the solve is timed on both sides — gurobipy's
 `Runtime` excludes parsing, and so does `ripsolve`'s reported elapsed.
@@ -90,7 +96,7 @@ Presolve reduces in place — a fixed column becomes `lb == ub` and a redundant 
 has its bounds freed — so nothing is renumbered and there is no postsolve pass. It
 is worth a great deal on structured models (`v006c*` is solved outright;
 `bin_10var_5con` drops from 24 nodes to 1) and nothing at all on the dense random
-families above. That is not a shortfall in the implementation: Gurobi's presolve
+families above. That is not a shortfall in the implementation: the commercial solver's presolve
 also reduces those instances to exactly their original dimensions.
 
 Two cut families run at the root. Lifted knapsack covers are combinatorial and need
@@ -198,7 +204,7 @@ On the 1000-row models, in a fixed 100-second budget:
 | `v064c1000n020` simplex iterations | 10,486 | 59,926 |
 
 That is roughly 7.5x the simplex throughput, which narrows the per-iteration gap
-against Gurobi on these models from about 53x to about 9x. Smaller models gain
+against the commercial solver on these models from about 53x to about 9x. Smaller models gain
 between 1.2x and 2.4x in wall clock.
 
 Forrest-Tomlin updates would shorten the eta file further, and the `Basis` interface
@@ -240,7 +246,7 @@ finds solutions on five of the six models where diving finds none.
 The solutions are poor — 2791 against an optimum of 137 on `v064c064` — but an
 incumbent of any quality switches pruning on. `v064c200` drops from 9916 nodes and
 5.7s to 3388 nodes and 2.25s. `v064c1000n020` remains unsolved, with no feasible
-point found by anything, Gurobi included.
+point found by anything, the commercial solver included.
 
 In-tree attempts are scheduled adaptively rather than on a fixed cadence: the
 interval doubles after each attempt that finds nothing and snaps back to the base
@@ -306,7 +312,7 @@ answers to match.
 
 ## Testing against a reference solver
 
-Correctness is checked against Gurobi, used strictly as a **test oracle**: nothing
+Correctness is checked against a leading commercial solver, used strictly as a **test oracle**: nothing
 in `ripsolve` links against it, and `cargo test` does not require it.
 `bench/refresh_fixtures.py` records reference LP-relaxation and MIP-optimal values
 into `crates/ripsolve/tests/fixtures/reference.json`, and the tests read only that

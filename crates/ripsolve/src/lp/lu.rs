@@ -3,7 +3,7 @@
 //! The dense explicit inverse this replaces costs `O(m^2)` per solve and `O(m^3)`
 //! to rebuild. At `m = 1000` the rebuild alone is ~10^9 operations every 50 pivots,
 //! which measured out at 0.2 seconds per branch-and-bound node — 53x slower per
-//! simplex iteration than Gurobi on the same model.
+//! simplex iteration than a leading commercial solver on the same model.
 //!
 //! # Pivot choice
 //!

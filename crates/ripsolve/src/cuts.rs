@@ -3,7 +3,8 @@
 //!
 //! Presolve reduces the *model*; cuts strengthen the *relaxation*. On the dense
 //! random instances this solver is aimed at, presolve finds nothing at all — and
-//! neither does Gurobi's — so cuts are where the remaining bound gap lives.
+//! neither does a leading commercial solver's — so cuts are where the remaining
+//! bound gap lives.
 //!
 //! # Knapsack covers
 //!
