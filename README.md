@@ -322,4 +322,4 @@ cargo build --release && python3 bench/refresh_fixtures.py
 
 ## Licence
 
-MIT.
+MIT — see [LICENSE](LICENSE).
