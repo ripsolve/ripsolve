@@ -127,6 +127,10 @@ pub fn presolve(problem: &mut Problem, max_rounds: usize) -> Outcome {
             changed = true;
         }
 
+        if fix_singleton_columns(problem, &rows, &mut stats) {
+            changed = true;
+        }
+
         if !changed {
             break;
         }
@@ -292,6 +296,76 @@ fn floor_with_tolerance(v: f64) -> f64 {
 }
 
 /// A column appearing in no still-active row is decided entirely by its cost.
+/// Fix a column that appears in exactly one row, when the direction the objective
+/// wants can never violate that row.
+///
+/// A singleton column has only one reason to move: its single row. If moving it the
+/// way the objective prefers pushes the row's activity towards a side that has no
+/// bound, then no feasible point is lost by pinning it there, and none of the objective
+/// either. This is the standard dual fixing for column singletons, and it stays within
+/// what this presolve can do because it only narrows bounds, so nothing is renumbered
+/// and no postsolve is needed.
+///
+/// It matters more than its simplicity suggests. MIPLIB's neos-3048764-nadi is 8731
+/// singleton columns out of 12360, and HiGHS, which does this, solves it in 0.1s
+/// against a model a quarter the size.
+fn fix_singleton_columns(problem: &mut Problem, rows: &[Row], stats: &mut Stats) -> bool {
+    let n = problem.n_cols();
+    // Where each column appears, and how often. Only the columns seen exactly once
+    // matter, so the entry is overwritten freely until the count settles.
+    let mut appearances = vec![0usize; n];
+    let mut only = vec![(0usize, 0.0f64); n];
+    for (i, row) in rows.iter().enumerate() {
+        if is_free(problem.row_lb[i], problem.row_ub[i]) {
+            continue;
+        }
+        for &(j, a) in row {
+            if a != 0.0 {
+                appearances[j] += 1;
+                only[j] = (i, a);
+            }
+        }
+    }
+
+    let mut changed = false;
+    for j in 0..n {
+        if appearances[j] != 1 || problem.col_lb[j] == problem.col_ub[j] {
+            continue;
+        }
+        let (i, a) = only[j];
+        // Lowering the column moves the row's activity one way and raising it moves
+        // the other; each is safe exactly when the side it moves towards is unbounded.
+        let down_safe = (a > 0.0 && problem.row_lb[i] == f64::NEG_INFINITY)
+            || (a < 0.0 && problem.row_ub[i] == f64::INFINITY);
+        let up_safe = (a > 0.0 && problem.row_ub[i] == f64::INFINITY)
+            || (a < 0.0 && problem.row_lb[i] == f64::NEG_INFINITY);
+
+        // Minimization form, so a positive cost wants the column down. A zero cost is
+        // indifferent and takes whichever side is safe.
+        let cost = problem.obj[j];
+        let target = if cost > 0.0 && down_safe {
+            problem.col_lb[j]
+        } else if cost < 0.0 && up_safe {
+            problem.col_ub[j]
+        } else if cost == 0.0 && down_safe {
+            problem.col_lb[j]
+        } else if cost == 0.0 && up_safe {
+            problem.col_ub[j]
+        } else {
+            continue;
+        };
+        // An infinite target means the objective is unbounded along this column, which
+        // is the LP's finding to make and not presolve's.
+        if !target.is_finite() {
+            continue;
+        }
+        if fix_column(problem, j, target, stats) {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn fix_columns_absent_from_every_row(
     problem: &mut Problem,
     rows: &[Row],
@@ -575,6 +649,62 @@ mod tests {
     }
 
     #[test]
+    fn pins_a_singleton_column_the_objective_and_row_agree_on() {
+        // `x0` appears once, in a row with no lower bound, and costs something. Pushing
+        // it down can only make that row easier, so zero is both optimal and safe.
+        //
+        // The first row is deliberately not redundant (its maximum activity of 5
+        // exceeds the bound of 4) and does not pin `x0` by propagation either, since
+        // that only gives `x0 <= 1`. Without this reduction nothing fixes it, which is
+        // what makes the test able to fail.
+        let p = problem(
+            &[1.0, 1.0, 1.0],
+            &[
+                (&[3.0, 2.0, 0.0], RowSense::Le, 4.0),
+                (&[0.0, 1.0, 1.0], RowSense::Ge, 1.0),
+            ],
+        );
+        let stats = assert_presolve_is_sound(&p, "singleton fixing");
+        assert!(stats.fixed_columns >= 1);
+
+        let mut after = p.clone();
+        presolve(&mut after, 20);
+        assert_eq!(
+            (after.col_lb[0], after.col_ub[0]),
+            (0.0, 0.0),
+            "the singleton column should be pinned at its lower bound"
+        );
+        // `x2` is a singleton too, but in a row whose lower bound is exactly what it
+        // may be needed for, so it must survive.
+        assert!(
+            after.col_lb[2] < after.col_ub[2],
+            "a singleton its row may still need must not be pinned"
+        );
+    }
+
+    #[test]
+    fn leaves_a_singleton_column_its_row_still_needs() {
+        // Same shape, but the row now has a lower bound that only `x0` can satisfy, so
+        // pushing it down is not safe and the reduction must decline.
+        let p = problem(
+            &[1.0, 1.0],
+            &[
+                (&[1.0, 0.0], RowSense::Ge, 1.0),
+                (&[0.0, 1.0], RowSense::Le, 5.0),
+            ],
+        );
+        assert_presolve_is_sound(&p, "singleton kept");
+
+        let mut after = p.clone();
+        presolve(&mut after, 20);
+        assert_eq!(
+            (after.col_lb[0], after.col_ub[0]),
+            (1.0, 1.0),
+            "propagation should pin it at one, not at zero"
+        );
+    }
+
+    #[test]
     fn tightens_an_oversized_coefficient_on_a_ge_row() {
         // `5x0 + 2x1 + 2x2 + 2x3 >= 3`: x0 alone already satisfies the row, so 5 is
         // more than the row can use and reduces to 3. The binary solutions are
@@ -613,9 +743,15 @@ mod tests {
     fn tightens_an_oversized_coefficient_on_a_le_row() {
         // `5x0 + 2x1 + 2x2 + 2x3 <= 8`: the row can only ever be violated by 3 above
         // its bound, so x0's coefficient reduces to 3 and the bound follows to 6.
+        // The second row is what keeps the columns out of reach of singleton fixing.
+        // Without it every column appears once, the objective prefers zero, and the
+        // model is solved outright before tightening can be observed.
         let p = problem(
             &[1.0, 1.0, 1.0, 1.0],
-            &[(&[5.0, 2.0, 2.0, 2.0], RowSense::Le, 8.0)],
+            &[
+                (&[5.0, 2.0, 2.0, 2.0], RowSense::Le, 8.0),
+                (&[1.0, 1.0, 1.0, 1.0], RowSense::Ge, 1.0),
+            ],
         );
         let stats = assert_presolve_is_sound(&p, "le tightening");
         assert_eq!(stats.tightened_coefficients, 1);
