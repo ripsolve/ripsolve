@@ -45,6 +45,24 @@ pub struct Singular {
 }
 
 /// Relative threshold a pivot must meet against the largest entry in its column.
+///
+/// Relative to the column maximum, which makes the test exactly invariant to column
+/// scaling — both sides scale together. That is worth knowing before reaching for
+/// equilibration: scaling the basis before factorizing was implemented and
+/// measured, and changed nothing. It reduced the coefficient range of a badly
+/// scaled basis from 2e15 to 8e1 and left the residual where it was (1.4e-7 against
+/// 3.3e-7, i.e. marginally worse), because the pivoting was never scale-naive.
+///
+/// Two things it does not address, either:
+///
+/// - A basis of independently random wide-range entries cannot be equilibrated at
+///   all. Diagonal scaling has 2m degrees of freedom against m^2 entries, so the
+///   residuals measured in `scale_tests` are ill-conditioning rather than bad
+///   scaling, and no scaling step will fix them.
+/// - Scaling the whole *model* rather than the basis is a different thing and
+///   remains untried. It is what production solvers do, and the benefit is that
+///   feasibility and optimality tolerances then mean the same thing in every row —
+///   which this, operating inside the factorization, never touches.
 const PIVOT_THRESHOLD: f64 = 0.01;
 /// Columns examined per pivot search before settling for the best seen.
 const MAX_COLUMN_SEARCH: usize = 4;
