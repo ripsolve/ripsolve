@@ -2,14 +2,14 @@
 //!
 //! The dense explicit inverse this replaces costs `O(m^2)` per solve and `O(m^3)`
 //! to rebuild. At `m = 1000` the rebuild alone is ~10^9 operations every 50 pivots,
-//! which measured out at 0.2 seconds per branch-and-bound node — 53x slower per
+//! which measured out at 0.2 seconds per branch-and-bound node, 53x slower per
 //! simplex iteration than a leading commercial solver on the same model.
 //!
 //! # Pivot choice
 //!
 //! Pivots are chosen by the Markowitz criterion: among the remaining entries,
 //! minimize `(r_i - 1) * (c_j - 1)`, the number of positions the elimination could
-//! turn nonzero. That single rule subsumes the special cases — a column singleton
+//! turn nonzero. That single rule subsumes the special cases, a column singleton
 //! scores zero and is taken immediately, so an LP basis's large triangular part
 //! (every logical variable contributes one) is peeled off without any separate
 //! triangularization pass.
@@ -48,7 +48,7 @@ pub struct Singular {
 /// Relative threshold a pivot must meet against the largest entry in its column.
 ///
 /// Relative to the column maximum, which makes the test exactly invariant to column
-/// scaling — both sides scale together. That is worth knowing before reaching for
+/// scaling, both sides scale together. That is worth knowing before reaching for
 /// equilibration: scaling the basis before factorizing was implemented and
 /// measured, and changed nothing. It reduced the coefficient range of a badly
 /// scaled basis from 2e15 to 8e1 and left the residual where it was (1.4e-7 against
@@ -62,7 +62,7 @@ pub struct Singular {
 ///   scaling, and no scaling step will fix them.
 /// - Scaling the whole *model* rather than the basis is a different thing and
 ///   remains untried. It is what production solvers do, and the benefit is that
-///   feasibility and optimality tolerances then mean the same thing in every row —
+///   feasibility and optimality tolerances then mean the same thing in every row,
 ///   which this, operating inside the factorization, never touches.
 const PIVOT_THRESHOLD: f64 = 0.01;
 /// Columns examined per pivot search before settling for the best seen.
@@ -628,7 +628,7 @@ mod scale_tests {
     }
 
     /// The largest relative residual of `B (B^-1 a) = a` over random right-hand
-    /// sides — how much accuracy the factorization actually delivers.
+    /// sides, how much accuracy the factorization actually delivers.
     ///
     /// Checking that a solve *runs* says nothing. A factorization built on bad
     /// pivots still produces numbers; they are simply wrong enough, far enough
@@ -712,14 +712,14 @@ mod scale_tests {
             let residual = worst_residual(m, &columns, &lu);
             assert!(
                 residual < 1e-7,
-                "m = {m}: residual {residual:.3e} — the factorization is losing accuracy"
+                "m = {m}: residual {residual:.3e}, the factorization is losing accuracy"
             );
         }
     }
 
     /// What the factorization does as the data gets worse conditioned.
     ///
-    /// Not an assertion of quality — a record of a known limitation, measured. The
+    /// Not an assertion of quality, a record of a known limitation, measured. The
     /// factorization has no scaling step, so accuracy tracks the spread of the
     /// coefficients directly:
     ///
@@ -773,7 +773,7 @@ mod scale_tests {
             let lu = Lu::factor(m, &columns, 1e-12).unwrap();
             assert!(
                 lu.nnz() < 6 * original,
-                "m = {m}: {} nonzeros from {original} — fill has blown up",
+                "m = {m}: {} nonzeros from {original}, fill has blown up",
                 lu.nnz()
             );
         }

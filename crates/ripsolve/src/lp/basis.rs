@@ -1,7 +1,7 @@
 //! The basis inverse, and the solves the simplex needs against it.
 //!
 //! Representation: a sparse LU factorization (see [`crate::lp::lu`]) plus a
-//! *product form* update — an "eta file" of rank-one corrections, one per pivot,
+//! *product form* update, an "eta file" of rank-one corrections, one per pivot,
 //! replayed on top of the factors. Periodically the etas are discarded and the
 //! basis refactorized, which both bounds the replay cost and stops error
 //! accumulating.
@@ -17,8 +17,8 @@
 //! first and the etas in order; BTRAN applies the transposed etas in reverse and
 //! the factors last.
 //!
-//! The interface — [`Basis::ftran`], [`Basis::btran`], [`Basis::update`],
-//! [`Basis::refactorize`] — is unchanged from the dense explicit inverse this
+//! The interface ([`Basis::ftran`], [`Basis::btran`], [`Basis::update`],
+//! [`Basis::refactorize`]) is unchanged from the dense explicit inverse this
 //! replaced, so Forrest-Tomlin can supersede product form later without the simplex
 //! driver noticing, exactly as this change did.
 
@@ -72,7 +72,7 @@ pub struct Basis {
     etas: Vec<Eta>,
     /// Rows appended since the last refactorization.
     ///
-    /// The extension wraps the whole base operator -- the LU *and* its etas -- because
+    /// The extension wraps the whole base operator, the LU *and* its etas, because
     /// the correction needs `B^-1` applied, not `LU^-1`. Pivots taken after it
     /// therefore cannot join `etas`; they go in `post`.
     ext: Vec<Extension>,

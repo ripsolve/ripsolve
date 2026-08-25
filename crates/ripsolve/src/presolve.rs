@@ -8,7 +8,7 @@
 //!
 //! That trade is deliberate. Physically removing rows and columns would make the
 //! LPs smaller, but it requires an index map and a postsolve pass to rebuild the
-//! original solution — historically the most bug-prone part of a presolver. The
+//! original solution, historically the most bug-prone part of a presolver. The
 //! simplex already skips fixed columns during pricing and a freed row's logical is
 //! basic and never binds, so most of the benefit arrives anyway. Physical removal
 //! is a later optimization, worth doing when instance sizes make the wasted rows
@@ -431,8 +431,8 @@ mod tests {
     /// Every binary assignment the model admits, by exhaustive enumeration.
     ///
     /// Only usable for small `n`, but it is ground truth: presolve is allowed to
-    /// change coefficients and bounds however it likes, provided this set — and the
-    /// objective value of each member — comes out identical.
+    /// change coefficients and bounds however it likes, provided this set, and the
+    /// objective value of each member, comes out identical.
     fn feasible_set(p: &Problem) -> Vec<(u32, f64)> {
         let n = p.n_cols();
         assert!(n <= 20, "exhaustive enumeration needs a small model");
@@ -461,7 +461,7 @@ mod tests {
 
     /// Presolve's actual contract, checked exhaustively.
     ///
-    /// It is *not* that the feasible set is preserved — fixing a column that appears
+    /// It is *not* that the feasible set is preserved, fixing a column that appears
     /// in no constraint to its cheaper value legitimately discards feasible points.
     /// The contract is two-sided:
     ///
@@ -514,7 +514,7 @@ mod tests {
     /// Coefficient tightening on its own must preserve the feasible set *exactly*.
     ///
     /// Unlike the pipeline as a whole, this reduction is only ever allowed to change
-    /// the relaxation, never the integer solutions — so it gets the strict check the
+    /// the relaxation, never the integer solutions, so it gets the strict check the
     /// full presolve cannot be held to.
     fn assert_tightening_preserves_feasible_set(before: &Problem, label: &str) {
         let expected = feasible_set(before);
@@ -581,7 +581,7 @@ mod tests {
         // unchanged; the relaxation is not, since x0 = 0.6 was feasible and is not now.
         //
         // The spare columns are load-bearing: with fewer of them, bound propagation
-        // fixes x0 = 1 outright before tightening gets a chance -- a stronger
+        // fixes x0 = 1 outright before tightening gets a chance, a stronger
         // reduction, but not the one under test.
         let p = problem(
             &[1.0, 1.0, 1.0, 1.0],

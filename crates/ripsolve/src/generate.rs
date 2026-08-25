@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-/// SplitMix64 — the reference finalizer, used as a standalone generator.
+/// SplitMix64: the reference finalizer, used as a standalone generator.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -52,7 +52,7 @@ pub enum Kind {
     /// at `a_i'x*` for one random witness point `x*` shared by every row.
     ///
     /// Both halves of that matter. Anchoring at a shared witness makes the instance
-    /// feasible by construction -- independently drawn right-hand sides large enough
+    /// feasible by construction, independently drawn right-hand sides large enough
     /// to exclude the origin almost always over-constrain each other into
     /// infeasibility. And each row is sign-flipped as needed to keep its right-hand
     /// side positive, which excludes the origin: with a slack `b` the origin is
@@ -184,7 +184,7 @@ impl Spec {
 /// specific instance; this digest is what lets a test notice that the generator has
 /// since changed and the recorded values no longer describe the instance being
 /// solved. FNV-1a is chosen only because it is trivial to reimplement identically
-/// in the fixture-refresh script -- it is a change detector, not a security hash.
+/// in the fixture-refresh script: it is a change detector, not a security hash.
 pub fn lp_digest(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {

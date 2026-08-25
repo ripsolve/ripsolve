@@ -57,12 +57,12 @@ pub struct Options {
     /// Root cuts turn out to be a shallow-depth phenomenon: measured over six models
     /// they bind at 33-50% of rows at depth one and 0-4% by depth ten, while the tree
     /// carries them through every node. Cuts derived at a node use that node's bounds,
-    /// so they bind where they were made -- but they are valid only for that subtree,
+    /// so they bind where they were made, but they are valid only for that subtree,
     /// which is why they never enter the shared model.
     ///
     /// Ten is from a sweep of 0, 1, 3, 10, 50 and 200 over eight models. It is the only
     /// setting that beats not cutting at all, 22.98s against 24.75s, while still taking
-    /// real chunks out of the tree -- `v064c1000n100` 1106 nodes to 786, `mkp_200` 72150
+    /// real chunks out of the tree, `v064c1000n100` 1106 nodes to 786, `mkp_200` 72150
     /// to 63896. Separating at *every* node shrinks trees far harder (`v256c256n100`
     /// 288 nodes to 86, `v064c200` 2690 to 1136) but costs 36.50s: worth reaching for
     /// on a model where nodes are the bottleneck, not as a default.
@@ -83,7 +83,7 @@ pub struct Options {
     ///     v048c048     0.01s          0.04s
     /// ```
     ///
-    /// The cuts are not useless — they raise the root bound substantially, taking
+    /// The cuts are not useless, they raise the root bound substantially, taking
     /// v064c200 from 72.1 to 95.4 against an optimum of 225. They simply do not pay
     /// for themselves here: separation is expensive, the cuts come out dense enough
     /// to slow every subsequent LP, and best-bound node selection had already
@@ -127,7 +127,7 @@ pub struct Options {
     /// Total strong-branching probes allowed across the whole search.
     ///
     /// Defaults to zero. Under best-bound selection strong branching does reduce
-    /// node counts — by 10% to 32% on seven of eight instances — but two extra LPs
+    /// node counts (by 10% to 32% on seven of eight instances) but two extra LPs
     /// per candidate cost more time than those nodes save. Worth raising on large
     /// models, where it pays: v128c1000n100 goes from 13.3s to 9.5s at a budget of
     /// 100. See `branch.rs` for why it was catastrophic under depth-first search
@@ -225,9 +225,9 @@ impl PartialOrd for Key {
 
 /// The open node set: a depth-first plunge stack plus a best-bound pool.
 ///
-/// Neither rule alone is good enough. Pure depth-first finds incumbents quickly —
+/// Neither rule alone is good enough. Pure depth-first finds incumbents quickly,
 /// a child differs from its parent by one bound, so its LP re-solves in a few
-/// pivots — but it will happily spend an entire run inside one subtree while the
+/// pivots, but it will happily spend an entire run inside one subtree while the
 /// global bound never moves. Pure best-bound moves the bound as fast as possible
 /// but wanders across the tree, warm-starting badly and finding incumbents late.
 ///
@@ -327,8 +327,8 @@ struct NodeOutcome {
 /// branching history built up while doing so.
 ///
 /// Node processing lives here rather than inline in the search loop so that the
-/// serial and parallel drivers run *the same* code. The logic is subtle — cutoff
-/// handling, pseudocost feedback, forced fixings — and two copies of it would
+/// serial and parallel drivers run *the same* code. The logic is subtle, cutoff
+/// handling, pseudocost feedback, forced fixings, and two copies of it would
 /// diverge.
 struct Worker<'a> {
     problem: &'a Problem,
@@ -368,7 +368,7 @@ impl<'a> Worker<'a> {
     /// below this node and so is safe to prune and order children with.
     ///
     /// The node's own basis and solution are left untouched, so branching still reads
-    /// the same relaxation it would have without this. That is deliberate -- the
+    /// the same relaxation it would have without this. That is deliberate, the
     /// augmented vertex is arguably the better branching point, but mixing it with a
     /// basis taken from the un-augmented model is a correctness trap not worth
     /// setting for a first cut at this.
@@ -598,7 +598,7 @@ struct Shared {
     /// The incumbent, guarded for writing.
     best: Mutex<(f64, Option<Vec<f64>>)>,
     /// The incumbent objective again, as raw bits, for lock-free reads on the hot
-    /// path. Always written under `best`, so it can only lag, never lead — and a
+    /// path. Always written under `best`, so it can only lag, never lead, and a
     /// stale-but-worse cutoff prunes less, never wrongly.
     best_bits: AtomicU64,
     nodes: AtomicUsize,
@@ -616,7 +616,7 @@ struct Shared {
 /// Swept over 0 (never drop) through 3 with the root budget at three rounds. Two is
 /// the best of them, though not by much: it takes `v128c1000n100` from 740 nodes to
 /// 610 and `v064c200` from 2932 to 2716, and is neutral on everything else measured.
-/// Dropping at the first slack resolve is too eager -- a cut can go slack for one
+/// Dropping at the first slack resolve is too eager, a cut can go slack for one
 /// round and bind again once the next round's cuts move the vertex.
 const CUT_MAX_AGE: u32 = 2;
 
@@ -801,7 +801,7 @@ struct Node {
     /// Every bound change on the path from the root, as `(column, lower, upper)`.
     ///
     /// Bound changes rather than fixings, because branching on a general integer
-    /// splits a range — `x <= floor(v)` against `x >= ceil(v)` — instead of pinning
+    /// splits a range (`x <= floor(v)` against `x >= ceil(v)`) instead of pinning
     /// a value. On a binary column that split *is* a fixing, so the binary case
     /// needs no separate handling.
     ///
@@ -818,12 +818,12 @@ struct Node {
     origin: Option<(usize, bool, f64, f64)>,
 }
 
-/// Solve a binary integer program to proven optimality.
+/// Solve a mixed-integer program to proven optimality.
 pub fn solve(problem: &Problem, options: Options) -> Solution {
     let started = Instant::now();
 
     // Presolve reduces in place and introduces no renumbering, so the reduced
-    // model's solution vector is directly the original's -- there is no postsolve.
+    // model's solution vector is directly the original's, there is no postsolve.
     // It is sound (it never admits a point the original rejects) and preserves the
     // optimum, so searching the reduced model answers the original question.
     let mut reduced;

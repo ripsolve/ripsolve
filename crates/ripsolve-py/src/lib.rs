@@ -1,4 +1,4 @@
-//! A Python interface shaped like `gurobipy`, for binary integer programs.
+//! A Python interface shaped like `gurobipy`, for mixed-integer programs.
 //!
 //! The goal is that a `gurobipy` script that only uses binary variables runs
 //! unchanged after swapping the import. So the names, the attribute spellings, and
@@ -145,7 +145,7 @@ impl Grb {
 /// A linear expression: a weighted sum of variables plus a constant.
 ///
 /// Terms are kept in a `BTreeMap` keyed by column so that repeated mentions of a
-/// variable accumulate — `x + x` is `2 x`, as in Gurobi — and so the resulting row
+/// variable accumulate (`x + x` is `2 x`, as in Gurobi) and so the resulting row
 /// is deterministic regardless of how the expression was assembled.
 #[pyclass(name = "LinExpr", module = "ripsolve", from_py_object)]
 #[derive(Clone, Default)]
@@ -520,7 +520,7 @@ impl Model {
     /// script calling `addVar()` would silently get a different model.
     ///
     /// Binary is an integer pinned to `[0, 1]`, so the default bounds depend on the
-    /// type -- as in Gurobi, where an unbounded integer is `[0, inf)`.
+    /// type, as in Gurobi, where an unbounded integer is `[0, inf)`.
     #[pyo3(signature = (obj = 0.0, vtype = 'C', name = "", lb = None, ub = None))]
     fn addVar(
         &self,

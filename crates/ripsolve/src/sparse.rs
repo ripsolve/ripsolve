@@ -26,7 +26,7 @@ impl SparseMatrix {
     ///
     /// Duplicate `(row, col)` pairs are summed, matching the convention of LP and
     /// MPS files where a variable may legally appear more than once in a row.
-    /// Entries that are exactly zero — including ones that cancel — are dropped.
+    /// Entries that are exactly zero, including ones that cancel, are dropped.
     pub fn from_triplets(
         n_rows: usize,
         n_cols: usize,

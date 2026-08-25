@@ -1,7 +1,7 @@
 //! Reading problems from LP and MPS files.
 //!
 //! Parsing is delegated to `lp_parser_rs`; this module's job is the translation
-//! into [`Problem`] — range-form rows and a minimization-form objective.
+//! into [`Problem`], range-form rows and a minimization-form objective.
 //!
 //! Column and row order follow the order the names appear in the source file.
 //! `lp_parser_rs` keys its collections with `IndexMap`, so that order is stable,
@@ -82,7 +82,7 @@ fn declared_integer(text: &str) -> HashSet<String> {
 /// column directly with `BV` (binary), `LI` or `UI` (integer bounds).
 ///
 /// Losing this is not a small matter. A model whose integrality vanishes solves as
-/// a pure LP and reports the relaxation as a proven optimum — silently, and with a
+/// a pure LP and reports the relaxation as a proven optimum, silently, and with a
 /// better objective than the true one, which is exactly what makes it hard to
 /// notice. MIPLIB's `flugpl` came back at 1167185.73 against a true optimum of
 /// 1201500 before this existed.
@@ -168,12 +168,12 @@ impl Format {
 }
 
 impl Problem {
-    /// Read a binary integer program from a file, choosing the parser by extension.
+    /// Read a mixed-integer program from a file, choosing the parser by extension.
     pub fn from_file(path: &Path) -> Result<Problem, ReadError> {
         Problem::from_file_as(path, Format::from_path(path)?)
     }
 
-    /// Read a binary integer program from a file in an explicitly given format.
+    /// Read a mixed-integer program from a file in an explicitly given format.
     pub fn from_file_as(path: &Path, format: Format) -> Result<Problem, ReadError> {
         let content = parse_file(path).map_err(|e| ReadError::Parse(e.to_string()))?;
         let lp = match format {
@@ -262,7 +262,7 @@ impl Problem {
         }
 
         // Position within the IndexMap is the column index, so a name lookup is just
-        // `get_index_of` -- no side table to build or keep consistent.
+        // `get_index_of`, no side table to build or keep consistent.
         let col_of = |id| {
             lp.variables
                 .get_index_of(&id)
@@ -413,7 +413,7 @@ End
 
     #[test]
     fn reads_a_general_integer_variable() {
-        // No bounds section, so a General integer is [0, inf) -- not binary.
+        // No bounds section, so a General integer is [0, inf), not binary.
         let p = parse("Minimize\n obj: x1\nSubject To\n c1: x1 >= 1\nGeneral\n x1\nEnd\n").unwrap();
         assert!(p.is_integer(0));
         assert!(!p.is_binary(0), "an unbounded integer is not binary");

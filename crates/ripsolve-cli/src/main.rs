@@ -13,7 +13,7 @@ use ripsolve::search::{self, Options, Status as SearchStatus};
 #[command(
     name = "ripsolve",
     version,
-    about = "A branch-and-cut solver for binary integer programs"
+    about = "A branch-and-cut solver for mixed-integer programs"
 )]
 struct Cli {
     #[command(subcommand)]

@@ -14,7 +14,7 @@
 //! reduce to a bound pair and the simplex never branches on row sense. Structural
 //! bounds start at `[0, 1]`; branching later narrows them to `[0,0]` or `[1,1]`.
 //!
-//! The starting basis is all-logical, whose matrix is `-I` — trivially invertible,
+//! The starting basis is all-logical, whose matrix is `-I`, trivially invertible,
 //! and generally primal infeasible, which is what phase 1 is for.
 //!
 //! # Phase 1
@@ -22,7 +22,7 @@
 //! Phase 1 minimizes the sum of bound violations of the basic variables. Its
 //! gradient is `-1` for a basic below its lower bound and `+1` for one above its
 //! upper bound, and zero elsewhere; nonbasic variables sit on a bound and so never
-//! contribute. The ratio test stops at the first breakpoint — the first basic
+//! contribute. The ratio test stops at the first breakpoint, the first basic
 //! variable to reach a bound, whether it is becoming feasible or losing
 //! feasibility. That is the textbook short-step rule: monotone and easy to verify,
 //! but it takes more iterations than the long-step piecewise test a mature solver
@@ -42,7 +42,7 @@ const CLOCK_INTERVAL: usize = 256;
 ///
 /// Swept over 1, 4, 8, 32, 64, 128 and 256: solve time falls all the way up, but so
 /// does memory, and each worker in a parallel search holds its own cache. 64 keeps
-/// most of the gain — v064c1000n100 11.2s to 9.2s, v128c1000n100 5.1s to 4.1s — at
+/// most of the gain (v064c1000n100 11.2s to 9.2s, v128c1000n100 5.1s to 4.1s) at
 /// 50MB on one thread and 200MB across sixteen. Larger is faster if memory is free.
 const FACTOR_CACHE: usize = 64;
 
@@ -107,7 +107,7 @@ impl BasisState {
     /// Extend a basis saved before `k` rows were appended so it applies after.
     ///
     /// Each new row's logical starts basic in that row. A cut is violated by the
-    /// point the basis describes -- that is what makes it a cut -- so the new basic
+    /// point the basis describes (that is what makes it a cut) so the new basic
     /// variable starts outside its bounds and the basis is primal infeasible but
     /// still dual feasible, which is exactly the dual simplex's entry condition.
     pub fn extend_for_rows(&mut self, n_structural: usize, old_rows: usize, k: usize) {
@@ -188,7 +188,7 @@ pub struct Lp {
     /// Branch and bound re-solves the same basis constantly: a child differs from
     /// its parent only in a column's *bounds*, which do not enter the basis matrix
     /// at all, so the parent's factors are valid for the child verbatim. Without
-    /// this, every warm start refactorized from scratch — measured at 9.1ms of a
+    /// this, every warm start refactorized from scratch, measured at 9.1ms of a
     /// 10.9ms node on a 1000-row model, against 1.8ms of actual pivoting.
     ///
     /// Several entries rather than one, because best-bound node selection does not
@@ -255,8 +255,8 @@ impl Lp {
     ///
     /// Rows are given as `(coefficients, lb, ub)` over the structural columns, in the
     /// same range form the model already uses. The new logicals take the highest
-    /// indices, which is what lets every existing column index -- and so every saved
-    /// basis -- keep its meaning across the growth.
+    /// indices, which is what lets every existing column index, and so every saved
+    /// basis, keep its meaning across the growth.
     ///
     /// This is how a cut reaches a node's LP without rebuilding it. The alternative,
     /// constructing a fresh `Lp` from an augmented `Problem`, costs a cold
@@ -298,7 +298,7 @@ impl Lp {
     }
 
     /// Give the solver a wall-clock budget, after which a solve gives up and
-    /// reports [`LpStatus::IterationLimit`] — the node is unresolved either way,
+    /// reports [`LpStatus::IterationLimit`], the node is unresolved either way,
     /// and the search treats both the same.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
@@ -408,7 +408,7 @@ impl Lp {
     /// # Derivation
     ///
     /// Each tableau row reads `z_B(i) + sum_j a_j w_j = beta`, where `w_j >= 0` is
-    /// the nonbasic's distance from the bound it sits on — `z_j - l_j` at a lower
+    /// the nonbasic's distance from the bound it sits on, `z_j - l_j` at a lower
     /// bound, `u_j - z_j` at an upper one. That shift is what lets a
     /// bounded-variable simplex use the textbook formula, which assumes nonbasics at
     /// zero, and it is also where the sign of `a_j` flips for an at-upper column.
@@ -435,7 +435,7 @@ impl Lp {
     /// with instead of building a new one.
     ///
     /// The grown basis is block triangular against the one already factorized, so the
-    /// reuse is exact rather than approximate -- see [`Basis::extend`]. Without it,
+    /// reuse is exact rather than approximate, see [`Basis::extend`]. Without it,
     /// every call pays a cold factorization at the grown dimension, which is what put
     /// node-local cutting out of reach at any useful frequency.
     ///
@@ -740,7 +740,7 @@ impl<'a> Solver<'a> {
     /// Choose an entering variable, returning it with the direction to move.
     ///
     /// Dantzig pricing (steepest reduced cost) normally, switching to Bland's rule
-    /// — lowest index that improves — once the solve has stalled. Dantzig is the
+    ///, lowest index that improves, once the solve has stalled. Dantzig is the
     /// faster rule but can cycle on degenerate vertices; Bland's cannot, so falling
     /// back to it guarantees termination at the cost of some speed.
     fn price(&mut self, phase_one: bool, bland: bool) -> Option<(usize, f64)> {
@@ -818,7 +818,7 @@ impl<'a> Solver<'a> {
             // The bound it lands on is carried along with the target rather than
             // inferred from the direction of travel: in phase 1 an infeasible
             // variable travels *towards* the bound it violates, so a rising variable
-            // can land on its lower bound -- the opposite of the phase-2 case.
+            // can land on its lower bound, the opposite of the phase-2 case.
             let target = if phase_one {
                 if v < lo - tol {
                     // Infeasible below: rising reaches `lo`; falling only worsens it,
@@ -1005,7 +1005,7 @@ impl<'a> Solver<'a> {
     ///
     /// Each iteration takes the most primal-infeasible basic variable out of the
     /// basis at the bound it violates, and chooses the entering column by the dual
-    /// ratio test — the smallest `|d_j / alpha_rj|` among columns that can move in
+    /// ratio test, the smallest `|d_j / alpha_rj|` among columns that can move in
     /// the required direction. No such column means no assignment can repair the
     /// violation, which is exactly primal infeasibility.
     ///
@@ -1023,7 +1023,7 @@ impl<'a> Solver<'a> {
         // Degenerate steps in a row before switching to Bland's rule. The primal
         // method has had this since it first cycled; the dual method had nothing,
         // and since every warm start enters through the dual method, that is nearly
-        // every node in the search. MIPLIB's pk1 -- 86 columns -- burned 100,000
+        // every node in the search. MIPLIB's pk1, 86 columns, burned 100,000
         // iterations across four nodes before the caller gave up.
         const STALL_LIMIT: usize = 100;
         let mut stalled = 0usize;
@@ -1178,7 +1178,7 @@ impl<'a> Solver<'a> {
         //
         // Relative, not absolute. An absolute cap was tried and silently rejected
         // *every* GMI cut on the models this solver targets, which run about 99.5%
-        // dense -- a dense model's cuts are supposed to be dense, and the bound they
+        // dense, a dense model's cuts are supposed to be dense, and the bound they
         // were worth went with them. The comparison that matters is against the
         // model's own rows.
         const DENSITY_FACTOR: usize = 3;
@@ -1376,7 +1376,7 @@ impl<'a> Solver<'a> {
 
         // A warm start inherits dual feasibility from its parent, so the dual method
         // repairs the one bound the branch just changed in a few pivots. When that
-        // does not hold -- a cold start, or a basis from an unrelated problem -- fall
+        // does not hold (a cold start, or a basis from an unrelated problem) fall
         // through to the primal method, which needs no assumptions.
         let entry = if self.entry_hint == Entry::Dual && self.is_dual_feasible() {
             Entry::Dual
@@ -1832,7 +1832,7 @@ mod tests {
 
     #[test]
     fn warm_start_costs_fewer_iterations_than_a_cold_solve() {
-        // The whole point of warm starting. Not a tight bound -- just that inheriting
+        // The whole point of warm starting. Not a tight bound, just that inheriting
         // the parent basis avoids repeating the work.
         let rows: Vec<(&[f64], RowSense, f64)> = vec![
             (&[2.0, 3.0, 1.0, 4.0, 1.0, 2.0][..], RowSense::Ge, 6.0),

@@ -1,4 +1,4 @@
-//! The problem model: a binary integer program.
+//! The problem model: a mixed-integer program.
 //!
 //! Rows are stored in *range* form (`lb <= a'x <= ub`, with infinite bounds
 //! allowed) rather than as a sense plus a right-hand side. That is what HiGHS and
@@ -6,7 +6,7 @@
 //! rows all become one case for the simplex, and presolve's bound tightening is
 //! just an update to `lb`/`ub` instead of a change of sense.
 //!
-//! Columns carry a type — continuous or integer — and their own bounds. A binary
+//! Columns carry a type (continuous or integer) and their own bounds. A binary
 //! variable is simply an integer one bounded to `[0, 1]`, which is why the solver
 //! has no separate notion of it: the branching rule `x <= floor(v)` / `x >= ceil(v)`
 //! degenerates to fixing at 0 or 1 on its own.
@@ -34,7 +34,7 @@ pub enum Sense {
     Maximize,
 }
 
-/// A binary integer program.
+/// A mixed-integer program.
 ///
 /// The solver works internally in minimization form. [`Problem::objective_value`]
 /// converts an internal objective back to the user's original sense and offset, so
@@ -109,7 +109,7 @@ impl Problem {
 
     /// Is this column integral and bounded to `[0, 1]`?
     ///
-    /// Several reductions — cover cuts, coefficient tightening — are stated for
+    /// Several reductions (cover cuts, coefficient tightening) are stated for
     /// binary columns specifically, and check this rather than assuming it.
     pub fn is_binary(&self, j: usize) -> bool {
         self.is_integer(j) && self.col_lb[j] >= 0.0 && self.col_ub[j] <= 1.0

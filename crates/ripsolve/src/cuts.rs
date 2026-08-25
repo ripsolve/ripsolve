@@ -2,8 +2,8 @@
 //! the current fractional relaxation.
 //!
 //! Presolve reduces the *model*; cuts strengthen the *relaxation*. On the dense
-//! random instances this solver is aimed at, presolve finds nothing at all — and
-//! neither does a leading commercial solver's — so cuts are where the remaining
+//! random instances this solver is aimed at, presolve finds nothing at all, and
+//! neither does a leading commercial solver's, so cuts are where the remaining
 //! bound gap lives.
 //!
 //! # Knapsack covers
@@ -90,7 +90,7 @@ impl Cut {
         }
     }
 
-    /// Whether the row is active at `x` -- satisfied, but with no slack to spare.
+    /// Whether the row is active at `x`: satisfied, but with no slack to spare.
     pub fn is_tight(&self, x: &[f64], tolerance: f64) -> bool {
         self.violation(x) >= -tolerance
     }
@@ -134,9 +134,9 @@ const MIN_ORTHOGONALITY: f64 = 0.1;
 
 /// Choose which of the separated candidates are worth adding to the model.
 ///
-/// Separation is generous by design -- it is cheaper to generate a cut than to decide
-/// it was not needed -- so the choice of what to *keep* is where cutting is won or
-/// lost. Candidates are ranked by efficacy and taken greedily, skipping any that is
+/// Separation is generous by design, because it is cheaper to generate a cut than to
+/// decide it was not needed. The choice of what to *keep* is therefore where cutting
+/// is won or lost. Candidates are ranked by efficacy and taken greedily, skipping any that is
 /// nearly parallel to one already chosen.
 pub fn select(candidates: Vec<Cut>, x: &[f64], limit: usize) -> Vec<Cut> {
     let mut ranked: Vec<(f64, Cut)> = candidates
@@ -248,7 +248,7 @@ fn y_value(knapsack: &Knapsack, i: usize, x: &[f64]) -> f64 {
 
 /// Find a violated minimal cover, optionally forced to contain `seed`.
 ///
-/// The separation problem — find the most violated cover — is itself a knapsack
+/// The separation problem (find the most violated cover) is itself a knapsack
 /// problem, so this uses the standard greedy: take terms in increasing order of
 /// `(1 - y_j) / w_j`, since a term near 1 adds most violation per unit of capacity
 /// consumed, and stop once the weights overrun.
@@ -323,7 +323,7 @@ const MAX_LIFT_CAPACITY: usize = 20_000;
 ///
 /// The DP is `O(terms * capacity)` *per column lifted*, and both grow with the
 /// model, so on a dense 256-column knapsack the unbounded version reached billions
-/// of operations per cover — separation cost 1.3 seconds a round to save a handful
+/// of operations per cover, separation cost 1.3 seconds a round to save a handful
 /// of nodes. Lifting is an improvement to a cut that is already valid, so running
 /// out of budget just means a weaker cut, never a wrong one.
 const MAX_LIFT_WORK: usize = 400_000;
@@ -345,7 +345,7 @@ const MAX_SEEDS_PER_ROW: usize = 4;
 /// ```
 ///
 /// taken over the columns already in the inequality. That inner problem is a 0/1
-/// knapsack, solved here exactly by dynamic programming — which needs integer
+/// knapsack, solved here exactly by dynamic programming, which needs integer
 /// weights, so lifting is skipped when a row has fractional coefficients. Lifting
 /// *sequentially* (each column against the inequality built so far, not against the
 /// original cover) is what keeps the result valid.

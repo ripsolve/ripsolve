@@ -3,7 +3,7 @@
 //! Branch and bound prunes by comparing a node's bound against the best solution
 //! found so far, so it cannot prune anything at all until it holds one. A search
 //! that spends its first thousand nodes without an incumbent is doing exhaustive
-//! work no matter how good its bound is — which is exactly what `v064c1000n020`
+//! work no matter how good its bound is, which is exactly what `v064c1000n020`
 //! did, running out its time limit having never found a feasible point.
 //!
 //! Two heuristics, cheapest first:
@@ -14,7 +14,7 @@
 //! - **Diving.** Repeatedly fix the *least* fractional column to its nearest
 //!   integer and re-solve, until the relaxation comes out integral or the dive
 //!   hits infeasibility. Each re-solve differs from the last by one bound, so the
-//!   warm-started dual simplex settles it in a handful of pivots — the same
+//!   warm-started dual simplex settles it in a handful of pivots, the same
 //!   machinery the search itself runs on.
 //!
 //! Least fractional, not most: the aim here is a feasible point rather than a
@@ -23,8 +23,8 @@
 //! opposite, which is why it scores columns by pseudocost instead.
 //!
 //! A feasibility pump would be the next addition, for models where diving keeps
-//! hitting infeasibility. It is a genuinely different mechanism — alternating
-//! projection and rounding — rather than a refinement of this one.
+//! hitting infeasibility. It is a genuinely different mechanism, alternating
+//! projection and rounding, rather than a refinement of this one.
 
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
@@ -32,8 +32,8 @@ use crate::model::Problem;
 /// When to try a heuristic again, based on whether the last attempts worked.
 ///
 /// A fixed interval is wrong in both directions. On a model where diving keeps
-/// landing, the search wants it often; on one where it keeps failing — and it fails
-/// on entire instance families, not just occasional nodes — every attempt is a
+/// landing, the search wants it often. On one where it keeps failing (and it fails
+/// on entire instance families, not just occasional nodes) every attempt is a
 /// short chain of LPs spent for nothing. Running unconditionally every 100 nodes
 /// measurably cost `v064c1000n100` its incumbent quality, because the time went to
 /// dives instead of nodes.
@@ -51,7 +51,7 @@ pub struct Schedule {
 }
 
 /// How far the interval may grow. Past this a heuristic is effectively retired for
-/// the run, but never quite — a search that changes character still gets one look.
+/// the run, though never quite: a search that changes character still gets one look.
 const MAX_INTERVAL_FACTOR: usize = 64;
 
 impl Schedule {
@@ -287,8 +287,8 @@ fn dive_inner(
 ///
 /// The *feasibility pump*. It keeps two points: a relaxation-feasible `x` that is
 /// fractional, and an integral `x~` that is generally infeasible. Each round
-/// re-optimizes the original constraint set under a new objective — the distance to
-/// `x~` — which pulls `x` toward integrality, and then re-rounds to get the next
+/// re-optimizes the original constraint set under a new objective, the distance to
+/// `x~`, which pulls `x` toward integrality, and then re-rounds to get the next
 /// `x~`. When the two coincide, that point is both integral and feasible.
 ///
 /// The distance objective is linear on binaries: `|x_j - t_j|` is `x_j` when
@@ -297,7 +297,7 @@ fn dive_inner(
 ///
 /// This is the right tool where diving is the wrong one. Diving commits to a
 /// rounding and re-solves a *smaller* LP each step, so on a model whose feasible
-/// set is sparse it walks into infeasibility and cannot recover — measured, it
+/// set is sparse it walks into infeasibility and cannot recover, measured, it
 /// failed on every instance in this benchmark set. The pump never fixes anything,
 /// so its LP is always feasible; it can wander, but it cannot dead-end.
 pub fn feasibility_pump(
@@ -344,7 +344,7 @@ fn pump_inner(
         }
 
         // A repeated target means the pump has cycled. Flip the columns that were
-        // hardest to round — the ones furthest from the integer they landed on —
+        // hardest to round (the ones furthest from the integer they landed on)
         // which is the standard escape and keeps the walk deterministic.
         if previous.as_ref() == Some(&target) {
             let mut by_distance: Vec<usize> = (0..n).filter(|&j| problem.is_integer(j)).collect();
@@ -418,7 +418,7 @@ mod tests {
     }
 
     /// Whatever a heuristic returns must actually be feasible and correctly costed.
-    /// A heuristic that returns an infeasible point does not fail loudly — it
+    /// A heuristic that returns an infeasible point does not fail loudly, it
     /// installs a bogus incumbent and the search prunes the real optimum away.
     fn assert_valid(problem: &Problem, found: &Incumbent, label: &str) {
         let x: Vec<f64> = found.x.clone();
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn heuristics_leave_the_lp_exactly_as_they_found_it() {
-        // Both dive and pump mutate the LP -- bounds and costs respectively -- and
+        // Both dive and pump mutate the LP, bounds and costs respectively, and
         // both must restore it, or the node they were called from is corrupted.
         let p = instance(Kind::Knapsack, 25, 12, 3);
         let mut lp = Lp::relaxation(&p);

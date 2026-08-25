@@ -10,7 +10,7 @@
 //! around it changed, and the history is worth keeping because the first
 //! explanation was wrong.
 //!
-//! Under depth-first node selection it was catastrophic — v128c256n100 went from 10
+//! Under depth-first node selection it was catastrophic, v128c256n100 went from 10
 //! nodes to 917, v081c162n018 from 3828 to 23686. The suspicion at the time was
 //! that these instances are dual degenerate enough that most probes return a zero
 //! degradation, leaving the score to break ties arbitrarily.
@@ -29,8 +29,8 @@
 //!
 //! It stays off because the node savings do not pay for the probes: two extra LPs
 //! per candidate costs more wall-clock time than 10-30% fewer nodes saves, on five
-//! of eight instances. Worth enabling on large models — v128c1000n100 goes from
-//! 13.3s to 9.5s at a budget of 100 — which is what the budget option is for.
+//! of eight instances. Worth enabling on large models, v128c1000n100 goes from
+//! 13.3s to 9.5s at a budget of 100, which is what the budget option is for.
 
 /// Per-column history of how much branching on it actually cost./// Per-column history of how much branching on it actually cost.
 ///
@@ -48,8 +48,8 @@ pub struct Pseudocosts {
 
 /// Observations of a direction needed before its pseudocost is trusted.
 ///
-/// Below this the column is probed by strong branching instead — the "reliability"
-/// in reliability branching. Zero would be pure pseudocost (cheap, poor early
+/// Below this the column is probed by strong branching instead, which is the
+/// "reliability" in reliability branching. Zero would be pure pseudocost (cheap, poor early
 /// decisions); a large value approaches full strong branching (excellent decisions,
 /// far too expensive).
 const RELIABILITY: u32 = 4;
@@ -74,7 +74,7 @@ impl Pseudocosts {
     ///
     /// `step` is clamped away from zero before dividing. A column sitting at 1e-6
     /// from integral is still a legal branching candidate, and dividing by that
-    /// would book a degradation inflated a millionfold — which then poisons the
+    /// would book a degradation inflated a millionfold, which then poisons the
     /// global average every unobserved column is scored against. Measured, the
     /// unclamped version made strong branching a net loss on every instance tried.
     pub fn record(&mut self, j: usize, up: bool, degradation: f64, step: f64) {
@@ -164,8 +164,8 @@ fn candidates(problem: &Problem, x: &[f64], tolerance: f64) -> Vec<(usize, f64)>
 
 /// How much a probe degraded the objective, or `None` if it told us nothing.
 ///
-/// An infeasible probe is the most informative outcome there is — that branch is
-/// dead — so it reports an infinite degradation rather than no information.
+/// An infeasible probe is the most informative outcome there is: that branch is
+/// dead, so it reports an infinite degradation rather than no information.
 fn degradation(status: LpStatus, objective: f64, parent: f64) -> Option<f64> {
     match status {
         LpStatus::Optimal => Some((objective - parent).max(0.0)),
@@ -197,7 +197,7 @@ pub struct Decision {
 /// not work, even though it looks equivalent: a probed column reports its true
 /// degradation, which is usually modest, while an unprobed one reports the global
 /// average, which is optimistic. The search then reliably picks a column it knows
-/// nothing about over one it just measured, and the probes are worse than wasted —
+/// nothing about over one it just measured, and the probes are worse than wasted,
 /// measured at 10 nodes to 917 on v128c256n100.
 #[allow(clippy::too_many_arguments)]
 pub fn select(
