@@ -207,6 +207,64 @@ in 21s and not proving it within 60s at all.
 `--cut-rounds N` turns them back on, and they are worth turning on for knapsack-structured
 models like `mkp_200`, where they now win outright.
 
+### Cutting at nodes instead
+
+The measurement that explains the root-cut result also says what to do about it. Counting
+how many root cuts are still binding as the tree descends:
+
+| instance | depth 1 | depth 3 | depth 10 |
+|---|---|---|---|
+| `v064c200` | 36% | 12% | 1% |
+| `v081c162n009` | 50% | 25% | 0% |
+| `mkp_200` | 50% | 17% | 0% |
+| `v256c256n100` | 50% | 25% | 16% |
+
+Binding roughly halves per level. Weighted by where the nodes actually are, these rows are
+carried through about 99% of the tree and bind in about 2% of it -- 15 of `mkp_200`'s 73436
+nodes are at depth three or less. A root cut is a shallow-depth object, and the shallow
+depths are a rounding error in the node count.
+
+Cuts read off a *node's* tableau bind where they were made. They are valid only for that
+node's subtree, so they never enter the shared model: the grown LP lives for one solve and
+only the bound escapes, which is valid everywhere below that node and so is safe to prune
+and order children with. That does what root cutting could not:
+
+| | nodes, no local cuts | every 10th node | every node |
+|---|---|---|---|
+| `v064c200` | 2690 | 2116 | **1136** |
+| `v256c256n100` | 288 | 214 | **86** |
+| `v064c1000n100` | 1106 | 786 | **458** |
+| `mkp_200` | 72150 | 63896 | **40200** |
+| total time | 24.75s | **22.98s** | 36.50s |
+
+Separating at every node halves trees but does not pay for itself; every tenth node is a
+7% win outright, and is the default. `--local-cut-frequency N` sets it.
+
+Growing an LP by a row would normally mean refactorizing it, which at every separating node
+is most of the cost. It does not have to: a basis grown by *k* cuts is block lower
+triangular against the one already factorized,
+
+```text
+    B' = [ B    0 ]        S = -I, the appended rows' own logicals
+         [ R_B  S ]
+```
+
+so `B'^-1` is the existing `B^-1` plus a sparse rank-*k* correction -- FTRAN substitutes
+forward through the block, BTRAN transposes it to upper triangular and mirrors. The one
+trap is that the correction needs `B^-1` and not `LU^-1`, so the extension wraps the whole
+base operator including its etas, and pivots taken afterwards need their own layer above
+it; collapsing those two layers is silent until the first post-extension pivot. Measured
+against the same binary with the reuse forced to miss, the saving tracks row count, which
+is the signature to expect when what you have removed is an `O(m * fill)` factorization:
+
+| rows | instance | reuse | refactorize | |
+|---|---|---|---|---|
+| 30 | `mkp_200` | 22.21s | 23.84s | 1.07x |
+| 200 | `v064c200` | 1.51s | 1.60s | 1.07x |
+| 1000 | `v128c1000n100` | 4.07s | 5.42s | 1.33x |
+| 1000 | `v064c1000n100` | 6.64s | 9.83s | **1.48x** |
+| | total, eight models | 35.90s | 42.29s | 1.18x |
+
 Two follow-ups were measured and rejected, both of which sounded better than they were.
 
 **Capping the cut count.** Since `mkp_200` wins with three cuts and everything else loses

@@ -33,6 +33,7 @@ pub enum BasisError {
 }
 
 /// One product-form update: the transformed entering column and its pivot row.
+#[derive(Clone)]
 struct Eta {
     row: usize,
     pivot: f64,
@@ -40,11 +41,43 @@ struct Eta {
     column: Vec<(usize, f64)>,
 }
 
+/// One row appended to a basis after it was factorized.
+///
+/// Adding a cut grows the basis by a row and a logical. The logical starts basic in
+/// its own row, so the new basis matrix is block lower triangular:
+///
+/// ```text
+///     B' = [ B    0 ]
+///          [ R_B  S ]
+/// ```
+///
+/// with `S` the appended logicals' own coefficients, `-1` each in `[A | -I]`. A block
+/// triangular matrix is solved by substitution, so `B'` never needs factorizing:
+/// `B'^-1` is the existing `B^-1` plus a sparse correction of size `k`.
+#[derive(Clone)]
+struct Extension {
+    /// The appended row's coefficients against the *base* basis positions.
+    row: Vec<(usize, f64)>,
+    /// This row's own logical, the diagonal of `S`.
+    diagonal: f64,
+}
+
 /// A factorized basis.
+#[derive(Clone)]
 pub struct Basis {
+    /// Full dimension, appended rows included.
     m: usize,
     lu: Lu,
+    /// Pivots against the factorized base, applied beneath any extension.
     etas: Vec<Eta>,
+    /// Rows appended since the last refactorization.
+    ///
+    /// The extension wraps the whole base operator -- the LU *and* its etas -- because
+    /// the correction needs `B^-1` applied, not `LU^-1`. Pivots taken after it
+    /// therefore cannot join `etas`; they go in `post`.
+    ext: Vec<Extension>,
+    /// Pivots recorded after the extension, applied on top of it.
+    post: Vec<Eta>,
 }
 
 /// Entries smaller than this are treated as structurally absent.
@@ -59,28 +92,57 @@ impl Basis {
             m,
             lu,
             etas: Vec::new(),
+            ext: Vec::new(),
+            post: Vec::new(),
         }
     }
 
-    pub fn dimension(&self) -> usize {
-        self.m
+    /// Dimension of the factorized base, before any appended rows.
+    fn base_dim(&self) -> usize {
+        self.m - self.ext.len()
     }
 
-    /// Pivots applied since the last refactorization.
-    pub fn updates(&self) -> usize {
-        self.etas.len()
+    /// Grow the basis by the given rows, each with its own logical basic in it.
+    ///
+    /// `rows` gives each appended row's coefficients over the structural columns, and
+    /// `basic` the variables currently in the basis, in position order. The result
+    /// inverts the grown basis exactly, with no refactorization: this is the whole
+    /// point of the block form, since refactorizing at every node that separates is
+    /// what made node-local cuts too expensive to run often.
+    pub fn extend(&mut self, rows: &[Vec<(usize, f64)>], basic: &[usize], n_structural: usize) {
+        if rows.is_empty() {
+            return;
+        }
+        debug_assert_eq!(basic.len(), self.m);
+        // Scatter each row once and read it off per basis position, rather than
+        // searching the row for every column.
+        let mut dense = vec![0.0; n_structural];
+        for row in rows {
+            for &(j, v) in row {
+                dense[j] = v;
+            }
+            let mut against_basis = Vec::new();
+            for (position, &j) in basic.iter().enumerate() {
+                // Logicals of the pre-existing rows have no entry in an appended row.
+                if j < n_structural && dense[j] != 0.0 {
+                    against_basis.push((position, dense[j]));
+                }
+            }
+            self.ext.push(Extension {
+                row: against_basis,
+                diagonal: -1.0,
+            });
+            self.m += 1;
+            for &(j, _) in row {
+                dense[j] = 0.0;
+            }
+        }
     }
 
-    /// Nonzeros held in the factors, for diagnostics.
-    pub fn nnz(&self) -> usize {
-        self.lu.nnz() + self.etas.iter().map(|e| e.column.len() + 1).sum::<usize>()
-    }
-
-    /// FTRAN: solve `B d = a`, returning `d = B^-1 a`.
-    pub fn ftran(&self, a: &[f64], out: &mut Vec<f64>) {
+    /// FTRAN against the base only: the LU and the etas beneath any extension.
+    fn ftran_base(&self, a: &[f64], out: &mut Vec<f64>) {
         self.lu.ftran(a, out);
         for eta in &self.etas {
-            // v_r <- v_r / pivot, then v_i <- v_i - d_i * v_r.
             let scaled = out[eta.row] / eta.pivot;
             out[eta.row] = scaled;
             if scaled != 0.0 {
@@ -91,11 +153,10 @@ impl Basis {
         }
     }
 
-    /// BTRAN: solve `B' y = c`, returning `y' = c' B^-1`.
-    pub fn btran(&self, c: &[f64], out: &mut Vec<f64>) {
+    /// BTRAN against the base only.
+    fn btran_base(&self, c: &[f64], out: &mut Vec<f64>) {
         out.clear();
         out.extend_from_slice(c);
-        // Transposed etas, newest first: only the pivot row's entry changes.
         for eta in self.etas.iter().rev() {
             let mut acc = out[eta.row];
             for &(i, v) in &eta.column {
@@ -103,9 +164,88 @@ impl Basis {
             }
             out[eta.row] = acc / eta.pivot;
         }
-        let mut work = std::mem::take(out);
+        let work = std::mem::take(out);
         self.lu.btran(&work, out);
-        work.clear();
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.m
+    }
+
+    /// Pivots applied since the last refactorization.
+    pub fn updates(&self) -> usize {
+        self.etas.len() + self.post.len()
+    }
+
+    /// Nonzeros held in the factors, for diagnostics.
+    pub fn nnz(&self) -> usize {
+        self.lu.nnz()
+            + self
+                .etas
+                .iter()
+                .chain(&self.post)
+                .map(|e| e.column.len() + 1)
+                .sum::<usize>()
+            + self.ext.iter().map(|e| e.row.len() + 1).sum::<usize>()
+    }
+
+    /// FTRAN: solve `B d = a`, returning `d = B^-1 a`.
+    pub fn ftran(&self, a: &[f64], out: &mut Vec<f64>) {
+        let b = self.base_dim();
+        self.ftran_base(&a[..b], out);
+        // Forward substitution through the block: `S d2 = a2 - R_B d1`.
+        for (i, e) in self.ext.iter().enumerate() {
+            let correction: f64 = e.row.iter().map(|&(p, v)| v * out[p]).sum();
+            out.push((a[b + i] - correction) / e.diagonal);
+        }
+        for eta in &self.post {
+            let scaled = out[eta.row] / eta.pivot;
+            out[eta.row] = scaled;
+            if scaled != 0.0 {
+                for &(i, v) in &eta.column {
+                    out[i] -= v * scaled;
+                }
+            }
+        }
+    }
+
+    /// BTRAN: solve `B^T y = c`, returning `y = B^-T c`.
+    ///
+    /// Transposing the block form turns it upper triangular, so the appended rows are
+    /// solved first and their result corrects the right-hand side of the base solve --
+    /// the mirror of the forward substitution in [`Basis::ftran`].
+    pub fn btran(&self, c: &[f64], out: &mut Vec<f64>) {
+        if self.ext.is_empty() && self.post.is_empty() {
+            self.btran_base(c, out);
+            return;
+        }
+        let mut work = c.to_vec();
+        // Transposed etas, newest first: only the pivot row's entry changes.
+        for eta in self.post.iter().rev() {
+            let mut acc = work[eta.row];
+            for &(i, v) in &eta.column {
+                acc -= v * work[i];
+            }
+            work[eta.row] = acc / eta.pivot;
+        }
+        if self.ext.is_empty() {
+            self.btran_base(&work, out);
+            return;
+        }
+        let b = self.base_dim();
+        let mut base_rhs = work[..b].to_vec();
+        let mut appended = Vec::with_capacity(self.ext.len());
+        for (i, e) in self.ext.iter().enumerate() {
+            let y = work[b + i] / e.diagonal;
+            if y != 0.0 {
+                for &(p, v) in &e.row {
+                    base_rhs[p] -= v * y;
+                }
+            }
+            appended.push(y);
+        }
+        self.btran_base(&base_rhs, out);
+        out.extend_from_slice(&appended);
     }
 
     /// BTRAN against a unit vector: row `r` of `B^-1`.
@@ -136,11 +276,17 @@ impl Basis {
             .filter(|&(i, &v)| i != r && v.abs() > ZERO_TOL)
             .map(|(i, &v)| (i, v))
             .collect();
-        self.etas.push(Eta {
+        let eta = Eta {
             row: r,
             pivot,
             column,
-        });
+        };
+        // A pivot taken after the basis grew sits above the extension, not beneath it.
+        if self.ext.is_empty() {
+            self.etas.push(eta);
+        } else {
+            self.post.push(eta);
+        }
     }
 
     /// Refactorize from the basis columns, given as `(rows, values)` pairs.
@@ -151,12 +297,17 @@ impl Basis {
     ) -> Result<(), BasisError> {
         if self.m == 0 {
             self.etas.clear();
+            self.ext.clear();
+            self.post.clear();
             return Ok(());
         }
         match Lu::factor(self.m, columns, ZERO_TOL) {
             Ok(lu) => {
                 self.lu = lu;
                 self.etas.clear();
+                // A fresh factorization covers the appended rows like any other.
+                self.ext.clear();
+                self.post.clear();
                 Ok(())
             }
             Err(Singular { position }) => Err(BasisError::Singular { row: position }),
@@ -183,6 +334,80 @@ mod tests {
                 (rows, vals)
             })
             .collect()
+    }
+
+    /// Build the grown basis matrix explicitly: the old columns gain their entries in
+    /// the appended rows, and each appended row gets a logical column of -1.
+    fn grown(dense: &[Vec<f64>], rows: &[Vec<(usize, f64)>], basic: &[usize]) -> Vec<Vec<f64>> {
+        let b = dense.len();
+        let k = rows.len();
+        let mut out: Vec<Vec<f64>> = dense
+            .iter()
+            .enumerate()
+            .map(|(p, col)| {
+                let mut c = col.clone();
+                c.resize(b + k, 0.0);
+                for (i, row) in rows.iter().enumerate() {
+                    // `basic[p]` is the variable in position `p`; structural columns
+                    // are numbered below `dense.len()` in these tests.
+                    for &(j, v) in row {
+                        if j == basic[p] {
+                            c[b + i] = v;
+                        }
+                    }
+                }
+                c
+            })
+            .collect();
+        for i in 0..k {
+            let mut logical = vec![0.0; b + k];
+            logical[b + i] = -1.0;
+            out.push(logical);
+        }
+        out
+    }
+
+    #[test]
+    fn an_extended_basis_inverts_the_grown_matrix() {
+        // A base that is not triangular, so the LU actually has to do something.
+        let dense = vec![
+            vec![2.0, 1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let basic = vec![0usize, 1, 2];
+        let mut basis = Basis::all_logical(3);
+        basis.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        assert_inverts(&basis, &dense);
+
+        // Two appended rows touching different subsets of the basis.
+        let rows = vec![vec![(0usize, 1.0), (2, 3.0)], vec![(1usize, -2.0)]];
+        basis.extend(&rows, &basic, 3);
+        assert_eq!(basis.dimension(), 5);
+        assert_inverts(&basis, &grown(&dense, &rows, &basic));
+    }
+
+    /// The extension has to survive later pivots, which is why they layer above it
+    /// rather than joining the etas beneath.
+    #[test]
+    fn an_extended_basis_still_inverts_after_a_pivot() {
+        let dense = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let basic = vec![0usize, 1];
+        let mut basis = Basis::all_logical(2);
+        basis.refactorize(&sparse(2, &dense), 1e-9).unwrap();
+
+        let rows = vec![vec![(0usize, 1.0), (1, 1.0)]];
+        basis.extend(&rows, &basic, 2);
+        let mut grown_cols = grown(&dense, &rows, &basic);
+
+        // Swap a new column into position 1, exactly as a pivot would.
+        let entering = vec![1.0, -1.0, 2.0];
+        let mut d = Vec::new();
+        basis.ftran(&entering, &mut d);
+        basis.update(&d, 1);
+        grown_cols[1] = entering;
+
+        assert_inverts(&basis, &grown_cols);
     }
 
     /// `B^-1 B` must be the identity, checked column by column.

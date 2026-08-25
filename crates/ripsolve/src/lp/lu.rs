@@ -23,6 +23,7 @@
 //! step would itself be quadratic.
 
 /// The factorization `P B Q = L U`, with `L` unit lower triangular.
+#[derive(Clone)]
 pub struct Lu {
     m: usize,
     /// Original row index of pivot `k`.

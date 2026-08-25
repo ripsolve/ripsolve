@@ -103,6 +103,26 @@ pub struct BasisState {
     status: Vec<Status>,
 }
 
+impl BasisState {
+    /// Extend a basis saved before `k` rows were appended so it applies after.
+    ///
+    /// Each new row's logical starts basic in that row. A cut is violated by the
+    /// point the basis describes -- that is what makes it a cut -- so the new basic
+    /// variable starts outside its bounds and the basis is primal infeasible but
+    /// still dual feasible, which is exactly the dual simplex's entry condition.
+    pub fn extend_for_rows(&mut self, n_structural: usize, old_rows: usize, k: usize) {
+        for i in 0..k {
+            let logical = n_structural + old_rows + i;
+            debug_assert_eq!(self.status.len(), logical);
+            self.basic.push(logical);
+            self.status.push(Status::Basic { row: old_rows + i });
+        }
+    }
+}
+
+/// A row in range form: coefficients over the structural columns, then `lb` and `ub`.
+pub type RangeRow = (Vec<(usize, f64)>, f64, f64);
+
 /// The result of solving an LP relaxation.
 #[derive(Clone, Debug)]
 pub struct LpSolution {
@@ -231,6 +251,40 @@ impl Lp {
         }
     }
 
+    /// Append rows to the model in place, one logical variable each.
+    ///
+    /// Rows are given as `(coefficients, lb, ub)` over the structural columns, in the
+    /// same range form the model already uses. The new logicals take the highest
+    /// indices, which is what lets every existing column index -- and so every saved
+    /// basis -- keep its meaning across the growth.
+    ///
+    /// This is how a cut reaches a node's LP without rebuilding it. The alternative,
+    /// constructing a fresh `Lp` from an augmented `Problem`, costs a cold
+    /// factorization at every node that separates.
+    pub fn add_rows(&mut self, rows: &[RangeRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut by_column: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.n_structural];
+        for (offset, (coefficients, _, _)) in rows.iter().enumerate() {
+            for &(j, a) in coefficients {
+                by_column[j].push((offset, a));
+            }
+        }
+        self.matrix = self.matrix.with_rows_appended(rows.len(), &by_column);
+
+        // Logicals for the new rows land at the end of the variable order, after the
+        // existing `n + m` variables, so nothing already indexed moves.
+        for (_, lb, ub) in rows {
+            self.cost.push(0.0);
+            self.lower.push(*lb);
+            self.upper.push(*ub);
+        }
+        self.m += rows.len();
+        // Every cached factorization was built for the old row count.
+        self.invalidate_factors();
+    }
+
     pub fn with_tolerances(mut self, tol: Tolerances) -> Self {
         self.tol = tol;
         self
@@ -285,6 +339,11 @@ impl Lp {
 
     pub fn n_columns(&self) -> usize {
         self.n_structural
+    }
+
+    /// Rows currently in the model, including any added since construction.
+    pub fn n_rows(&self) -> usize {
+        self.m
     }
 
     fn n_total(&self) -> usize {
@@ -370,6 +429,46 @@ impl Lp {
             return Vec::new();
         }
         solver.gomory_cuts(max_cuts)
+    }
+
+    /// Solve this model grown by `rows`, reusing the factorization `basis` was left
+    /// with instead of building a new one.
+    ///
+    /// The grown basis is block triangular against the one already factorized, so the
+    /// reuse is exact rather than approximate -- see [`Basis::extend`]. Without it,
+    /// every call pays a cold factorization at the grown dimension, which is what put
+    /// node-local cutting out of reach at any useful frequency.
+    ///
+    /// The grown model is temporary and is not cached: the caller wants the bound it
+    /// proves, not a model to keep.
+    pub fn solve_with_rows(
+        &self,
+        basis: &BasisState,
+        rows: &[RangeRow],
+        cutoff: Option<f64>,
+        max_iterations: usize,
+    ) -> LpSolution {
+        let coefficients: Vec<Vec<(usize, f64)>> = rows.iter().map(|(c, _, _)| c.clone()).collect();
+        // Falls back to a fresh factorization if this basis is not the one the cache
+        // is holding, which costs what the old path cost and is never wrong.
+        let factors = self
+            .factors
+            .iter()
+            .find(|(columns, _)| *columns == basis.basic)
+            .map(|(_, held)| {
+                let mut extended = held.clone();
+                extended.extend(&coefficients, &basis.basic, self.n_structural);
+                extended
+            });
+
+        let mut grown = self.clone();
+        grown.add_rows(rows);
+        let mut state = basis.clone();
+        state.extend_for_rows(self.n_structural, self.m, rows.len());
+
+        Solver::warm(&grown, &state, factors)
+            .run(max_iterations, cutoff)
+            .0
     }
 
     /// Re-solve starting from a saved basis.
@@ -1378,6 +1477,128 @@ mod tests {
     use crate::model::{RowSense, Sense};
 
     use crate::sparse::SparseMatrix;
+
+    /// Growing an LP in place must land exactly where building it with the same rows
+    /// from the start does. This is the property the whole node-local cut path rests
+    /// on, so it is checked against a from-scratch solve rather than against itself.
+    #[test]
+    fn rows_added_in_place_match_a_model_built_with_them() {
+        use crate::cuts::Cut;
+
+        let base = problem(
+            &[-1.0, -2.0],
+            &[
+                (&[1.0, 1.0], RowSense::Le, 3.5),
+                (&[2.0, 1.0], RowSense::Le, 5.0),
+            ],
+        );
+        let mut lp = Lp::relaxation(&base);
+        let first = lp.solve();
+        assert_eq!(first.status, LpStatus::Optimal);
+
+        // A row the relaxation optimum violates, so the growth has real work to do.
+        let cut = Cut {
+            coefficients: vec![(0, 1.0), (1, 1.0)],
+            lb: f64::NEG_INFINITY,
+            ub: 1.5,
+        };
+        assert!(cut.violation(&first.x) > 0.0);
+
+        let mut grown = lp.clone();
+        let mut basis = first.basis.clone();
+        grown.add_rows(&[(cut.coefficients.clone(), cut.lb, cut.ub)]);
+        basis.extend_for_rows(base.n_cols(), base.n_rows(), 1);
+        let warm = grown.solve_warm(&basis, None, 10_000);
+
+        let mut rebuilt_problem = base.clone();
+        rebuilt_problem.add_cuts(std::slice::from_ref(&cut));
+        let cold = Lp::relaxation(&rebuilt_problem).solve();
+
+        assert_eq!(warm.status, LpStatus::Optimal);
+        assert_eq!(cold.status, LpStatus::Optimal);
+        assert!(
+            (warm.objective - cold.objective).abs() < 1e-9,
+            "grown {} vs rebuilt {}",
+            warm.objective,
+            cold.objective
+        );
+        // And the cut actually bit: the bound is worse than before it was added.
+        assert!(warm.objective > first.objective + 1e-9);
+        assert!(cut.violation(&warm.x) <= 1e-9);
+    }
+
+    /// Reusing the parent factorization must land exactly where refactorizing does.
+    /// This is the property that makes `solve_with_rows` an optimization rather than a
+    /// different algorithm, so it is checked against the path it replaces.
+    #[test]
+    fn reusing_the_factorization_matches_refactorizing_from_scratch() {
+        use crate::cuts::Cut;
+
+        let base = problem(
+            &[-3.0, -2.0, -4.0],
+            &[
+                (&[1.0, 1.0, 1.0], RowSense::Le, 2.5),
+                (&[2.0, 1.0, 0.0], RowSense::Le, 2.0),
+                (&[0.0, 1.0, 3.0], RowSense::Le, 3.5),
+            ],
+        );
+        let mut lp = Lp::relaxation(&base);
+        let first = lp.solve();
+        assert_eq!(first.status, LpStatus::Optimal);
+
+        let cuts = [
+            Cut {
+                coefficients: vec![(0, 1.0), (1, 1.0), (2, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 1.5,
+            },
+            Cut {
+                coefficients: vec![(1, 1.0), (2, 2.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 1.25,
+            },
+        ];
+        let rows: Vec<RangeRow> = cuts
+            .iter()
+            .map(|c| (c.coefficients.clone(), c.lb, c.ub))
+            .collect();
+
+        // The cache now holds the factorization the last solve ended on, which is what
+        // the reuse path looks for.
+        let reused = lp.solve_with_rows(&first.basis, &rows, None, 10_000);
+
+        let mut rebuilt = base.clone();
+        rebuilt.add_cuts(&cuts);
+        let cold = Lp::relaxation(&rebuilt).solve();
+
+        assert_eq!(reused.status, LpStatus::Optimal);
+        assert_eq!(cold.status, LpStatus::Optimal);
+        assert!(
+            (reused.objective - cold.objective).abs() < 1e-9,
+            "reused {} vs cold {}",
+            reused.objective,
+            cold.objective
+        );
+        assert!(
+            reused.objective > first.objective + 1e-9,
+            "the cuts must bite"
+        );
+    }
+
+    #[test]
+    fn adding_a_row_the_optimum_already_satisfies_leaves_the_bound_alone() {
+        let base = problem(&[-1.0, -2.0], &[(&[1.0, 1.0], RowSense::Le, 3.0)]);
+        let mut lp = Lp::relaxation(&base);
+        let first = lp.solve();
+
+        let mut basis = first.basis.clone();
+        lp.add_rows(&[(vec![(0, 1.0), (1, 1.0)], f64::NEG_INFINITY, 10.0)]);
+        basis.extend_for_rows(base.n_cols(), base.n_rows(), 1);
+        let after = lp.solve_warm(&basis, None, 10_000);
+
+        assert_eq!(after.status, LpStatus::Optimal);
+        assert!((after.objective - first.objective).abs() < 1e-9);
+    }
 
     /// Build a problem from dense rows, for readable test cases.
     pub(super) fn problem(obj: &[f64], rows: &[(&[f64], RowSense, f64)]) -> Problem {

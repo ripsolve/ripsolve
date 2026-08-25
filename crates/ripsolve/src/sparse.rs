@@ -90,6 +90,45 @@ impl SparseMatrix {
         (&self.row_idx[s..e], &self.values[s..e])
     }
 
+    /// A copy with `n_new` extra rows, whose entries are supplied per column as
+    /// `(row_offset, value)` with `row_offset` counted from the first new row.
+    ///
+    /// Every new entry sits below every existing one, so it belongs at the end of its
+    /// column and nothing needs re-sorting: this is one linear pass, not a rebuild
+    /// through triplets.
+    pub fn with_rows_appended(
+        &self,
+        n_new: usize,
+        by_column: &[Vec<(usize, f64)>],
+    ) -> SparseMatrix {
+        debug_assert_eq!(by_column.len(), self.n_cols);
+        let added: usize = by_column.iter().map(|c| c.len()).sum();
+        let mut col_start = Vec::with_capacity(self.n_cols + 1);
+        let mut row_idx = Vec::with_capacity(self.nnz() + added);
+        let mut values = Vec::with_capacity(self.nnz() + added);
+
+        col_start.push(0);
+        for (c, extra) in by_column.iter().enumerate() {
+            let (rows, vals) = self.column(c);
+            row_idx.extend_from_slice(rows);
+            values.extend_from_slice(vals);
+            for &(offset, v) in extra {
+                debug_assert!(offset < n_new);
+                row_idx.push(self.n_rows + offset);
+                values.push(v);
+            }
+            col_start.push(row_idx.len());
+        }
+
+        SparseMatrix {
+            n_rows: self.n_rows + n_new,
+            n_cols: self.n_cols,
+            col_start,
+            row_idx,
+            values,
+        }
+    }
+
     /// Density as a fraction of `n_rows * n_cols`; 0.0 for an empty matrix.
     ///
     /// The simplex uses this to decide between dense and sparse kernels.

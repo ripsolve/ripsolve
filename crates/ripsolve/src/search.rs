@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::branch::{self, Pseudocosts};
 use crate::cuts;
 use crate::heuristic::{self, Limits, Schedule};
-use crate::lp::{BasisState, Lp, LpStatus};
+use crate::lp::{BasisState, Lp, LpSolution, LpStatus};
 use crate::model::Problem;
 use crate::presolve::{self, Outcome};
 
@@ -51,6 +51,24 @@ pub struct Options {
     pub max_iterations_per_node: usize,
     /// Tighten the model before searching.
     pub presolve: bool,
+    /// Separate cuts at one node in every `local_cut_frequency`, not only at the
+    /// root. Zero disables node-local cutting.
+    ///
+    /// Root cuts turn out to be a shallow-depth phenomenon: measured over six models
+    /// they bind at 33-50% of rows at depth one and 0-4% by depth ten, while the tree
+    /// carries them through every node. Cuts derived at a node use that node's bounds,
+    /// so they bind where they were made -- but they are valid only for that subtree,
+    /// which is why they never enter the shared model.
+    ///
+    /// Ten is from a sweep of 0, 1, 3, 10, 50 and 200 over eight models. It is the only
+    /// setting that beats not cutting at all, 22.98s against 24.75s, while still taking
+    /// real chunks out of the tree -- `v064c1000n100` 1106 nodes to 786, `mkp_200` 72150
+    /// to 63896. Separating at *every* node shrinks trees far harder (`v256c256n100`
+    /// 288 nodes to 86, `v064c200` 2690 to 1136) but costs 36.50s: worth reaching for
+    /// on a model where nodes are the bottleneck, not as a default.
+    pub local_cut_frequency: usize,
+    /// Most cuts to derive at one node.
+    pub local_cuts_per_node: usize,
     /// Rounds of cut separation at the root. Zero disables cuts.
     ///
     /// Defaults to zero, which is not where a branch-and-*cut* solver expects to
@@ -126,6 +144,8 @@ impl Default for Options {
             gap_tolerance: 0.0,
             max_iterations_per_node: 100_000,
             presolve: true,
+            local_cut_frequency: 10,
+            local_cuts_per_node: 8,
             // Off by default. See `cut_rounds`.
             cut_rounds: 0,
             cuts_per_round: 32,
@@ -338,6 +358,54 @@ impl<'a> Worker<'a> {
     ///
     /// `incumbent` is the best objective known *now*; in a parallel search that may
     /// be better than when the node was created, which only ever prunes more.
+    /// Tighten one node's bound with cuts derived from its own relaxation.
+    ///
+    /// Returns the improved bound, or `None` if nothing was gained. Cuts separated
+    /// here are read off a tableau built under this node's branching bounds, so they
+    /// are valid for this subtree and not for the tree at large. They are therefore
+    /// never added to the shared model: the augmented LP lives for exactly one solve,
+    /// and the only thing that outlives it is the bound, which *is* valid everywhere
+    /// below this node and so is safe to prune and order children with.
+    ///
+    /// The node's own basis and solution are left untouched, so branching still reads
+    /// the same relaxation it would have without this. That is deliberate -- the
+    /// augmented vertex is arguably the better branching point, but mixing it with a
+    /// basis taken from the un-augmented model is a correctness trap not worth
+    /// setting for a first cut at this.
+    fn separate_locally(
+        &mut self,
+        solved: &LpSolution,
+        options: &Options,
+        cutoff: Option<f64>,
+    ) -> Option<f64> {
+        let limit = options.local_cuts_per_node;
+        let found = cuts::separate_gomory(&self.lp, &solved.basis, &solved.x, limit);
+        let found = cuts::select(found, &solved.x, limit);
+        if found.is_empty() {
+            return None;
+        }
+
+        let rows: Vec<crate::lp::RangeRow> = found
+            .iter()
+            .map(|c| (c.coefficients.clone(), c.lb, c.ub))
+            .collect();
+        let resolved = self.lp.solve_with_rows(
+            &solved.basis,
+            &rows,
+            cutoff,
+            options.max_iterations_per_node,
+        );
+        self.iterations += resolved.iterations;
+
+        match resolved.status {
+            // The tightened relaxation is already worse than the incumbent, so
+            // everything below this node is too.
+            LpStatus::CutOff => Some(f64::INFINITY),
+            LpStatus::Optimal if resolved.objective > solved.objective => Some(resolved.objective),
+            _ => None,
+        }
+    }
+
     fn process(&mut self, node: &Node, incumbent: f64, index: usize) -> NodeOutcome {
         let problem = self.problem;
         let options = self.options;
@@ -387,6 +455,20 @@ impl<'a> Worker<'a> {
 
         if !improves(solved.objective, incumbent, options.gap_tolerance) {
             return out;
+        }
+
+        // Cuts derived from this node's own relaxation, if it is one of the nodes
+        // chosen for it. Only the bound escapes; see `separate_locally`.
+        let mut bound = solved.objective;
+        if options.local_cut_frequency > 0
+            && index.is_multiple_of(options.local_cut_frequency)
+            && integral_solution(problem, &solved.x, options.integrality_tolerance).is_none()
+            && let Some(tightened) = self.separate_locally(&solved, &options, cutoff)
+        {
+            bound = tightened;
+            if !improves(bound, incumbent, options.gap_tolerance) {
+                return out;
+            }
         }
 
         // Dive from this node every so often. Nodes deep in the tree already have
@@ -473,7 +555,7 @@ impl<'a> Worker<'a> {
                     let went_up = lo > value.floor();
                     out.children.push(Node {
                         fixings,
-                        bound: solved.objective,
+                        bound,
                         basis: solved.basis.clone(),
                         origin: Some((column, went_up, solved.objective, decision.fraction)),
                     });
