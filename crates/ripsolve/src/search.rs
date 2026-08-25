@@ -52,6 +52,31 @@ pub struct Options {
     /// Tighten the model before searching.
     pub presolve: bool,
     /// Rounds of cut separation at the root. Zero disables cuts.
+    ///
+    /// Defaults to zero, which is not where a branch-and-*cut* solver expects to
+    /// end up. Measured over eleven models spanning this solver's target range,
+    /// cutting was slower on every one of them:
+    ///
+    /// ```text
+    ///                  no cuts      3 rounds of 32
+    ///     mkp_200      17.1s          47.8s
+    ///     v064c200      1.7s           2.4s
+    ///     v081c162n009  0.8s           1.2s
+    ///     v048c048     0.01s          0.04s
+    /// ```
+    ///
+    /// The cuts are not useless — they raise the root bound substantially, taking
+    /// v064c200 from 72.1 to 95.4 against an optimum of 225. They simply do not pay
+    /// for themselves here: separation is expensive, the cuts come out dense enough
+    /// to slow every subsequent LP, and best-bound node selection had already
+    /// captured most of what a better bound was worth. On `mkp_200` cutting even
+    /// *raised* the node count, 72150 to 91346, and on MIPLIB's markshare_4_0 it was
+    /// the difference between proving optimality in 21 seconds and not proving it at
+    /// all.
+    ///
+    /// Turning this on is worthwhile when node count matters more than wall clock,
+    /// and would become worthwhile generally with cheaper separation and proper cut
+    /// selection by efficacy and orthogonality. Neither is implemented.
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
@@ -101,9 +126,8 @@ impl Default for Options {
             gap_tolerance: 0.0,
             max_iterations_per_node: 100_000,
             presolve: true,
-            // Separation converges after two or three rounds on every instance
-            // measured; a larger budget finds no more cuts and only costs time.
-            cut_rounds: 3,
+            // Off by default. See `cut_rounds`.
+            cut_rounds: 0,
             cuts_per_round: 32,
             refactor_interval: 50,
             threads: 1,

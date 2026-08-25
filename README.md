@@ -155,6 +155,31 @@ optimal in 6s, and cut `v256c256n100` from 2290 nodes to 250 and `v128c256n100`
 from 368 to 1. Two instances regressed instead — the node counts still do not track
 the bound, which improves monotonically with every cut added.
 
+**Cuts are nonetheless off by default**, which is not where a branch-and-*cut* solver
+expects to land. Every measurement above was taken under most-fractional branching and
+depth-first search. Re-measured after pseudocost branching and best-bound node selection
+were in place, cutting was slower on all eleven models in the target range:
+
+| | no cuts | 3 rounds of 32 |
+|---|---|---|
+| `mkp_200` | **16.6s** | 48.2s |
+| `v064c1000n100` | **7.9s** | 10.5s |
+| `v064c200` | **1.5s** | 2.3s |
+| `v081c162n009` | **0.8s** | 1.2s |
+| total, nine models | **32.1s** | 67.8s |
+
+The cuts still work: they take the `v064c200` root bound from 72.1 to 95.4. They just no
+longer pay for themselves. Separation is expensive, the cuts come out dense enough to slow
+every subsequent LP, and best-bound selection had already collected most of what a better
+bound was worth — the earlier wins were largely a better bound rescuing a bad search order,
+and the search order is no longer bad. On `mkp_200` cutting even *raises* the node count,
+72150 to 91346. On MIPLIB's `markshare_4_0` it is the difference between proving optimality
+in 21s and not proving it within 60s at all.
+
+`--cut-rounds N` turns them back on, and they remain worth having when node count matters
+more than wall clock. Making them pay generally needs cheaper separation and selection by
+efficacy and orthogonality rather than by density alone; neither is implemented.
+
 Pseudocost branching addresses that, scoring a column by the objective degradation
 it has actually caused rather than by how fractional it looks. It is a large win on
 the hardest instances and roughly neutral elsewhere — `v081c162n018` drops from

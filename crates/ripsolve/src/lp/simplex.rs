@@ -1070,20 +1070,19 @@ impl<'a> Solver<'a> {
         // Cuts whose coefficients span more than this are numerically worthless and
         // actively harmful to the LPs that must then carry them.
         const MAX_DYNAMISM: f64 = 1e6;
-        // How many columns a cut may touch: a fraction of the model, but never
-        // fewer than a floor.
+        // How dense a cut may be, relative to the rows of the model it came from.
         //
-        // GMI cuts come out far denser than the rows they are derived from -- on
-        // MIPLIB's pk1 the model's rows average 23% of the columns while its cuts
-        // reach 81%. A dense row destroys the sparsity the LU factorization depends
-        // on, so every later solve pays for it: pk1 went from 171k nodes without
-        // cuts to 24 with them, each node burning tens of thousands of iterations.
+        // GMI cuts come out denser than the rows they derive from, and a row much
+        // denser than the model destroys the sparsity the LU depends on: on MIPLIB's
+        // pk1, whose rows average 23% of the columns, cuts reaching 81% took the
+        // solve from 171k nodes to 24.
         //
-        // The floor matters as much as the fraction. On a sixteen-column model no
-        // useful GMI cut is under 40% dense, and a pure fraction rejects every one
-        // of them -- while the LPs there are so cheap that a dense row costs nothing
-        // worth guarding against.
-        const MAX_DENSITY: f64 = 0.4;
+        // Relative, not absolute. An absolute cap was tried and silently rejected
+        // *every* GMI cut on the models this solver targets, which run about 99.5%
+        // dense -- a dense model's cuts are supposed to be dense, and the bound they
+        // were worth went with them. The comparison that matters is against the
+        // model's own rows.
+        const DENSITY_FACTOR: usize = 3;
         const MIN_SUPPORT: usize = 30;
         const TINY: f64 = 1e-11;
 
@@ -1224,7 +1223,8 @@ impl<'a> Solver<'a> {
                 .iter()
                 .map(|&(_, v)| v.abs())
                 .fold(f64::INFINITY, f64::min);
-            let allowed = MIN_SUPPORT.max((MAX_DENSITY * lp.n_structural as f64) as usize);
+            let average_row = lp.matrix.nnz() / lp.m.max(1);
+            let allowed = MIN_SUPPORT.max(DENSITY_FACTOR * average_row);
             if largest / smallest > MAX_DYNAMISM || !rhs.is_finite() || coefficients.len() > allowed
             {
                 continue;

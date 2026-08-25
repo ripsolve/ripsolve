@@ -46,9 +46,10 @@ enum Command {
         /// Skip presolve.
         #[arg(long)]
         no_presolve: bool,
-        /// Skip cut generation.
-        #[arg(long)]
-        no_cuts: bool,
+        /// Rounds of root cut separation. Off by default: cutting raises the root
+        /// bound but has measured slower on every model in this solver's range.
+        #[arg(long, default_value_t = 0)]
+        cut_rounds: usize,
         /// Worker threads; defaults to the machine's parallelism.
         #[arg(short, long)]
         threads: Option<usize>,
@@ -119,7 +120,7 @@ fn main() -> Result<()> {
             gap,
             verbose,
             no_presolve,
-            no_cuts,
+            cut_rounds,
             threads,
         } => {
             let problem =
@@ -133,11 +134,7 @@ fn main() -> Result<()> {
                 presolve: !no_presolve,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
-                cut_rounds: if no_cuts {
-                    0
-                } else {
-                    Options::default().cut_rounds
-                },
+                cut_rounds,
                 ..Options::default()
             };
             let started = std::time::Instant::now();
