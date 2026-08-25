@@ -11,15 +11,32 @@ integer bounded to `[0, 1]`; the solver has no separate notion of one, because
 branching splits a range (`x <= floor(v)` against `x >= ceil(v)`) and that
 degenerates to fixing at 0 or 1 on its own.
 
-Status: **early, but solving**. LP and MPS readers, presolve, lifted knapsack cover
-cuts, Gomory mixed-integer cuts, pseudocost branching, primal heuristics, a sparse
-LU factorization, best-bound search, parallel tree search, and a `gurobipy`-shaped
-Python API are all in place. Quadratic terms, SOS constraints, callbacks and lazy
-constraints are not.
+## Scope
 
-Correctness is checked against a leading commercial solver as an oracle — relaxation values, integer
-optima, and 400 randomized mixed-integer models — but nothing links against it and
-the test suite runs without it.
+`ripsolve` aims to be **fast on small and medium models** — up to roughly a
+thousand rows — and it is: on models in that range it is quicker than HiGHS, SCIP
+and CBC on several, ties a leading commercial solver on some, and beats it on a few.
+
+It is **not** a large-model solver, and the distance is not small. On a seeded
+random sample of 25 models from the MIPLIB 2017 benchmark set, whose median size is
+11,697 columns, it proved optimality on one and failed to finish even the root node
+on eleven. Closing that would take an efficient sparse simplex with partial pricing
+and steepest-edge, Forrest-Tomlin updates, a presolve that does real work at scale,
+and numerics to match. None of that is here.
+
+So: reach for it on models of a few hundred to a few thousand rows. Reach for HiGHS
+or SCIP above that.
+
+What is implemented: LP and MPS readers, presolve, lifted knapsack cover cuts,
+Gomory mixed-integer cuts, pseudocost branching, primal heuristics, a sparse LU
+factorization, best-bound search, parallel tree search, and a `gurobipy`-shaped
+Python API. Quadratic terms, SOS constraints, callbacks and lazy constraints are
+not.
+
+Correctness is checked against a leading commercial solver as an oracle —
+relaxation values, integer optima, and 400 randomized mixed-integer models — and
+against HiGHS, SCIP and CBC, which must all agree wherever more than one proves
+optimality. Nothing links against any of them and the test suite runs without them.
 
 ## Why not pure enumeration
 
@@ -46,6 +63,29 @@ other two on one:
 | 80 | >120s | **0.24s** | 0.25s |
 | 200 | >120s | 6.8s | 1.6s |
 | 500 | — | 1.7% gap at 300s | 294s |
+
+## Against the open-source solvers
+
+HiGHS, SCIP and CBC, every solver on one thread with the same 60-second limit,
+timing only the solve. `bench/open_compare.py` reproduces it, and fails if any two
+solvers that both claim optimality disagree on the optimum — it is a differential
+test as much as a benchmark.
+
+| instance | ripsolve | HiGHS | SCIP | CBC |
+|---|---:|---:|---:|---:|
+| `v032c032` | **0.04s** | 0.04s | 0.04s | 0.04s |
+| `v048c048` | **0.04s** | 0.1s | 0.3s | 0.04s |
+| `v048c128` | **0.1s** | 0.1s | 0.2s | 0.1s |
+| `v064c064` | **0.1s** | 0.3s | 0.8s | 0.2s |
+| `v064c200` | 2.8s | 2.8s | **2.0s** | 4.1s |
+| `v081c162n009` | **1.1s** | 1.6s | 2.5s | 2.5s |
+| `v081c162n018` | **0.4s** | 0.7s | 1.6s | 0.7s |
+| `v128c256n100` | **0.1s** | 0.2s | 0.2s | none |
+| `v256c256n100` | **0.5s** | 1.0s | 1.6s | none |
+| `v128c1000n100` | 6.1s | **2.9s** | 2.9s | none |
+
+Fastest on seven of ten, and every proven optimum agrees. The two it loses are the
+largest, which is the same boundary the scope section describes.
 
 ## Against a commercial solver
 
