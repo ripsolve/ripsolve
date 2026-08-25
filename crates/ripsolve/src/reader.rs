@@ -86,6 +86,44 @@ fn declared_integer(text: &str) -> HashSet<String> {
 /// better objective than the true one, which is exactly what makes it hard to
 /// notice. MIPLIB's `flugpl` came back at 1167185.73 against a true optimum of
 /// 1201500 before this existed.
+/// MPS sections that change what the model means, and that the parser drops.
+///
+/// Skipping one of these does not produce an approximate answer, it produces a
+/// confident answer to a different question. `INDICATORS` is the case that found this:
+/// its rows appear in `ROWS` and `COLUMNS` like any other, and the section is what
+/// says they apply only when their binary is set. Dropping it leaves those conditional
+/// constraints standing unconditionally, and on MIPLIB's cvrpsimple2i that turned a
+/// model with optimum 34 into one ripsolve proved infeasible, in half a millisecond
+/// and with no indication anything was wrong.
+const UNSUPPORTED_SECTIONS: [&str; 6] = [
+    "INDICATORS",
+    "SOS",
+    "QUADOBJ",
+    "QMATRIX",
+    "QCMATRIX",
+    "LAZYCONS",
+];
+
+/// The first unsupported section header in an MPS file, if any.
+///
+/// Only a header in column one counts, so a row or column named for one of these is
+/// not mistaken for the section itself.
+fn unsupported_section(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if line.starts_with('*') || line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some(header) = line.split_whitespace().next() else {
+            continue;
+        };
+        let upper = header.to_ascii_uppercase();
+        if UNSUPPORTED_SECTIONS.contains(&upper.as_str()) {
+            return Some(upper);
+        }
+    }
+    None
+}
+
 fn declared_integer_mps(text: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut section = "";
@@ -147,6 +185,11 @@ pub enum ReadError {
     FractionalIntegerBound(String, f64),
     #[error("constraint {0:?} is a special ordered set, which ripsolve does not support")]
     SosConstraint(String),
+    #[error(
+        "the model has an MPS {0} section, which ripsolve does not support; \
+         solving it would mean solving a different model"
+    )]
+    UnsupportedSection(String),
 }
 
 /// Which parser to use for a model file.
@@ -185,7 +228,12 @@ impl Problem {
         // see `declared_integer`.
         let integral = match format {
             Format::Lp => declared_integer(&content),
-            Format::Mps => declared_integer_mps(&content),
+            Format::Mps => {
+                if let Some(section) = unsupported_section(&content) {
+                    return Err(ReadError::UnsupportedSection(section));
+                }
+                declared_integer_mps(&content)
+            }
         };
         Problem::from_lp_with_integrality(&lp, &integral)
     }
@@ -340,6 +388,61 @@ impl Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An MPS file whose conditional row is marked by an INDICATORS section.
+    ///
+    /// `c2` binds only when `z` is 1. Read without the section it stands
+    /// unconditionally, which is how a feasible model comes to look infeasible.
+    const INDICATOR_MPS: &str = "\
+NAME          cond
+ROWS
+ N  obj
+ G  c1
+ G  c2
+COLUMNS
+    x         obj       1.0        c1        1.0
+    y         obj       1.0        c1        1.0
+    x         c2        1.0
+    y         c2        1.0
+RHS
+    rhs       c1        1.0        c2        2.0
+BOUNDS
+ UI bnd       x         1.0
+ UI bnd       y         1.0
+ BV bnd       z
+INDICATORS
+ IF c2        z         1
+ENDATA
+";
+
+    #[test]
+    fn an_indicator_section_is_refused_rather_than_dropped() {
+        // Dropping the section does not approximate the model, it replaces it with a
+        // different one and then answers confidently. On MIPLIB's cvrpsimple2i that
+        // turned an instance with optimum 34 into a proof of infeasibility.
+        assert_eq!(
+            unsupported_section(INDICATOR_MPS).as_deref(),
+            Some("INDICATORS")
+        );
+    }
+
+    #[test]
+    fn ordinary_mps_files_are_not_mistaken_for_unsupported_ones() {
+        // Only a section header in column one counts. A row or column that happens to
+        // share a name with one must not trip the check.
+        let ordinary = "\
+NAME          plain
+ROWS
+ N  obj
+ L  SOS
+COLUMNS
+    INDICATORS  obj       1.0        SOS       1.0
+RHS
+    rhs       SOS       1.0
+ENDATA
+";
+        assert_eq!(unsupported_section(ordinary), None);
+    }
 
     fn parse(text: &str) -> Result<Problem, ReadError> {
         let lp = LpProblem::parse(text).map_err(|e| ReadError::Parse(e.to_string()))?;
