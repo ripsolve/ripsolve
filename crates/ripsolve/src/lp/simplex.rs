@@ -309,19 +309,6 @@ impl Lp {
         }
     }
 
-    /// Column `j` of `[A | -I]` as `(rows, values)`.
-    ///
-    /// Refactorization wants the sparsity, not a dense scatter — the whole point of
-    /// the LU is to touch only the nonzeros.
-    fn column_sparse(&self, j: usize) -> (Vec<usize>, Vec<f64>) {
-        if j < self.n_structural {
-            let (rows, vals) = self.matrix.column(j);
-            (rows.to_vec(), vals.to_vec())
-        } else {
-            (vec![j - self.n_structural], vec![-1.0])
-        }
-    }
-
     /// Scatter column `j` of `[A | -I]` into a dense buffer of length `m`.
     fn column_into(&self, j: usize, out: &mut [f64]) {
         out.fill(0.0);
