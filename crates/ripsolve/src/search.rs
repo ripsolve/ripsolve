@@ -496,6 +496,20 @@ impl<'a> Worker<'a> {
                 &options.heuristic_limits,
                 &mut self.iterations,
             );
+            let found = found.map(|found| {
+                let polished = heuristic::polish(
+                    problem,
+                    &mut self.lp,
+                    &solved.basis,
+                    &found.x,
+                    &options.heuristic_limits,
+                    &mut self.iterations,
+                );
+                match polished {
+                    Some(better) if better.objective < found.objective => better,
+                    _ => found,
+                }
+            });
             let improved = match found {
                 Some(found) if found.objective < incumbent => {
                     out.incumbent = Some((found.objective, found.x));
@@ -1060,6 +1074,23 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     &mut iterations,
                 )
             });
+        // Whatever produced the point, its continuous columns are still sitting where
+        // the relaxation left them. Re-optimizing them is one LP and is often worth
+        // far more than the choice of heuristic that found the integers.
+        let found = found.map(|found| {
+            let polished = heuristic::polish(
+                problem,
+                &mut lp,
+                &root.basis,
+                &found.x,
+                &options.heuristic_limits,
+                &mut iterations,
+            );
+            match polished {
+                Some(better) if better.objective < found.objective => better,
+                _ => found,
+            }
+        });
         if let Some(found) = found
             && found.objective < incumbent
         {

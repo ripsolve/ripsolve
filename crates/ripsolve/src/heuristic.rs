@@ -181,6 +181,70 @@ fn snap(problem: &Problem, x: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// How much more iteration budget a polish solve gets than a dive or pump re-solve.
+const POLISH_ITERATION_FACTOR: usize = 20;
+
+/// Re-optimize the continuous columns of an integer-feasible point.
+///
+/// Every heuristic here produces its point by moving the *integer* columns and
+/// leaving the rest where the relaxation put them. Those values were optimal for the
+/// relaxed integers, not for the ones finally chosen, so on a model that is mostly
+/// continuous the result can be far from the best solution with those integers.
+/// MIPLIB's australia-abs-cta is the case in point: 918 of its 49758 columns are
+/// integer, and the incumbent came out at 10865 against an optimum of 106.9.
+///
+/// Fixing the integers and solving the remaining LP costs one solve and gives the best
+/// completion of the choice already made. On a model with no continuous columns there
+/// is nothing to re-optimize and this returns the point unchanged.
+///
+/// `lp`'s column bounds are restored before returning, whatever the outcome.
+pub fn polish(
+    problem: &Problem,
+    lp: &mut Lp,
+    basis: &BasisState,
+    x: &[f64],
+    limits: &Limits,
+    iterations: &mut usize,
+) -> Option<Incumbent> {
+    if problem.integer_columns().count() == problem.n_cols() {
+        return None;
+    }
+    for (j, &value) in x.iter().enumerate().take(problem.n_cols()) {
+        if problem.is_integer(j) {
+            lp.set_column_bounds(j, value, value);
+        }
+    }
+    // Warm-started from the caller's basis, and given room to finish. Fixing the
+    // integers only tightens bounds, so that basis stays dual feasible and the dual
+    // simplex repairs it in far fewer pivots than a cold solve would take. The budget
+    // is per-solve limit times the dive allowance because this happens once per
+    // incumbent, not once per node, and half-finishing it wastes the whole attempt.
+    let solved = lp.solve_warm(
+        basis,
+        None,
+        limits.max_iterations_per_solve * POLISH_ITERATION_FACTOR,
+    );
+    *iterations += solved.iterations;
+    for j in 0..problem.n_cols() {
+        lp.set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
+    }
+
+    if solved.status != LpStatus::Optimal {
+        return None;
+    }
+    // The fixed columns come back as they were fixed, but rounding them again costs
+    // nothing and keeps the result exactly integral.
+    let polished = snap(problem, &solved.x);
+    if !is_feasible(problem, &polished, limits.feasibility_tolerance) {
+        return None;
+    }
+    let objective = objective_of(problem, &polished);
+    Some(Incumbent {
+        objective,
+        x: polished,
+    })
+}
+
 /// Dive from a relaxation towards a feasible binary point.
 ///
 /// `lp`'s column bounds are restored before returning, whatever the outcome, so
