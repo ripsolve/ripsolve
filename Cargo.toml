@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ripsolve", "crates/ripsolve-cli", "crates/ripsolve-py"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ripsolve/ripsolve"
@@ -12,7 +12,7 @@ keywords = ["optimization", "mip", "solver", "simplex", "linear-programming"]
 categories = ["mathematics", "science", "algorithms"]
 
 [workspace.dependencies]
-ripsolve = { path = "crates/ripsolve", version = "0.1.0" }
+ripsolve = { path = "crates/ripsolve", version = "0.1.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
