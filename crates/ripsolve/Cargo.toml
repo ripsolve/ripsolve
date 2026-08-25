@@ -1,6 +1,10 @@
 [package]
 name = "ripsolve"
-description = "A branch-and-cut solver for binary integer programs, in pure Rust."
+description = "A branch-and-cut solver for mixed-integer programs, in pure Rust. Fast on small and medium models."
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
