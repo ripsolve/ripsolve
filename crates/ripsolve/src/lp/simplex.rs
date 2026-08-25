@@ -291,6 +291,24 @@ impl Lp {
         self.n_structural + self.m
     }
 
+    /// Column `j` of `[A | -I]`, appended into caller-owned buffers.
+    ///
+    /// Refactorization needs all `m` basis columns at once, and allocating a pair of
+    /// vectors for each of them every time put a large share of the solve in the
+    /// allocator.
+    fn column_sparse_into(&self, j: usize, rows: &mut Vec<usize>, values: &mut Vec<f64>) {
+        rows.clear();
+        values.clear();
+        if j < self.n_structural {
+            let (r, v) = self.matrix.column(j);
+            rows.extend_from_slice(r);
+            values.extend_from_slice(v);
+        } else {
+            rows.push(j - self.n_structural);
+            values.push(-1.0);
+        }
+    }
+
     /// Column `j` of `[A | -I]` as `(rows, values)`.
     ///
     /// Refactorization wants the sparsity, not a dense scatter — the whole point of
@@ -426,6 +444,9 @@ struct Solver<'a> {
     status: Vec<Status>,
     /// Current value of every variable.
     z: Vec<f64>,
+    /// The basis columns, refilled in place for each refactorization so the inner
+    /// vectors keep their allocations.
+    basis_columns: Vec<(Vec<usize>, Vec<f64>)>,
     /// Scratch buffers, reused across iterations to keep the loop allocation-free.
     col: Vec<f64>,
     alpha: Vec<f64>,
@@ -485,6 +506,7 @@ impl<'a> Solver<'a> {
             basic,
             status,
             z,
+            basis_columns: Vec::new(),
             col: vec![0.0; m],
             alpha: Vec::new(),
             y: Vec::new(),
@@ -535,6 +557,7 @@ impl<'a> Solver<'a> {
             basic: start.basic.clone(),
             status,
             z,
+            basis_columns: Vec::new(),
             col: vec![0.0; m],
             alpha: Vec::new(),
             y: Vec::new(),
@@ -788,9 +811,11 @@ impl<'a> Solver<'a> {
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
         for _ in 0..lp.m + 1 {
-            let columns: Vec<(Vec<usize>, Vec<f64>)> =
-                self.basic.iter().map(|&j| lp.column_sparse(j)).collect();
-            match self.basis.refactorize(&columns, lp.tol.pivot) {
+            self.basis_columns.resize_with(lp.m, Default::default);
+            for (slot, &j) in self.basis_columns.iter_mut().zip(&self.basic) {
+                lp.column_sparse_into(j, &mut slot.0, &mut slot.1);
+            }
+            match self.basis.refactorize(&self.basis_columns, lp.tol.pivot) {
                 Ok(()) => {
                     self.factorized = true;
                     self.recompute_basic_values();

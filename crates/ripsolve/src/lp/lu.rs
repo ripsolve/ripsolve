@@ -113,6 +113,9 @@ impl Lu {
         // Reused scatter buffers, so column updates never allocate.
         let mut scatter = vec![0.0f64; m];
         let mut present = vec![false; m];
+        // Reused for every column update. Allocating one of these per touched
+        // column per elimination step put ~18% of a solve in the allocator.
+        let mut updated: Vec<(usize, f64)> = Vec::new();
 
         // Columns ordered by current nonzero count, rebuilt each step. Cheaper than
         // maintaining a priority structure at these sizes.
@@ -190,7 +193,7 @@ impl Lu {
                 let factor = alpha / pivot;
 
                 // col_j <- col_j - factor * pivot_col, with the pivot row removed.
-                let mut updated: Vec<(usize, f64)> = Vec::with_capacity(cols[j].len());
+                updated.clear();
                 for &(i, v) in &cols[j] {
                     if i == pi {
                         continue;
@@ -218,7 +221,9 @@ impl Lu {
                     }
                 }
                 row_nz[pi] -= 1;
-                cols[j] = updated;
+                // Swap rather than assign: `cols[j]`'s allocation becomes the next
+                // iteration's buffer instead of being freed.
+                std::mem::swap(&mut cols[j], &mut updated);
             }
 
             for &(i, _) in &pivot_col {
