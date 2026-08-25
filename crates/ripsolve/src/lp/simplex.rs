@@ -36,13 +36,6 @@ use crate::sparse::SparseMatrix;
 
 /// Pivots between clock checks. Small enough to bound the overrun, large enough
 /// that reading the clock does not show up in a profile.
-/// Smallest partial pricing window, and the fraction of the model to use above it.
-///
-/// Small models price in full: below this the window is the whole column set and the
-/// partial pass is skipped, which keeps their behaviour exactly as it was.
-const PARTIAL_PRICE_WINDOW: usize = 1024;
-const PARTIAL_PRICE_FRACTION: usize = 8;
-
 const CLOCK_INTERVAL: usize = 256;
 
 /// Factorizations kept per LP.
@@ -557,8 +550,6 @@ struct Solver<'a> {
     entry_hint: Entry,
     /// True when `basis` already factorizes `basic`, so entry can skip the rebuild.
     factorized: bool,
-    /// Where the next partial pricing pass starts; see [`Solver::price`].
-    price_cursor: usize,
 }
 
 /// What the ratio test decided.
@@ -616,7 +607,6 @@ impl<'a> Solver<'a> {
             rhs: vec![0.0; m],
             entry_hint: Entry::Primal,
             factorized: false,
-            price_cursor: 0,
         };
         solver.recompute_basic_values();
         solver
@@ -656,7 +646,6 @@ impl<'a> Solver<'a> {
         let mut solver = Solver {
             lp,
             basis: factors.unwrap_or_else(|| Basis::all_logical(m)),
-            price_cursor: 0,
             factorized,
             basic: start.basic.clone(),
             status,
@@ -762,36 +751,21 @@ impl<'a> Solver<'a> {
     /// faster rule but can cycle on degenerate vertices; Bland's cannot, so falling
     /// back to it guarantees termination at the cost of some speed.
     fn price(&mut self, phase_one: bool, bland: bool) -> Option<(usize, f64)> {
-        // Bland's rule has to see every column in index order for its termination
-        // guarantee, so the partial pass is skipped entirely when it is in force.
-        if bland {
-            return self.scan(0, self.lp.n_total(), phase_one, true);
-        }
-        let n = self.lp.n_total();
-        // A partial pass first. Pricing every column at every iteration is the single
-        // largest cost on a model with many more columns than rows: on MIPLIB's
-        // neos-3048764-nadi (12360 columns, 3186 rows) it was 44% of the solve, with
-        // 143 million reduced-cost evaluations for 9190 pivots. A window gives up
-        // Dantzig's exact choice, which costs some extra iterations, and buys back far
-        // more than it costs.
-        let window = PARTIAL_PRICE_WINDOW.max(n / PARTIAL_PRICE_FRACTION).min(n);
-        if window < n {
-            let found = self.scan(self.price_cursor, window, phase_one, false);
-            if found.is_some() {
-                // Resume past the winner so the next pass covers fresh columns.
-                self.price_cursor = (self.price_cursor + window) % n;
-                return found;
-            }
-        }
-        // Nothing in the window: only a full pass can distinguish "none here" from
-        // "none at all", and optimality is exactly the latter.
-        self.price_cursor = 0;
-        self.scan(0, n, phase_one, false)
+        // Every column, every iteration. Partial pricing was implemented here and
+        // reverted: sweeping a rotating window took `leo1`'s relaxation from 0.24s to
+        // 0.12s, and on MIPLIB's neos-619167 it made the solver report a feasible model
+        // infeasible. The mechanism is that a window's best candidate can have a tiny
+        // reduced cost where the global best does not, and entering on one is entering
+        // a column nearly dependent on the basis, which drives it singular. Dantzig's
+        // rule is doing double duty as a numerical safeguard, and a partial rule needs
+        // its own before it can replace that. Speed bought this way is not worth a
+        // wrong answer.
+        self.scan(0, self.lp.n_total(), phase_one, bland)
     }
 
     /// Price `count` columns starting at `start`, wrapping at the end.
     ///
-    /// Returns the best candidate found, or under `bland` the first one.
+    /// Returns the best candidate found, or under `bland` the first one that improves.
     fn scan(
         &mut self,
         start: usize,
@@ -965,22 +939,45 @@ impl<'a> Solver<'a> {
                     return Ok(());
                 }
                 Err(BasisError::Singular { row }) => {
-                    // Swap the offending position for its logical, which is always
-                    // available and keeps the basis nonsingular by construction.
-                    let logical = lp.n_structural + row;
-                    if self.basic[row] == logical {
-                        return Err(LpStatus::Infeasible);
-                    }
+                    // `row` is a *basis position*, not a model row, so the logical that
+                    // shares its index is only the first candidate. If it is already
+                    // sitting here the basis is still singular with it in place, and
+                    // any logical not currently basic will do instead.
+                    let preferred = lp.n_structural + row;
+                    let replacement = if self.basic[row] == preferred {
+                        match (0..lp.m)
+                            .map(|r| lp.n_structural + r)
+                            .find(|&l| !matches!(self.status[l], Status::Basic { .. }))
+                        {
+                            Some(l) => l,
+                            // Every logical is basic, so the basis is `-I` and cannot
+                            // be singular. Reaching this is a numerical failure, and
+                            // reporting it as infeasibility would be a proof the solver
+                            // has not got: on MIPLIB's neos-619167 that turned a
+                            // feasible model into a confident "Infeasible".
+                            None => return Err(LpStatus::IterationLimit),
+                        }
+                    } else {
+                        preferred
+                    };
                     let displaced = self.basic[row];
+                    // A free column has neither bound to park against and belongs at
+                    // zero. Sending it to `At::Upper` gives it the value infinity,
+                    // which then propagates through every solve that follows: on
+                    // MIPLIB's neos-619167, whose 1560 free columns make a singular
+                    // basis likely, that surfaced as a confident proof that a feasible
+                    // model was infeasible.
                     let at = if lp.lower[displaced].is_finite() {
                         At::Lower
-                    } else {
+                    } else if lp.upper[displaced].is_finite() {
                         At::Upper
+                    } else {
+                        At::Zero
                     };
                     self.status[displaced] = Status::NonBasic(at);
                     self.z[displaced] = lp.value_at(displaced, at);
-                    self.basic[row] = logical;
-                    self.status[logical] = Status::Basic { row };
+                    self.basic[row] = replacement;
+                    self.status[replacement] = Status::Basic { row };
                 }
             }
         }
