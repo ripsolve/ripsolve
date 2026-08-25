@@ -1080,7 +1080,20 @@ impl<'a> Solver<'a> {
         // every node in the search. MIPLIB's pk1, 86 columns, burned 100,000
         // iterations across four nodes before the caller gave up.
         const STALL_LIMIT: usize = 100;
+        // Bland's rule is a way out of a cycle, not a way to run a solve. Staying in it
+        // costs enormously on a merely degenerate model: on MIPLIB's neos-555001, 98%
+        // of 116953 pivots ran under Bland where the reference solver needs 1396
+        // pivots in total.
+        //
+        // So it is left after a short spell and re-entered if the stall resumes, each
+        // spell twice the length of the last. A model that is degenerate but not
+        // cycling pays only the short spells; one that really is cycling escalates
+        // until the spell outlasts the cycle, which is what preserves termination. A
+        // fixed short spell does not: at twenty pivots, signed_c48_r48_s3 cycled until
+        // the iteration limit.
+        const BLAND_RUN: usize = 20;
         let mut stalled = 0usize;
+        let mut bland_run = BLAND_RUN;
 
         while *iterations < max_iterations {
             // Polled rather than checked every pivot: reading the clock is not free,
@@ -1089,6 +1102,10 @@ impl<'a> Solver<'a> {
                 return Some(LpStatus::IterationLimit);
             }
             let bland = stalled > STALL_LIMIT;
+            if stalled > STALL_LIMIT + bland_run {
+                stalled = 0;
+                bland_run *= 2;
+            }
             if cutoff.is_some_and(|limit| self.objective() > limit) {
                 return Some(LpStatus::CutOff);
             }
@@ -1420,9 +1437,22 @@ impl<'a> Solver<'a> {
     ) -> (LpSolution, Vec<usize>, Basis) {
         // Degenerate (zero-length) steps in a row before switching to Bland's rule.
         const STALL_LIMIT: usize = 100;
+        // Bland's rule is a way out of a cycle, not a way to run a solve. Staying in it
+        // costs enormously on a merely degenerate model: on MIPLIB's neos-555001, 98%
+        // of 116953 pivots ran under Bland where the reference solver needs 1396
+        // pivots in total.
+        //
+        // So it is left after a short spell and re-entered if the stall resumes, each
+        // spell twice the length of the last. A model that is degenerate but not
+        // cycling pays only the short spells; one that really is cycling escalates
+        // until the spell outlasts the cycle, which is what preserves termination. A
+        // fixed short spell does not: at twenty pivots, signed_c48_r48_s3 cycled until
+        // the iteration limit.
+        const BLAND_RUN: usize = 20;
 
         let mut iterations = 0usize;
         let mut stalled = 0usize;
+        let mut bland_run = BLAND_RUN;
 
         if !self.factorized && self.refactorize().is_err() {
             return self.done(LpStatus::Infeasible, 0);
@@ -1458,6 +1488,10 @@ impl<'a> Solver<'a> {
             self.y = y;
 
             let bland = stalled > STALL_LIMIT;
+            if stalled > STALL_LIMIT + bland_run {
+                stalled = 0;
+                bland_run *= 2;
+            }
             let Some((entering, sigma)) = self.price(phase_one, bland) else {
                 // No improving column. In phase 2 that is optimality; in phase 1 it
                 // means the infeasibility cannot be reduced further, so the LP has no
