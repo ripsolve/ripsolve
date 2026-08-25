@@ -50,6 +50,9 @@ enum Command {
         /// bound but has measured slower on every model in this solver's range.
         #[arg(long, default_value_t = 0)]
         cut_rounds: usize,
+        /// Most cuts to keep per separation round.
+        #[arg(long, default_value_t = 8)]
+        cuts_per_round: usize,
         /// Worker threads; defaults to the machine's parallelism.
         #[arg(short, long)]
         threads: Option<usize>,
@@ -121,6 +124,7 @@ fn main() -> Result<()> {
             verbose,
             no_presolve,
             cut_rounds,
+            cuts_per_round,
             threads,
         } => {
             let problem =
@@ -135,6 +139,7 @@ fn main() -> Result<()> {
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
                 cut_rounds,
+                cuts_per_round,
                 ..Options::default()
             };
             let started = std::time::Instant::now();

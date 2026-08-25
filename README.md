@@ -207,6 +207,29 @@ in 21s and not proving it within 60s at all.
 `--cut-rounds N` turns them back on, and they are worth turning on for knapsack-structured
 models like `mkp_200`, where they now win outright.
 
+Two follow-ups were measured and rejected, both of which sounded better than they were.
+
+**Capping the cut count.** Since `mkp_200` wins with three cuts and everything else loses
+with twenty, an obvious reading is that cuts pay when they are cheap to carry, so a hard
+cap should make them pay generally. It does not: swept at 2, 3, 5, 8, 16 and 32 cuts per
+round, no cap beats not cutting at all (38.3s against 44.7s at the best cap), and the
+current default of 8 is already the best setting on the instance cutting wins. The reading
+was wrong about the mechanism, not just the number. A cap is not a cost knob holding the
+cuts fixed: keeping fewer rows in the first round changes the vertex the second round
+separates from, so it changes which cuts get derived. Capping at 2 yields *five* cuts on
+`mkp_200` where capping at 8 yields four -- a different and worse set, not a cheaper subset.
+
+**Orthogonality across rounds.** Selection compares candidates only against others from
+the same round, so a second-round cut nearly parallel to one already in the model passes a
+filter built to catch exactly that -- and since each round separates from the vertex the
+previous round produced, near-copies are the common case. Checking candidates against the
+held cuts too does work mechanically, dropping `v064c200` from 22 rows to 15 and
+`v064c1000n100` from 19 to 12. It is still 7% slower over the suite, with three instances
+regressing against two gains: `v128c1000n100` goes 4.0s to 5.9s and `v256c256n100` 0.31s
+to 0.43s. Two cuts sharing most of a direction still differ in the part they do not share,
+and at a 0.1 orthogonality bar that remainder is carrying more bound than the duplication
+is costing.
+
 Pseudocost branching addresses that, scoring a column by the objective degradation
 it has actually caused rather than by how fractional it looks. It is a large win on
 the hardest instances and roughly neutral elsewhere — `v081c162n018` drops from
