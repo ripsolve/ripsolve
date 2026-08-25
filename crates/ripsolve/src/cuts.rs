@@ -64,6 +64,103 @@ impl Cut {
         };
         over.max(under)
     }
+
+    /// Euclidean length of the coefficient vector.
+    fn norm(&self) -> f64 {
+        self.coefficients
+            .iter()
+            .map(|&(_, a)| a * a)
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// How far `x` sits from the violated face, in the space the LP actually moves
+    /// through.
+    ///
+    /// Raw violation is not comparable between cuts: scaling a row by ten scales its
+    /// violation by ten without cutting off any more of the polytope. Dividing by the
+    /// coefficient norm gives the Euclidean distance from `x` to the cut's hyperplane,
+    /// which is comparable, and is what makes ranking candidates meaningful.
+    pub fn efficacy(&self, x: &[f64]) -> f64 {
+        let norm = self.norm();
+        if norm <= TOL {
+            0.0
+        } else {
+            self.violation(x) / norm
+        }
+    }
+
+    /// Whether the row is active at `x` -- satisfied, but with no slack to spare.
+    pub fn is_tight(&self, x: &[f64], tolerance: f64) -> bool {
+        self.violation(x) >= -tolerance
+    }
+
+    /// Cosine of the angle between two coefficient vectors, in `[0, 1]`.
+    ///
+    /// Both coefficient lists are sorted by column, so the dot product is a merge.
+    fn cosine(&self, other: &Cut) -> f64 {
+        let (mut i, mut j, mut dot) = (0, 0, 0.0);
+        while i < self.coefficients.len() && j < other.coefficients.len() {
+            let (ci, ai) = self.coefficients[i];
+            let (cj, aj) = other.coefficients[j];
+            match ci.cmp(&cj) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    dot += ai * aj;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        let scale = self.norm() * other.norm();
+        if scale <= TOL {
+            0.0
+        } else {
+            (dot / scale).abs().min(1.0)
+        }
+    }
+}
+
+/// A cut must move `x` at least this far to earn a row in the model.
+const MIN_EFFICACY: f64 = 1e-4;
+/// Selected cuts must be at least this far from parallel to each other.
+///
+/// Two nearly parallel cuts remove nearly the same region, so the second costs a row
+/// on every subsequent LP and buys almost nothing. Gomory rows off neighbouring
+/// tableau entries are frequently near-duplicates of one another, which is where this
+/// earns its keep.
+const MIN_ORTHOGONALITY: f64 = 0.1;
+
+/// Choose which of the separated candidates are worth adding to the model.
+///
+/// Separation is generous by design -- it is cheaper to generate a cut than to decide
+/// it was not needed -- so the choice of what to *keep* is where cutting is won or
+/// lost. Candidates are ranked by efficacy and taken greedily, skipping any that is
+/// nearly parallel to one already chosen.
+pub fn select(candidates: Vec<Cut>, x: &[f64], limit: usize) -> Vec<Cut> {
+    let mut ranked: Vec<(f64, Cut)> = candidates
+        .into_iter()
+        .map(|c| (c.efficacy(x), c))
+        .filter(|&(e, _)| e >= MIN_EFFICACY)
+        .collect();
+    // Descending efficacy. Scores are finite here: `efficacy` returns 0.0 for a
+    // degenerate norm, and those are filtered out above.
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut chosen: Vec<Cut> = Vec::new();
+    for (_, cut) in ranked {
+        if chosen.len() >= limit {
+            break;
+        }
+        if chosen
+            .iter()
+            .all(|k| 1.0 - k.cosine(&cut) >= MIN_ORTHOGONALITY)
+        {
+            chosen.push(cut);
+        }
+    }
+    chosen
 }
 
 /// A row rewritten as `sum w_j y_j <= capacity`, with all weights positive.
@@ -493,6 +590,84 @@ impl Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `x <= b` over the listed columns, with unit coefficients unless given.
+    fn row(terms: &[(usize, f64)], ub: f64) -> Cut {
+        Cut {
+            coefficients: terms.to_vec(),
+            lb: f64::NEG_INFINITY,
+            ub,
+        }
+    }
+
+    #[test]
+    fn efficacy_is_invariant_to_row_scaling() {
+        // The same halfspace written twice, once scaled by ten. Raw violation scales
+        // with it; the distance from x to the face does not, which is the whole point
+        // of ranking on efficacy rather than violation.
+        let plain = row(&[(0, 1.0), (1, 1.0)], 1.0);
+        let scaled = row(&[(0, 10.0), (1, 10.0)], 10.0);
+        let x = [1.0, 1.0];
+
+        assert!((scaled.violation(&x) - 10.0 * plain.violation(&x)).abs() < 1e-12);
+        assert!((scaled.efficacy(&x) - plain.efficacy(&x)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn selection_drops_a_near_duplicate_and_keeps_a_distinct_cut() {
+        let x = [1.0, 1.0];
+        // Two nearly parallel cuts and one at right angles to both. The near-duplicate
+        // removes almost the same region as the cut before it, so it should not earn a
+        // row; the orthogonal one should.
+        let first = row(&[(0, 1.0), (1, 1.0)], 1.0);
+        let duplicate = row(&[(0, 1.0), (1, 1.001)], 1.0);
+        let orthogonal = row(&[(0, 1.0), (1, -1.0)], -0.5);
+
+        assert!(first.cosine(&duplicate) > 0.99);
+        assert!(first.cosine(&orthogonal) < 0.1);
+
+        let chosen = select(vec![first, duplicate, orthogonal], &x, 10);
+        assert_eq!(chosen.len(), 2, "the near-parallel duplicate should be cut");
+        assert!(chosen.iter().any(|c| c.coefficients[1].1 < 0.0));
+    }
+
+    #[test]
+    fn selection_ranks_by_efficacy_and_respects_the_limit() {
+        let x = [1.0, 1.0];
+        // Deep and shallow violations of two orthogonal faces. With room for one, the
+        // deeper cut is the one to keep.
+        let shallow = row(&[(0, 1.0)], 0.99);
+        let deep = row(&[(1, 1.0)], 0.1);
+        assert!(deep.efficacy(&x) > shallow.efficacy(&x));
+
+        let chosen = select(vec![shallow, deep], &x, 1);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].coefficients[0].0, 1, "kept the deeper cut");
+    }
+
+    #[test]
+    fn selection_rejects_cuts_the_point_already_satisfies() {
+        // Nothing to separate: x is inside both halfspaces, so neither is a cut.
+        let x = [0.0, 0.0];
+        let satisfied = row(&[(0, 1.0), (1, 1.0)], 1.0);
+        let barely = row(&[(0, 1.0), (1, 1.0)], 1e-12);
+
+        assert!(select(vec![satisfied, barely], &x, 10).is_empty());
+
+        // Violated, but only just. A cut this shallow moves the relaxation nowhere
+        // while costing a row in every LP beneath it, so it is not worth taking.
+        let negligible = row(&[(0, 1.0)], 1.0 - 1e-6);
+        let y = [1.0, 0.0];
+        assert!(negligible.violation(&y) > 0.0);
+        assert!(select(vec![negligible], &y, 10).is_empty());
+    }
+
+    #[test]
+    fn tightness_distinguishes_a_binding_row_from_a_slack_one() {
+        let x = [0.5, 0.5];
+        assert!(row(&[(0, 1.0), (1, 1.0)], 1.0).is_tight(&x, 1e-7));
+        assert!(!row(&[(0, 1.0), (1, 1.0)], 2.0).is_tight(&x, 1e-7));
+    }
     use crate::generate::{Kind, Spec};
     use crate::lp::{Lp, LpStatus};
     use crate::model::{RowSense, Sense};

@@ -168,6 +168,34 @@ were in place, cutting was slower on all eleven models in the target range:
 | `v081c162n009` | **0.8s** | 1.2s |
 | total, nine models | **32.1s** | 67.8s |
 
+Most of that cost turned out to be management rather than cutting. Every separated cut
+was being added, permanently: near-duplicate Gomory rows off neighbouring tableau
+entries each took a row, and a cut that stopped binding after a later round still rode
+along in every one of `mkp_200`'s seventy thousand node LPs. Three changes address it —
+candidates are ranked by **efficacy**, the distance from the relaxation optimum to the
+cut's hyperplane, which unlike raw violation does not change when a row is rescaled;
+near-parallel candidates are skipped, since the second of two cuts removing the same
+region costs a row and buys nothing; and cuts are **aged** out once they have sat slack
+for two resolves, with a final purge of everything still slack before the tree opens.
+That last one is free by construction: a row inactive at the optimum of a convex program
+is not holding the bound up, so dropping it leaves the same point optimal. The node
+counts confirm it, coming out identical across the purge to the last node.
+
+Together they cost `mkp_200` four cuts instead of dozens and take it from 48.2s to 10.1s,
+which is now *faster* than not cutting at all. Across the suite cutting went from a 2.1x
+net loss to roughly 1.15x, and the earlier failure on `markshare_4_0` is gone. It is
+still a loss, so the default does not change — but it is now close enough that the
+remaining gap is worth naming precisely.
+
+That gap is not the bound. Cutting takes `v064c200`'s root from 72.1 to 92.4 against an
+optimum of 225, closing 28% of what a commercial solver closes 62% of — and the tree
+comes out at 2716 nodes against 2690 without cuts. A materially better root bound buys
+*no* smaller tree. The most likely reading is that these cuts are tight at the root
+vertex and go slack as soon as branching fixes variables, so they stop binding exactly
+where the pruning would have to happen. If that is right, the way forward is separation
+at nodes rather than more of it at the root, and it needs the cut pool to track which
+subtree each cut was derived under.
+
 The cuts still work: they take the `v064c200` root bound from 72.1 to 95.4. They just no
 longer pay for themselves. Separation is expensive, the cuts come out dense enough to slow
 every subsequent LP, and best-bound selection had already collected most of what a better
@@ -176,9 +204,8 @@ and the search order is no longer bad. On `mkp_200` cutting even *raises* the no
 72150 to 91346. On MIPLIB's `markshare_4_0` it is the difference between proving optimality
 in 21s and not proving it within 60s at all.
 
-`--cut-rounds N` turns them back on, and they remain worth having when node count matters
-more than wall clock. Making them pay generally needs cheaper separation and selection by
-efficacy and orthogonality rather than by density alone; neither is implemented.
+`--cut-rounds N` turns them back on, and they are worth turning on for knapsack-structured
+models like `mkp_200`, where they now win outright.
 
 Pseudocost branching addresses that, scoring a column by the objective degradation
 it has actually caused rather than by how fractional it looks. It is a large win on

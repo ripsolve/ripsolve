@@ -529,6 +529,19 @@ struct Shared {
 }
 
 /// Reasons a parallel search stops early, encoded for the atomic.
+/// Consecutive slack resolves after which a cut is dropped from the model.
+///
+/// Swept over 0 (never drop) through 3 with the root budget at three rounds. Two is
+/// the best of them, though not by much: it takes `v128c1000n100` from 740 nodes to
+/// 610 and `v064c200` from 2932 to 2716, and is neutral on everything else measured.
+/// Dropping at the first slack resolve is too eager -- a cut can go slack for one
+/// round and bind again once the next round's cuts move the vertex.
+const CUT_MAX_AGE: u32 = 2;
+
+/// Row activity within this of a cut's bound counts as binding. This is a tolerance
+/// on constraint activity, which is why it is not `integrality_tolerance`.
+const CUT_SLACK_TOLERANCE: f64 = 1e-7;
+
 const STOP_NONE: usize = 0;
 const STOP_NODES: usize = 1;
 const STOP_TIME: usize = 2;
@@ -812,6 +825,14 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut root = root;
     let mut with_cuts;
     let mut problem = problem;
+
+    // The model without any cut rows. Each round rebuilds from here rather than
+    // appending to the previous round's model, which is what lets a cut leave again.
+    let base = problem.clone();
+    // Cuts currently carried in the model, each with a count of consecutive resolves
+    // it has sat slack through.
+    let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
+
     for _ in 0..options.cut_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
@@ -832,12 +853,20 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             &root.x,
             options.cuts_per_round,
         ));
+        // Separation is deliberately generous; this is where the model's row count is
+        // actually decided. Ranking by efficacy and dropping near-parallel duplicates
+        // keeps the rows that move the bound and discards the ones that only cost an
+        // LP column scan at every node below.
+        let found = cuts::select(found, &root.x, options.cuts_per_round);
         if found.is_empty() {
             break;
         }
-        with_cuts = problem.clone();
-        with_cuts.add_cuts(&found);
         cuts_added += found.len();
+        active.extend(found.into_iter().map(|c| (c, 0)));
+
+        with_cuts = base.clone();
+        let rows: Vec<cuts::Cut> = active.iter().map(|(c, _)| c.clone()).collect();
+        with_cuts.add_cuts(&rows);
 
         let mut candidate = Lp::relaxation(&with_cuts);
         candidate.set_deadline(deadline);
@@ -848,10 +877,55 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             // that does not; the bound already gained is still sound.
             break;
         }
+
+        // A cut that has gone slack is no longer shaping the relaxation, but it still
+        // costs work in every LP below it. Later rounds routinely make earlier rounds'
+        // cuts redundant, so age them out rather than accumulating.
+        for (cut, age) in &mut active {
+            if cut.is_tight(&resolved.x, CUT_SLACK_TOLERANCE) {
+                *age = 0;
+            } else {
+                *age += 1;
+            }
+        }
+        active.retain(|&(_, age)| age < CUT_MAX_AGE);
+
         reduced = with_cuts;
         problem = &reduced;
         lp = candidate;
         root = resolved;
+    }
+
+    // One last purge before the tree opens. Every remaining slack cut would otherwise
+    // be carried through every node LP for the rest of the search, and a row that is
+    // inactive at the optimum of a convex program cannot be holding the bound up:
+    // dropping it leaves the same point optimal. The re-solve is a guard against that
+    // reasoning meeting a degenerate basis, not an expectation of change.
+    if root.status == LpStatus::Optimal
+        && active
+            .iter()
+            .any(|(c, _)| !c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
+    {
+        let rows: Vec<cuts::Cut> = active
+            .iter()
+            .filter(|(c, _)| c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut trimmed = base.clone();
+        trimmed.add_cuts(&rows);
+        let mut candidate = Lp::relaxation(&trimmed);
+        candidate.set_deadline(deadline);
+        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        iterations += resolved.iterations;
+        // Keep the trimmed model only if it really did hold the bound.
+        if resolved.status == LpStatus::Optimal
+            && resolved.objective >= root.objective - 1e-9 * root.objective.abs().max(1.0)
+        {
+            reduced = trimmed;
+            problem = &reduced;
+            lp = candidate;
+            root = resolved;
+        }
     }
 
     let root_bound = root.objective;
