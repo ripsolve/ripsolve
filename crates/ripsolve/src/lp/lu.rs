@@ -245,14 +245,20 @@ impl Lu {
             row_pos[prow[k]] = k;
             col_pos[pcol[k]] = k;
         }
-        let l_cols: Vec<Vec<(usize, f64)>> = l_raw
-            .into_iter()
-            .map(|entries| entries.into_iter().map(|(i, v)| (row_pos[i], v)).collect())
-            .collect();
-        let u_rows: Vec<Vec<(usize, f64)>> = u_raw
-            .into_iter()
-            .map(|entries| entries.into_iter().map(|(j, v)| (col_pos[j], v)).collect())
-            .collect();
+        // Renumber in place. Collecting into fresh vectors here allocated 2m of
+        // them per factorization to change nothing but the indices.
+        let mut l_cols = l_raw;
+        for entries in &mut l_cols {
+            for (i, _) in entries.iter_mut() {
+                *i = row_pos[*i];
+            }
+        }
+        let mut u_rows = u_raw;
+        for entries in &mut u_rows {
+            for (j, _) in entries.iter_mut() {
+                *j = col_pos[*j];
+            }
+        }
 
         Ok(Lu {
             m,
