@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Run ripsolve over a seeded random sample of the MIPLIB 2017 benchmark set.
+"""Run ripsolve over a seeded random sample of MIPLIB 2017.
 
 The point of sampling rather than choosing is that a hand-picked set says nothing.
 An earlier pass here used ten instances recalled from memory; every one of them was
 smaller than 83% of the benchmark set, so the results could not support any claim
 about MIPLIB generally.
+
+Two lists are available. `easy` (the default, 747 instances) is the one to sample for
+a claim about this solver, because those instances are known to be closed by reference
+solvers, so a timeout is a statement about ripsolve. `benchmark` is the curated 240,
+which are hard by construction and where a timeout mostly says the instance is hard.
+
+Both solvers get sixteen threads, which is what MIPLIB's own benchmarking rules allow.
 
 Every instance in the sample is reported — including ones that fail to download,
 fail to parse, or time out. Dropping those is how a benchmark flatters itself.
@@ -12,7 +19,7 @@ fail to parse, or time out. Dropping those is how a benchmark flatters itself.
 HiGHS runs alongside as an open-source reference, both to check answers and to say
 whether a timeout is ripsolve's problem or the instance's.
 
-Usage:  bench/miplib_sample.py [count] [seconds] [seed]
+Usage:  bench/miplib_sample.py [count] [seconds] [seed] [threads] [easy|benchmark]
 """
 
 import csv
@@ -30,12 +37,25 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE = ROOT / "target" / "release" / "ripsolve"
 OUT = ROOT / "bench" / "out"
 CACHE = OUT / "miplib"
-LIST_URL = "https://miplib.zib.de/downloads/benchmark-v2.test"
+# MIPLIB publishes several lists. `easy` is the right default here: those are the
+# instances the reference solvers close within the competition's own limits, so a
+# timeout on one is a statement about this solver rather than about the instance.
+# `benchmark` is the harder curated 240, kept for when that is the question being
+# asked.
+LISTS = {
+    "easy": "https://miplib.zib.de/downloads/easy-v18.test",
+    "benchmark": "https://miplib.zib.de/downloads/benchmark-v2.test",
+}
 DATA_URL = "https://miplib.zib.de/WebData/instances/{}.mps.gz"
 
 COUNT = int(sys.argv[1]) if len(sys.argv) > 1 else 25
 LIMIT = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
 SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 20260824
+# MIPLIB's own benchmarking rules allow sixteen threads, so that is what both solvers
+# get. Running this at one thread measures something the published results are not
+# comparable to.
+THREADS = int(sys.argv[4]) if len(sys.argv) > 4 else 16
+WHICH = sys.argv[5] if len(sys.argv) > 5 else "easy"
 # Instances larger than this are recorded as skipped rather than downloaded; the
 # benchmark set reaches 40 MB compressed and the point is a survey, not a stress
 # test of the network.
@@ -43,10 +63,11 @@ MAX_DOWNLOAD = 25 * 1024 * 1024
 
 
 def instance_names():
-    path = OUT / "benchmark-v2.test"
+    url = LISTS[WHICH]
+    path = OUT / url.rsplit("/", 1)[1]
     if not path.exists():
         OUT.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(LIST_URL, path)
+        urllib.request.urlretrieve(url, path)
     return [l.strip().removesuffix(".mps.gz") for l in path.read_text().splitlines() if l.strip()]
 
 
@@ -84,7 +105,7 @@ def run_ripsolve(path):
     started = time.time()
     try:
         out = subprocess.run(
-            [str(EXE), "solve", "-t", "1", "--time-limit", str(LIMIT), str(path)],
+            [str(EXE), "solve", "-t", str(THREADS), "--time-limit", str(LIMIT), str(path)],
             capture_output=True, text=True, timeout=LIMIT * 4,
         ).stdout
     except subprocess.TimeoutExpired:
@@ -102,7 +123,8 @@ def run_highs(path):
     import highspy
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
-    h.setOptionValue("threads", 1)
+    h.setOptionValue("threads", THREADS)
+    h.setOptionValue("parallel", "on" if THREADS > 1 else "off")
     h.setOptionValue("time_limit", LIMIT)
     started = time.time()
     try:
@@ -132,7 +154,8 @@ def main():
 
     OUT.mkdir(parents=True, exist_ok=True)
     csv_path = OUT / "miplib_sample.csv"
-    print(f"{len(sample)} of {len(names)} benchmark instances, seed {SEED}, {LIMIT:.0f}s limit")
+    print(f"{len(sample)} of {len(names)} MIPLIB '{WHICH}' instances, seed {SEED}, "
+          f"{LIMIT:.0f}s limit, {THREADS} threads")
     print(f"writing {csv_path}\n")
 
     with open(csv_path, "w", newline="") as handle:

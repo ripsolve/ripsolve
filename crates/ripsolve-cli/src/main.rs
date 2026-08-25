@@ -37,8 +37,8 @@ enum Command {
         /// Stop after this many seconds.
         #[arg(long)]
         time_limit: Option<f64>,
-        /// Stop once the relative optimality gap reaches this.
-        #[arg(long, default_value_t = 0.0)]
+        /// Relative optimality gap to stop at. 0 demands a proof of optimality.
+        #[arg(long, default_value_t = 1e-4)]
         gap: f64,
         /// Print the value of every column.
         #[arg(short, long)]

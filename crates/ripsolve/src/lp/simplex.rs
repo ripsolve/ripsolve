@@ -36,6 +36,13 @@ use crate::sparse::SparseMatrix;
 
 /// Pivots between clock checks. Small enough to bound the overrun, large enough
 /// that reading the clock does not show up in a profile.
+/// Smallest partial pricing window, and the fraction of the model to use above it.
+///
+/// Small models price in full: below this the window is the whole column set and the
+/// partial pass is skipped, which keeps their behaviour exactly as it was.
+const PARTIAL_PRICE_WINDOW: usize = 1024;
+const PARTIAL_PRICE_FRACTION: usize = 8;
+
 const CLOCK_INTERVAL: usize = 256;
 
 /// Factorizations kept per LP.
@@ -61,6 +68,13 @@ pub struct Tolerances {
     /// Trades two costs against each other: every solve replays the whole eta file,
     /// so a long interval makes solves expensive, while refactorizing is a fixed
     /// cost amortized over the interval.
+    ///
+    /// The balance moves with the row count, because refactorizing is `O(m * fill)`
+    /// while replaying an eta is closer to the width of one column. Fifty was tuned on
+    /// models of a few hundred rows, where an LP finishes in under a hundred pivots
+    /// and the interval never binds. On MIPLIB's neos-3048764-nadi (3186 rows) it made
+    /// factorization a third of the solve: raising it to two hundred takes that LP
+    /// from 1.75s to 1.09s and leaves every small model unchanged.
     pub refactor_interval: usize,
 }
 
@@ -70,7 +84,7 @@ impl Default for Tolerances {
             primal_feasibility: 1e-7,
             dual_feasibility: 1e-7,
             pivot: 1e-9,
-            refactor_interval: 50,
+            refactor_interval: 200,
         }
     }
 }
@@ -543,6 +557,8 @@ struct Solver<'a> {
     entry_hint: Entry,
     /// True when `basis` already factorizes `basic`, so entry can skip the rebuild.
     factorized: bool,
+    /// Where the next partial pricing pass starts; see [`Solver::price`].
+    price_cursor: usize,
 }
 
 /// What the ratio test decided.
@@ -600,6 +616,7 @@ impl<'a> Solver<'a> {
             rhs: vec![0.0; m],
             entry_hint: Entry::Primal,
             factorized: false,
+            price_cursor: 0,
         };
         solver.recompute_basic_values();
         solver
@@ -639,6 +656,7 @@ impl<'a> Solver<'a> {
         let mut solver = Solver {
             lp,
             basis: factors.unwrap_or_else(|| Basis::all_logical(m)),
+            price_cursor: 0,
             factorized,
             basic: start.basic.clone(),
             status,
@@ -744,11 +762,50 @@ impl<'a> Solver<'a> {
     /// faster rule but can cycle on degenerate vertices; Bland's cannot, so falling
     /// back to it guarantees termination at the cost of some speed.
     fn price(&mut self, phase_one: bool, bland: bool) -> Option<(usize, f64)> {
+        // Bland's rule has to see every column in index order for its termination
+        // guarantee, so the partial pass is skipped entirely when it is in force.
+        if bland {
+            return self.scan(0, self.lp.n_total(), phase_one, true);
+        }
+        let n = self.lp.n_total();
+        // A partial pass first. Pricing every column at every iteration is the single
+        // largest cost on a model with many more columns than rows: on MIPLIB's
+        // neos-3048764-nadi (12360 columns, 3186 rows) it was 44% of the solve, with
+        // 143 million reduced-cost evaluations for 9190 pivots. A window gives up
+        // Dantzig's exact choice, which costs some extra iterations, and buys back far
+        // more than it costs.
+        let window = PARTIAL_PRICE_WINDOW.max(n / PARTIAL_PRICE_FRACTION).min(n);
+        if window < n {
+            let found = self.scan(self.price_cursor, window, phase_one, false);
+            if found.is_some() {
+                // Resume past the winner so the next pass covers fresh columns.
+                self.price_cursor = (self.price_cursor + window) % n;
+                return found;
+            }
+        }
+        // Nothing in the window: only a full pass can distinguish "none here" from
+        // "none at all", and optimality is exactly the latter.
+        self.price_cursor = 0;
+        self.scan(0, n, phase_one, false)
+    }
+
+    /// Price `count` columns starting at `start`, wrapping at the end.
+    ///
+    /// Returns the best candidate found, or under `bland` the first one.
+    fn scan(
+        &mut self,
+        start: usize,
+        count: usize,
+        phase_one: bool,
+        bland: bool,
+    ) -> Option<(usize, f64)> {
         let tol = self.lp.tol.dual_feasibility;
+        let n = self.lp.n_total();
         let mut best: Option<(usize, f64)> = None;
         let mut best_score = 0.0;
 
-        for j in 0..self.lp.n_total() {
+        for step in 0..count {
+            let j = if start == 0 { step } else { (start + step) % n };
             let Status::NonBasic(at) = self.status[j] else {
                 continue;
             };

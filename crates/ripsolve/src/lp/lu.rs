@@ -118,16 +118,66 @@ impl Lu {
         // column per elimination step put ~18% of a solve in the allocator.
         let mut updated: Vec<(usize, f64)> = Vec::new();
 
-        // Columns ordered by current nonzero count, rebuilt each step. Cheaper than
-        // maintaining a priority structure at these sizes.
-        let mut order: Vec<usize> = (0..m).collect();
+        // Columns bucketed by nonzero count, so the search reaches the sparsest few
+        // without ordering the rest.
+        //
+        // Sorting every remaining column at every step, which is what this replaced,
+        // costs `O(m^2 log m)` over a factorization and exists only to read off the
+        // first `MAX_COLUMN_SEARCH` entries. On a 3186-row basis that was a third of
+        // the solve. Entries are left in place when a column's length changes and
+        // skipped on the way past, so an update costs a push rather than a search.
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); m + 1];
+        let mut col_len: Vec<usize> = (0..m).map(|j| cols[j].len()).collect();
+        for j in 0..m {
+            buckets[col_len[j].min(m)].push(j);
+        }
+        // Reused across steps so the shortlist does not allocate per pivot.
+        let mut shortlist: Vec<usize> = Vec::with_capacity(MAX_COLUMN_SEARCH);
+        // Lower bound on any live column's length. Scanning from zero each step would
+        // walk `m` empty buckets per pivot and cost exactly what the sort did.
+        // Elimination can only shorten a column by removing the pivot row, so this
+        // moves down by one at a time and is corrected on the way past.
+        let mut min_len = 0usize;
 
         for _step in 0..m {
-            order.retain(|&j| !col_done[j]);
-            order.sort_by_key(|&j| cols[j].len());
+            shortlist.clear();
+            let mut shortest_live = None;
+            let mut first_live_len = None;
+            // Indexing rather than iterating because the loop compacts the bucket it
+            // is reading, which an iterator would hold borrowed.
+            #[allow(clippy::needless_range_loop)]
+            'buckets: for len in min_len..=m {
+                let mut keep = 0;
+                for pos in 0..buckets[len].len() {
+                    let j = buckets[len][pos];
+                    // Stale entry: the column has since been pivoted out, or moved to
+                    // another bucket.
+                    if col_done[j] || col_len[j] != len {
+                        continue;
+                    }
+                    buckets[len][keep] = j;
+                    keep += 1;
+                    if shortest_live.is_none() {
+                        shortest_live = Some(j);
+                    }
+                    if shortlist.len() < MAX_COLUMN_SEARCH {
+                        shortlist.push(j);
+                    }
+                }
+                // Compact this bucket so the stale entries are not walked again.
+                buckets[len].truncate(keep);
+                if keep > 0 && first_live_len.is_none() {
+                    first_live_len = Some(len);
+                }
+                if shortlist.len() >= MAX_COLUMN_SEARCH {
+                    break 'buckets;
+                }
+            }
+            // Every bucket below the first live one is now known empty.
+            min_len = first_live_len.unwrap_or(min_len);
 
             let mut best: Option<(usize, usize, f64, usize)> = None; // (row, col, value, cost)
-            for (examined, &j) in order.iter().enumerate() {
+            for (examined, &j) in shortlist.iter().enumerate() {
                 if cols[j].is_empty() {
                     return Err(Singular { position: j });
                 }
@@ -153,7 +203,9 @@ impl Lu {
             }
 
             let Some((pi, pj, pivot, _)) = best else {
-                let position = order.first().copied().unwrap_or(0);
+                // The sparsest column still active is the one to report, matching what
+                // the caller repairs by swapping in a logical.
+                let position = shortest_live.unwrap_or(0);
                 return Err(Singular { position });
             };
 
@@ -225,6 +277,12 @@ impl Lu {
                 // Swap rather than assign: `cols[j]`'s allocation becomes the next
                 // iteration's buffer instead of being freed.
                 std::mem::swap(&mut cols[j], &mut updated);
+                if cols[j].len() != col_len[j] {
+                    col_len[j] = cols[j].len();
+                    let bucket = col_len[j].min(m);
+                    buckets[bucket].push(j);
+                    min_len = min_len.min(bucket);
+                }
             }
 
             for &(i, _) in &pivot_col {
