@@ -233,3 +233,37 @@ fn mps_integrality_survives_the_parser() {
         "markers.mps",
     );
 }
+
+#[test]
+fn a_feasible_relaxation_is_not_reported_infeasible() {
+    // Regression, and a reminder of what the unit tests do not reach.
+    //
+    // An optimization to the LU pivot search — selecting the shortest columns
+    // instead of sorting all of them — changed which pivots were chosen, and on
+    // this model the resulting factorization was poor enough that phase 1 gave up
+    // and declared a feasible LP infeasible. Every one of the 130-odd tests passed,
+    // because none of them factorizes a basis big enough to care which pivots it
+    // picks.
+    //
+    // "Infeasible" is the most dangerous wrong answer available: it is a confident
+    // claim that prunes a model out of existence rather than merely costing time.
+    use ripsolve::lp::{Lp, LpStatus};
+
+    let problem = Problem::from_file(&samples_dir().join("mip/lu_pivot_regression.mps")).unwrap();
+    assert!(
+        problem.n_cols() > 200,
+        "the model must be big enough to exercise pivoting"
+    );
+
+    let solved = Lp::relaxation(&problem).solve();
+    assert_eq!(
+        solved.status,
+        LpStatus::Optimal,
+        "the relaxation of this model is feasible; an independent solver puts it at -1216923.27"
+    );
+    let value = problem.objective_value(solved.objective);
+    assert!(
+        (value - -1216923.270104403).abs() < 1e-3,
+        "relaxation is {value}, expected -1216923.27"
+    );
+}
