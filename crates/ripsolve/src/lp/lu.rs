@@ -96,38 +96,16 @@ impl Lu {
         let mut scatter = vec![0.0f64; m];
         let mut present = vec![false; m];
 
-        // The still-active columns, compacted as they are eliminated.
+        // Columns ordered by current nonzero count, rebuilt each step. Cheaper than
+        // maintaining a priority structure at these sizes.
         let mut order: Vec<usize> = (0..m).collect();
-        // The few shortest of them, refilled each step.
-        let mut shortlist: Vec<(usize, usize)> = Vec::with_capacity(MAX_COLUMN_SEARCH);
 
         for _step in 0..m {
             order.retain(|&j| !col_done[j]);
-
-            // Select the shortest few columns rather than sorting all of them.
-            //
-            // This was a full sort at every one of the m elimination steps, which is
-            // O(m * n log n) per factorization. It did not show on small models and
-            // dominated everything else on real ones: profiling a 3904-row instance
-            // put 60% of the entire solve in that one sort. Only MAX_COLUMN_SEARCH
-            // columns are ever examined, so sorting the rest was pure waste.
-            shortlist.clear();
-            for &j in &order {
-                let len = cols[j].len();
-                if shortlist.len() == MAX_COLUMN_SEARCH && len >= shortlist[MAX_COLUMN_SEARCH - 1].1
-                {
-                    continue;
-                }
-                let at = shortlist
-                    .iter()
-                    .position(|&(_, l)| len < l)
-                    .unwrap_or(shortlist.len());
-                shortlist.insert(at, (j, len));
-                shortlist.truncate(MAX_COLUMN_SEARCH);
-            }
+            order.sort_by_key(|&j| cols[j].len());
 
             let mut best: Option<(usize, usize, f64, usize)> = None; // (row, col, value, cost)
-            for (examined, &(j, _)) in shortlist.iter().enumerate() {
+            for (examined, &j) in order.iter().enumerate() {
                 if cols[j].is_empty() {
                     return Err(Singular { position: j });
                 }
