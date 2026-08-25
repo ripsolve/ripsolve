@@ -5,6 +5,11 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+# The integration tests read model files from the repository's samples directory,
+# which sits outside this package. Shipping them would hand every consumer a
+# `cargo test` that fails on missing paths, so they stay in the repository where
+# they work. The unit tests inside src/ are published and run normally.
+exclude = ["tests/**"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
