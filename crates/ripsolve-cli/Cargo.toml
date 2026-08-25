@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface to the ripsolve mixed-integer programming solver."
+keywords.workspace = true
+categories = ["command-line-utilities", "mathematics", "science"]
+readme = "README.md"
 
 [[bin]]
 name = "ripsolve"

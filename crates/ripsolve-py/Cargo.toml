@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# A CPython extension module, not a Rust library: it is built by python/build.sh
+# and imported by the interpreter, so there is nothing here for a Rust consumer.
+publish = false
 
 [lib]
 # Named for the module Python will import; `cdylib` because CPython loads it as a
