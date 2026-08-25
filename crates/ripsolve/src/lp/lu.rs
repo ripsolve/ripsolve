@@ -523,3 +523,270 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    /// SplitMix64, so a failure is reproducible from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn value(&mut self) -> f64 {
+            let v = (self.next() % 2001) as f64 / 100.0 - 10.0;
+            if v.abs() < 0.5 { 1.0 } else { v }
+        }
+    }
+
+    /// A basis shaped like one the simplex actually holds: mostly unit columns from
+    /// logical variables, with a minority of sparse structural columns mixed in.
+    ///
+    /// Structure is the point. A dense random matrix makes every pivot choice
+    /// equivalent, so it cannot distinguish a good Markowitz search from a bad one.
+    fn realistic_basis(
+        m: usize,
+        structural: usize,
+        per_column: usize,
+        seed: u64,
+    ) -> Vec<(Vec<usize>, Vec<f64>)> {
+        let mut rng = Rng(seed);
+        let mut columns: Vec<(Vec<usize>, Vec<f64>)> =
+            (0..m).map(|i| (vec![i], vec![-1.0])).collect();
+        for _ in 0..structural {
+            let target = rng.below(m);
+            let mut rows: Vec<usize> = Vec::new();
+            // Keep the diagonal entry so the basis stays comfortably nonsingular.
+            rows.push(target);
+            for _ in 0..per_column.saturating_sub(1) {
+                let r = rng.below(m);
+                if !rows.contains(&r) {
+                    rows.push(r);
+                }
+            }
+            let mut pairs: Vec<(usize, f64)> = rows.into_iter().map(|r| (r, rng.value())).collect();
+            pairs.sort_unstable_by_key(|&(r, _)| r);
+            // A strong diagonal keeps the basis well conditioned, so a residual this
+            // test rejects is the factorization's fault and not the matrix's.
+            for (r, v) in &mut pairs {
+                if *r == target {
+                    *v = 25.0;
+                }
+            }
+            columns[target] = (
+                pairs.iter().map(|&(r, _)| r).collect(),
+                pairs.iter().map(|&(_, v)| v).collect(),
+            );
+        }
+        columns
+    }
+
+    fn dense_column(m: usize, column: &(Vec<usize>, Vec<f64>)) -> Vec<f64> {
+        let mut out = vec![0.0; m];
+        for (&r, &v) in column.0.iter().zip(&column.1) {
+            out[r] = v;
+        }
+        out
+    }
+
+    /// The largest relative residual of `B (B^-1 a) = a` over random right-hand
+    /// sides — how much accuracy the factorization actually delivers.
+    ///
+    /// Checking that a solve *runs* says nothing. A factorization built on bad
+    /// pivots still produces numbers; they are simply wrong enough, far enough
+    /// downstream, to make the simplex conclude something false.
+    fn worst_residual(m: usize, columns: &[(Vec<usize>, Vec<f64>)], lu: &Lu) -> f64 {
+        let dense: Vec<Vec<f64>> = columns.iter().map(|c| dense_column(m, c)).collect();
+        let mut rng = Rng(99);
+        let mut worst: f64 = 0.0;
+        let mut d = Vec::new();
+        for _ in 0..3 {
+            let a: Vec<f64> = (0..m).map(|_| rng.value()).collect();
+            lu.ftran(&a, &mut d);
+            let scale = a.iter().fold(0.0f64, |acc, v| acc.max(v.abs())).max(1.0);
+            for i in 0..m {
+                let got: f64 = (0..m).map(|p| dense[p][i] * d[p]).sum();
+                worst = worst.max((got - a[i]).abs() / scale);
+            }
+        }
+        worst
+    }
+
+    /// Coefficients spanning `10^spread` either side of one, which is what makes a
+    /// basis hard to factorize accurately. A matrix of ones and twos does not
+    /// distinguish a good factorization from a bad one.
+    fn spread_basis(
+        m: usize,
+        structural: usize,
+        per_column: usize,
+        spread: f64,
+        seed: u64,
+    ) -> Vec<(Vec<usize>, Vec<f64>)> {
+        let mut rng = Rng(seed);
+        let mut columns: Vec<(Vec<usize>, Vec<f64>)> =
+            (0..m).map(|i| (vec![i], vec![-1.0])).collect();
+        for _ in 0..structural {
+            let target = rng.below(m);
+            let mut rows = vec![target];
+            for _ in 0..per_column.saturating_sub(1) {
+                let r = rng.below(m);
+                if !rows.contains(&r) {
+                    rows.push(r);
+                }
+            }
+            let mut pairs: Vec<(usize, f64)> = rows
+                .into_iter()
+                .map(|r| {
+                    let exponent = ((rng.next() % 2001) as f64 / 1000.0 - 1.0) * spread;
+                    let magnitude = 10f64.powf(exponent);
+                    (
+                        r,
+                        if rng.next().is_multiple_of(2) {
+                            magnitude
+                        } else {
+                            -magnitude
+                        },
+                    )
+                })
+                .collect();
+            pairs.sort_unstable_by_key(|&(r, _)| r);
+            columns[target] = (
+                pairs.iter().map(|&(r, _)| r).collect(),
+                pairs.iter().map(|&(_, v)| v).collect(),
+            );
+        }
+        columns
+    }
+
+    #[test]
+    fn stays_accurate_on_a_basis_large_enough_for_pivoting_to_matter() {
+        // The gap this closes: every other LU test here uses a handful of rows,
+        // where any pivot order works and a Markowitz search cannot be wrong. A
+        // change to pivot selection once passed the whole suite and then reported a
+        // feasible LP infeasible on a 402-row model.
+        //
+        // Checked as a *residual*, not as "the solve ran". A factorization built on
+        // bad pivots still returns numbers; they are simply wrong enough, far enough
+        // downstream, for the simplex to conclude something false.
+        for (m, structural) in [(200, 60), (500, 150), (900, 250)] {
+            let columns = spread_basis(m, structural, 8, 0.5, 7 + m as u64);
+            let lu = Lu::factor(m, &columns, 1e-12).unwrap_or_else(|e| panic!("m = {m}: {e:?}"));
+            let residual = worst_residual(m, &columns, &lu);
+            assert!(
+                residual < 1e-7,
+                "m = {m}: residual {residual:.3e} — the factorization is losing accuracy"
+            );
+        }
+    }
+
+    /// What the factorization does as the data gets worse conditioned.
+    ///
+    /// Not an assertion of quality — a record of a known limitation, measured. The
+    /// factorization has no scaling step, so accuracy tracks the spread of the
+    /// coefficients directly:
+    ///
+    /// | coefficient range | residual |
+    /// |---|---|
+    /// | 1x        | 6e-14 |
+    /// | 10x       | 6e-10 |
+    /// | 100x      | 7e-8  |
+    /// | 1000x     | 2e-3  |
+    /// | 10000x    | 9e0   |
+    ///
+    /// By a range of 1e4 the result is meaningless, and real models routinely carry
+    /// 1e4 to 1e6. Equilibrating the matrix before factorizing is the standard
+    /// remedy and is not implemented. This test asserts only the part that holds
+    /// today, so the boundary is recorded rather than assumed away.
+    #[test]
+    fn accuracy_tracks_how_badly_scaled_the_data_is() {
+        let m = 400;
+        let well = worst_residual(
+            m,
+            &spread_basis(m, 120, 8, 0.0, 3),
+            &Lu::factor(m, &spread_basis(m, 120, 8, 0.0, 3), 1e-12).unwrap(),
+        );
+        assert!(
+            well < 1e-10,
+            "uniform coefficients should factorize cleanly, got {well:.3e}"
+        );
+
+        // And the documented failure, so a future scaling step has something to beat.
+        let bad_columns = spread_basis(m, 120, 8, 2.0, 3);
+        let bad = worst_residual(
+            m,
+            &bad_columns,
+            &Lu::factor(m, &bad_columns, 1e-12).unwrap(),
+        );
+        assert!(
+            bad > well,
+            "a 1e4 coefficient range is expected to be worse than a uniform one; \
+             if this fails, scaling has been added and the bound above should be tightened"
+        );
+    }
+
+    #[test]
+    fn markowitz_keeps_fill_bounded_at_scale() {
+        // What the pivot search is *for*. A search that picks poorly still produces
+        // a usable factorization on a small matrix, and buries the solver in fill on
+        // a real one, so this is checked where the difference shows.
+        for (m, structural) in [(300, 90), (800, 240)] {
+            let columns = spread_basis(m, structural, 8, 0.5, 11 + m as u64);
+            let original: usize = columns.iter().map(|c| c.0.len()).sum();
+            let lu = Lu::factor(m, &columns, 1e-12).unwrap();
+            assert!(
+                lu.nnz() < 6 * original,
+                "m = {m}: {} nonzeros from {original} — fill has blown up",
+                lu.nnz()
+            );
+        }
+    }
+
+    #[test]
+    fn accuracy_survives_a_long_run_of_updates() {
+        // The product-form file grows between refactorizations, and its error grows
+        // with it. This is the regime the simplex spends its life in.
+        let m = 400;
+        let mut columns = realistic_basis(m, 120, 8, 31);
+        let mut basis = crate::lp::basis::Basis::all_logical(m);
+        basis.refactorize(&columns, 1e-9).unwrap();
+
+        let mut rng = Rng(5);
+        for step in 0..60 {
+            let position = rng.below(m);
+            let replacement = realistic_basis(m, 1, 6, 100 + step)[0].clone();
+            let dense = dense_column(m, &replacement);
+            let mut d = Vec::new();
+            basis.ftran(&dense, &mut d);
+            // Skip a pivot too small to be safe, exactly as the simplex would.
+            if d[position].abs() < 1e-7 {
+                continue;
+            }
+            basis.update(&d, position);
+            columns[position] = replacement;
+        }
+
+        // B^-1 B must still be the identity after all of that.
+        let dense: Vec<Vec<f64>> = columns.iter().map(|c| dense_column(m, c)).collect();
+        let mut out = Vec::new();
+        let mut worst: f64 = 0.0;
+        for (j, column) in dense.iter().enumerate() {
+            basis.ftran(column, &mut out);
+            for (i, &got) in out.iter().enumerate() {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                worst = worst.max((got - expected).abs());
+            }
+        }
+        assert!(
+            worst < 1e-6,
+            "after 60 updates the inverse is off by {worst:.3e}"
+        );
+    }
+}
