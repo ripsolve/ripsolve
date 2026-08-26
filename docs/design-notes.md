@@ -207,6 +207,41 @@ hits its time limit reports a worse one, with `mkp_500` ending at a 3% gap rathe
 than 1%. It also holds every unexplored node in memory, where plunging keeps the open
 set to roughly the tree depth. `plunge_limit` exists to raise when that binds.
 
+### Diving, and why the default is still zero
+
+MIPLIB's `graphdraw-gemcutter` is 166 columns and 474 rows, and the reference solver
+closes it in 6.5 seconds where this one does not close it at all. It is small enough
+that the failure is worth understanding.
+
+The relaxation is not the problem: both solvers get 4310.0 against an optimum of 7118.5.
+The failure is primal. Pure best-bound finishes 85% above the optimum, at 13176, and the
+bound has crawled to 4926 after 107902 nodes.
+
+Diving fixes the primal side and nothing else:
+
+| dive length | incumbent |
+|---|---:|
+| none (pure best-bound) | 13176.5 |
+| 10 | 9369.5 |
+| 50 | 7893.5 |
+
+and it costs the dense binary models 2 to 4x: `v081c162n009` goes from 0.62s to 2.40s,
+`v064c064` from 0.03s to 0.13s. The two families want opposite things.
+
+An adaptive dive length was implemented to have both: dive while dives are finding
+incumbents, back off when they are not, with a periodic full-length probe so a model
+that needs long dives can still discover it. It protects the dense models almost
+completely, and it does not work well enough to keep. Part of the gain is lost, 8336
+against 7893 at the same ceiling, because the models that need diving need it
+*sustained*, and a rule that withdraws it after an unproductive dive is withdrawing it
+from exactly the models it was meant for. Diving also never closes `graphdraw-gemcutter`
+at any setting, so the cost to the target class bought no additional solved instance.
+
+`plunge_limit` therefore stays at zero and stays a fixed length when set, so a caller
+who asks for diving gets what they asked for. The finding this leaves behind is that the
+gap on models like this one is a primal-heuristic gap, not a search-order gap: diving
+helps only because it is acting as a heuristic, and the honest fix is a better heuristic.
+
 ## Branching
 
 Pseudocost branching scores a column by the objective degradation it has actually
