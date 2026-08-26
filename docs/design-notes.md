@@ -356,14 +356,44 @@ per column on `piperout-27`, so a reduced cost is a two-element dot product and 
 one from an array is barely cheaper than computing it. And against that, maintaining
 them adds a BTRAN, a row-wise product and pattern bookkeeping to every pivot.
 
+### Devex pricing
+
+Devex attacks the other axis: not the cost of an iteration but how many are needed. It
+scores a column by `d^2 / w`, where the reference weight `w` approximates how far the
+objective actually moves per unit of the step, so that pricing stops preferring columns
+that look steep only because they are badly scaled and then move almost nowhere.
+
+It was implemented, with the pivot row read the cheap way described above and a
+reference framework that restarts when the weights drift above the true column norm.
+The result is a coin flip with a bad tail:
+
+| | Dantzig | devex |
+|---|---:|---:|
+| `nursesched-sprint02` | 20167 pivots, 15.5s | 10000 pivots, 7.9s |
+| `hypothyroid-k1` | over 200s | 92.8s |
+| `v064c200` | 59 pivots | 46 pivots |
+| `neos-555001` | 3955 pivots, 0.47s | 4376 pivots, 0.73s |
+| `piperout-27` | 15679 pivots, 27.5s | 16107 pivots, 38.6s |
+| `neos-3075395-nile` | 30827 pivots, 24s | over 200s |
+
+Halving the pivots on one model and turning a 24 second solve into a timeout on another
+is not something to ship, even behind an option, while the reason for the bad case is
+unknown. What is known is that the first attempt was far worse still, 3955 pivots to
+24299, because the weights only ever grow and nothing restarted the framework; and that
+the drift check has to be periodic, since a pass over `alpha` on every pivot costs more
+at 27756 rows than the rule saves. Neither of those explains `nile`, which stayed slow
+with both fixed.
+
 Taken with the sparse-solve result, the picture is that the LP here is near a local
 optimum for the models it sees. The classical sparse-simplex techniques all trade
 per-column arithmetic for bookkeeping, and on a matrix this sparse there is not enough
 per-column arithmetic left to trade. Getting further would mean changing what is
-computed rather than how: partial or devex pricing so that `O(n)` per iteration stops
-being paid at all, which is the one direction not yet tried properly, the earlier
-partial pricing attempt having been reverted for returning a wrong answer rather than
-for being slow.
+computed rather than how, and both attempts in that direction have now failed for
+different reasons: partial pricing returned a wrong answer, and devex is unpredictable.
+What they share is that both give up Dantzig's rule, which is doing more work here than
+choosing a column: it is also the reason the chosen column is numerically safe, and the
+reason the iteration count is stable across models. A replacement needs to supply both,
+not just a better score.
 
 One smaller thing was measured and rejected on the way. Both solves allocated an
 `m`-length buffer per call, which on `neos-555001` is 128000 allocations of 27KB and
