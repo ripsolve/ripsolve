@@ -11,6 +11,11 @@ a claim about this solver, because those instances are known to be closed by ref
 solvers, so a timeout is a statement about ripsolve. `benchmark` is the curated 240,
 which are hard by construction and where a timeout mostly says the instance is hard.
 
+The reference solver runs first, and an instance it cannot close within the same budget
+is skipped rather than scored: a timeout on both sides measures the instance, not this
+solver. Its answers are cached in `bench/out/miplib_oracle.json`, keyed by instance,
+limit and thread count, so re-running a survey costs only ripsolve's time.
+
 Both solvers get sixteen threads, which is what MIPLIB's own benchmarking rules allow.
 
 Every instance in the sample is reported — including ones that fail to download,
@@ -19,10 +24,11 @@ fail to parse, or time out. Dropping those is how a benchmark flatters itself.
 HiGHS runs alongside as an open-source reference, both to check answers and to say
 whether a timeout is ripsolve's problem or the instance's.
 
-Usage:  bench/miplib_sample.py [count] [seconds] [seed] [threads] [easy|benchmark] [all]
+Usage:  bench/miplib_sample.py [count] [seconds] [seed] [threads] [easy|benchmark]
 """
 
 import csv
+import json
 import gzip
 import pathlib
 import random
@@ -56,8 +62,6 @@ SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 20260824
 # comparable to.
 THREADS = int(sys.argv[4]) if len(sys.argv) > 4 else 16
 WHICH = sys.argv[5] if len(sys.argv) > 5 else "easy"
-# `all` keeps the instances neither solver closes; by default they are skipped.
-KEEP_ALL = len(sys.argv) > 6 and sys.argv[6] == "all"
 # Instances whose reference answer could not be pinned down, and so cannot score
 # anything. Excluding one needs a reason that is about the instance, never about how
 # ripsolve does on it.
@@ -67,17 +71,6 @@ EXCLUDED = {
     # answer of 3.6199 is very likely wrong, and is tracked separately; it is not the
     # reason this instance is dropped.
     "neos-619167": "no stable reference objective",
-}
-
-# Instances where the reference solver also runs out of time. They cost two minutes
-# each and say nothing: a timeout on both sides measures the instance, not the solver.
-# Recorded from the run of 2026-08-25 and skipped unless `all` is passed as the sixth
-# argument, so that a genuine improvement can still be checked against them.
-NOT_DISCRIMINATING = {
-    "bmoipr2", "graphdraw-gemcutter", "leo1", "n9-3", "neos-3075395-nile",
-    "neos-4754521-awarau", "neos-5104907-jarama", "neos-5106984-jizera",
-    "neos-520729", "neos-555343", "neos-631710", "neos-829552", "pg5_34",
-    "supportcase40",
 }
 
 # Instances larger than this are recorded as skipped rather than downloaded; the
@@ -143,32 +136,74 @@ def run_ripsolve(path):
             "nodes": grab(r"(\d+) nodes"), "seconds": seconds}
 
 
-def run_highs(path):
-    import highspy
-    h = highspy.Highs()
-    h.setOptionValue("output_flag", False)
-    h.setOptionValue("threads", THREADS)
-    h.setOptionValue("parallel", "on" if THREADS > 1 else "off")
-    h.setOptionValue("time_limit", LIMIT)
+ORACLE_CACHE = OUT / "miplib_oracle.json"
+
+
+def load_oracle_cache():
+    if ORACLE_CACHE.exists():
+        try:
+            return json.loads(ORACLE_CACHE.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def run_oracle(name, path, cache):
+    """What the reference solver makes of this instance, from cache when possible.
+
+    An instance's answer does not change, so the only reason to re-run is a different
+    budget. The key carries the limit and the thread count for that reason, and nothing
+    else: a cache that silently answers for the wrong budget is worse than no cache.
+
+    Reported as `reference` rather than by name. The licence in use here is an academic
+    one, and rather than read its terms as permission to publish benchmarks under the
+    solver's name, the published output omits it.
+    """
+    key = f"{name}|{LIMIT:g}|{THREADS}"
+    if key in cache:
+        hit = dict(cache[key])
+        hit["cached"] = True
+        return hit
+
+    import gurobipy as gp
+
     started = time.time()
     try:
-        h.readModel(str(path))
-        h.run()
-    except Exception:
-        return {"status": "error", "obj": "", "seconds": round(time.time() - started, 1)}
-    seconds = round(time.time() - started, 1)
-    solved = str(h.getModelStatus()).endswith("kOptimal")
-    info = h.getInfo()
-    got = getattr(info, "primal_solution_status", 0)
-    obj = h.getObjectiveValue() if got else None
-    return {"status": "optimal" if solved else "limit",
-            "obj": f"{obj:.6g}" if obj is not None else "", "seconds": seconds}
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 0)
+        env.start()
+        m = gp.read(str(path), env)
+        m.setParam("Threads", THREADS)
+        m.setParam("TimeLimit", LIMIT)
+        m.optimize()
+        proven = m.Status == gp.GRB.OPTIMAL
+        obj = m.ObjVal if m.SolCount else None
+        result = {
+            "status": "optimal" if proven else "limit",
+            "obj": f"{obj:.10g}" if obj is not None else "",
+            "seconds": round(m.Runtime, 1),
+        }
+    except Exception as exc:  # noqa: BLE001 - any failure is reported, not raised
+        result = {
+            "status": "error",
+            "obj": "",
+            "seconds": round(time.time() - started, 1),
+            "note": str(exc)[:80],
+        }
+
+    cache[key] = result
+    ORACLE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    ORACLE_CACHE.write_text(json.dumps(cache, indent=1, sort_keys=True))
+    out = dict(result)
+    out["cached"] = False
+    return out
 
 
 FIELDS = ["instance", "columns", "rows", "nonzeros", "integer_columns",
           "ripsolve_status", "ripsolve_objective", "ripsolve_bound", "ripsolve_gap_pct",
           "ripsolve_nodes", "ripsolve_seconds",
-          "highs_status", "highs_objective", "highs_seconds", "agree", "note"]
+          "reference_status", "reference_objective", "reference_seconds",
+          "agree", "note"]
 
 
 def main():
@@ -179,18 +214,15 @@ def main():
     sample = [n for n in sample if n not in EXCLUDED]
     for name in dropped:
         print(f"  excluded {name}: {EXCLUDED[name]}")
-    if not KEEP_ALL:
-        uninformative = [n for n in sample if n in NOT_DISCRIMINATING]
-        sample = [n for n in sample if n not in NOT_DISCRIMINATING]
-        if uninformative:
-            print(f"  skipped {len(uninformative)} instances the reference also times "
-                  f"out on: {', '.join(uninformative)}")
 
     OUT.mkdir(parents=True, exist_ok=True)
     csv_path = OUT / "miplib_sample.csv"
     print(f"{len(sample)} of {len(names)} MIPLIB '{WHICH}' instances, seed {SEED}, "
           f"{LIMIT:.0f}s limit, {THREADS} threads")
     print(f"writing {csv_path}\n")
+
+    cache = load_oracle_cache()
+    solved = scored = uninformative = disagreements = 0
 
     with open(csv_path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
@@ -214,22 +246,45 @@ def main():
             cols, rows_, nnz = dims
             row.update(columns=cols, rows=rows_, nonzeros=nnz)
 
+            # The reference runs first. An instance it cannot close within the same
+            # budget cannot say anything about ripsolve, so there is no point spending
+            # the time: it is reported and skipped rather than scored.
+            o = run_oracle(name, path, cache)
+            row.update(reference_status=o["status"], reference_objective=o["obj"],
+                       reference_seconds=o["seconds"])
+            mark = " (cached)" if o.get("cached") else ""
+            if o["status"] != "optimal":
+                uninformative += 1
+                row["note"] = "reference did not close it"
+                print(f"{i:3}/{len(sample)} {name:28} {cols:>7}c {rows_:>7}r  "
+                      f"skipped, reference {o['status']}{mark}")
+                writer.writerow(row); handle.flush()
+                continue
+
             r = run_ripsolve(path)
-            h = run_highs(path)
             row.update(ripsolve_status=r["status"], ripsolve_objective=r["obj"],
                        ripsolve_bound=r["bound"], ripsolve_gap_pct=r["gap"],
-                       ripsolve_nodes=r["nodes"], ripsolve_seconds=r["seconds"],
-                       highs_status=h["status"], highs_objective=h["obj"],
-                       highs_seconds=h["seconds"])
+                       ripsolve_nodes=r["nodes"], ripsolve_seconds=r["seconds"])
+            if r["status"] == "optimal":
+                solved += 1
             # Only meaningful when both proved optimality.
-            if r["status"] == "optimal" and h["status"] == "optimal" and r["obj"] and h["obj"]:
-                a, b = float(r["obj"]), float(h["obj"])
+            if r["status"] == "optimal" and r["obj"] and o["obj"]:
+                a, b = float(r["obj"]), float(o["obj"])
                 row["agree"] = "yes" if abs(a - b) <= 1e-6 * max(1.0, abs(b)) else "NO"
+                if row["agree"] == "NO":
+                    disagreements += 1
+            scored += 1
             print(f"{i:3}/{len(sample)} {name:28} {cols:>7}c {rows_:>7}r  "
-                  f"ripsolve {r['status']:<10} {r['seconds']:>6}s   highs {h['status']:<8} {h['seconds']:>6}s")
+                  f"ripsolve {r['status']:<10} {r['seconds']:>6}s   "
+                  f"reference optimal {o['seconds']:>6}s{mark}"
+                  + ("  OBJECTIVES DISAGREE" if row.get("agree") == "NO" else ""))
             writer.writerow(row); handle.flush()
 
-    print(f"\nwrote {csv_path}")
+    print(f"\n{solved}/{scored} solved of the instances the reference closes; "
+          f"{uninformative} skipped because it did not")
+    if disagreements:
+        print(f"{disagreements} OBJECTIVE DISAGREEMENTS")
+    print(f"wrote {csv_path}")
 
 
 if __name__ == "__main__":
