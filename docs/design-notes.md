@@ -308,12 +308,32 @@ way touches about `m` nonzeros in total, and a single entering column has a hand
 iteration rate follows the row count and not the nonzero count, dropping 14x between
 3474 rows and 18442 while the model grows 5x.
 
-The fix for this is a hyper-sparse triangular solve: find the positions reachable from
+The obvious fix is a hyper-sparse triangular solve: find the positions reachable from
 the right-hand side's nonzeros and visit only those, rather than scanning `0..m` four
-times. That is precisely the regime where it pays, since near-zero fill means the
-reachable set from a sparse right-hand side stays small. It is a substantial and
-error-prone change to the most load-bearing code here, and the gain is bounded by
-pricing and the ratio test, which are `O(n)` and `O(m)` and would then dominate.
+times. It was implemented, and it is slower.
+
+The reasoning that motivated it was wrong, and the mistake is worth keeping. Near-zero
+fill does not imply that the reachable set from a sparse right-hand side is small. The
+factors being sparse says each pivot touches few others; it says nothing about how far a
+nonzero travels along the chain. Measured, `B^-1 a_q` comes out at 32.6% of the rows on
+`piperout-27` and 12.4% on `neos-555001`, averaged over every solve of the relaxation.
+At those densities the reachability walk and the sort that orders it cost more than the
+scan they replace:
+
+| | dense | sparse |
+|---|---:|---:|
+| `neos-555001` relaxation | 0.48s | 0.56s |
+| `piperout-27` relaxation | 27.6s | 30.5s |
+
+Iteration counts were identical, so the sparse path was numerically exact and simply not
+worth its bookkeeping. It is reverted.
+
+What that leaves is that the dense passes are not obviously wasteful after all, since a
+third of the entries they touch really are nonzero. The remaining costs to attack are
+the dual computation, a dense BTRAN of the basic costs on every iteration, and pricing,
+which is `O(n)` per iteration. Reduced costs updated incrementally from the pivot row
+would remove the first and shrink the second, and that is a different and larger change
+than this one.
 
 One smaller thing was measured and rejected on the way. Both solves allocated an
 `m`-length buffer per call, which on `neos-555001` is 128000 allocations of 27KB and
