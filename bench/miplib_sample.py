@@ -19,7 +19,7 @@ fail to parse, or time out. Dropping those is how a benchmark flatters itself.
 HiGHS runs alongside as an open-source reference, both to check answers and to say
 whether a timeout is ripsolve's problem or the instance's.
 
-Usage:  bench/miplib_sample.py [count] [seconds] [seed] [threads] [easy|benchmark]
+Usage:  bench/miplib_sample.py [count] [seconds] [seed] [threads] [easy|benchmark] [all]
 """
 
 import csv
@@ -56,6 +56,8 @@ SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 20260824
 # comparable to.
 THREADS = int(sys.argv[4]) if len(sys.argv) > 4 else 16
 WHICH = sys.argv[5] if len(sys.argv) > 5 else "easy"
+# `all` keeps the instances neither solver closes; by default they are skipped.
+KEEP_ALL = len(sys.argv) > 6 and sys.argv[6] == "all"
 # Instances whose reference answer could not be pinned down, and so cannot score
 # anything. Excluding one needs a reason that is about the instance, never about how
 # ripsolve does on it.
@@ -65,6 +67,17 @@ EXCLUDED = {
     # answer of 3.6199 is very likely wrong, and is tracked separately; it is not the
     # reason this instance is dropped.
     "neos-619167": "no stable reference objective",
+}
+
+# Instances where the reference solver also runs out of time. They cost two minutes
+# each and say nothing: a timeout on both sides measures the instance, not the solver.
+# Recorded from the run of 2026-08-25 and skipped unless `all` is passed as the sixth
+# argument, so that a genuine improvement can still be checked against them.
+NOT_DISCRIMINATING = {
+    "bmoipr2", "graphdraw-gemcutter", "leo1", "n9-3", "neos-3075395-nile",
+    "neos-4754521-awarau", "neos-5104907-jarama", "neos-5106984-jizera",
+    "neos-520729", "neos-555343", "neos-631710", "neos-829552", "pg5_34",
+    "supportcase40",
 }
 
 # Instances larger than this are recorded as skipped rather than downloaded; the
@@ -166,6 +179,12 @@ def main():
     sample = [n for n in sample if n not in EXCLUDED]
     for name in dropped:
         print(f"  excluded {name}: {EXCLUDED[name]}")
+    if not KEEP_ALL:
+        uninformative = [n for n in sample if n in NOT_DISCRIMINATING]
+        sample = [n for n in sample if n not in NOT_DISCRIMINATING]
+        if uninformative:
+            print(f"  skipped {len(uninformative)} instances the reference also times "
+                  f"out on: {', '.join(uninformative)}")
 
     OUT.mkdir(parents=True, exist_ok=True)
     csv_path = OUT / "miplib_sample.csv"

@@ -950,12 +950,17 @@ impl<'a> Solver<'a> {
             for (slot, &j) in self.basis_columns.iter_mut().zip(&self.basic) {
                 lp.column_sparse_into(j, &mut slot.0, &mut slot.1);
             }
-            match self.basis.refactorize(&self.basis_columns, lp.tol.pivot) {
+            match self
+                .basis
+                .refactorize(&self.basis_columns, lp.tol.pivot, lp.deadline)
+            {
                 Ok(()) => {
                     self.factorized = true;
                     self.recompute_basic_values();
                     return Ok(());
                 }
+                // Out of time is not a repairable basis; it is the caller's budget.
+                Err(BasisError::OutOfTime) => return Err(LpStatus::IterationLimit),
                 Err(BasisError::Singular { row }) => {
                     // `row` is a *basis position*, not a model row, so the logical that
                     // shares its index is only the first candidate. If it is already

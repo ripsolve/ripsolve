@@ -22,7 +22,7 @@
 //! replaced, so Forrest-Tomlin can supersede product form later without the simplex
 //! driver noticing, exactly as this change did.
 
-use crate::lp::lu::{Lu, Singular};
+use crate::lp::lu::{FactorError, Lu};
 
 /// Why a refactorization could not produce a usable basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub enum BasisError {
     /// The basis is singular at this position; the caller must repair it (typically
     /// by swapping in a logical) and retry.
     Singular { row: usize },
+    /// The caller's deadline passed while factorizing.
+    OutOfTime,
 }
 
 /// One product-form update: the transformed entering column and its pivot row.
@@ -87,7 +89,7 @@ impl Basis {
     /// The all-logical starting basis, whose matrix is `-I`.
     pub fn all_logical(m: usize) -> Self {
         let columns: Vec<(Vec<usize>, Vec<f64>)> = (0..m).map(|i| (vec![i], vec![-1.0])).collect();
-        let lu = Lu::factor(m, &columns, ZERO_TOL).expect("-I is nonsingular");
+        let lu = Lu::factor(m, &columns, ZERO_TOL, None).expect("-I is nonsingular");
         Self {
             m,
             lu,
@@ -294,6 +296,7 @@ impl Basis {
         &mut self,
         columns: &[(Vec<usize>, Vec<f64>)],
         _pivot_tol: f64,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(), BasisError> {
         if self.m == 0 {
             self.etas.clear();
@@ -301,7 +304,7 @@ impl Basis {
             self.post.clear();
             return Ok(());
         }
-        match Lu::factor(self.m, columns, ZERO_TOL) {
+        match Lu::factor(self.m, columns, ZERO_TOL, deadline) {
             Ok(lu) => {
                 self.lu = lu;
                 self.etas.clear();
@@ -310,7 +313,8 @@ impl Basis {
                 self.post.clear();
                 Ok(())
             }
-            Err(Singular { position }) => Err(BasisError::Singular { row: position }),
+            Err(FactorError::Singular { position }) => Err(BasisError::Singular { row: position }),
+            Err(FactorError::OutOfTime) => Err(BasisError::OutOfTime),
         }
     }
 }
@@ -377,7 +381,7 @@ mod tests {
         ];
         let basic = vec![0usize, 1, 2];
         let mut basis = Basis::all_logical(3);
-        basis.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        basis.refactorize(&sparse(3, &dense), 1e-9, None).unwrap();
         assert_inverts(&basis, &dense);
 
         // Two appended rows touching different subsets of the basis.
@@ -394,7 +398,7 @@ mod tests {
         let dense = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
         let basic = vec![0usize, 1];
         let mut basis = Basis::all_logical(2);
-        basis.refactorize(&sparse(2, &dense), 1e-9).unwrap();
+        basis.refactorize(&sparse(2, &dense), 1e-9, None).unwrap();
 
         let rows = vec![vec![(0usize, 1.0), (1, 1.0)]];
         basis.extend(&rows, &basic, 2);
@@ -441,7 +445,7 @@ mod tests {
             vec![1.0, 0.0, 4.0],
         ];
         let mut b = Basis::all_logical(3);
-        b.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        b.refactorize(&sparse(3, &dense), 1e-9, None).unwrap();
         assert_inverts(&b, &dense);
         assert_eq!(b.updates(), 0);
     }
@@ -455,7 +459,7 @@ mod tests {
         ];
         let mut b = Basis::all_logical(3);
         assert!(matches!(
-            b.refactorize(&sparse(3, &dense), 1e-9),
+            b.refactorize(&sparse(3, &dense), 1e-9, None),
             Err(BasisError::Singular { .. })
         ));
     }
@@ -473,7 +477,7 @@ mod tests {
         let entering = vec![3.0, -1.0, 2.0];
 
         let mut updated = Basis::all_logical(3);
-        updated.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        updated.refactorize(&sparse(3, &dense), 1e-9, None).unwrap();
         let mut d = Vec::new();
         updated.ftran(&entering, &mut d);
         updated.update(&d, 1);
@@ -483,7 +487,7 @@ mod tests {
         assert_eq!(updated.updates(), 1);
 
         let mut fresh = Basis::all_logical(3);
-        fresh.refactorize(&sparse(3, &dense), 1e-9).unwrap();
+        fresh.refactorize(&sparse(3, &dense), 1e-9, None).unwrap();
         let probe = [1.0, -2.0, 0.5];
         let (mut a, mut b) = (Vec::new(), Vec::new());
         updated.ftran(&probe, &mut a);
@@ -508,7 +512,7 @@ mod tests {
             vec![1.0, 0.0, 1.0, 2.0],
         ];
         let mut basis = Basis::all_logical(4);
-        basis.refactorize(&sparse(4, &dense), 1e-9).unwrap();
+        basis.refactorize(&sparse(4, &dense), 1e-9, None).unwrap();
 
         for (step, replacement) in [
             (0usize, vec![1.0, 2.0, 0.0, 1.0]),
@@ -529,7 +533,7 @@ mod tests {
     fn btran_unit_is_a_row_of_the_inverse() {
         let dense = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
         let mut b = Basis::all_logical(2);
-        b.refactorize(&sparse(2, &dense), 1e-9).unwrap();
+        b.refactorize(&sparse(2, &dense), 1e-9, None).unwrap();
         for r in 0..2 {
             let mut rho = Vec::new();
             b.btran_unit(r, &mut rho);
@@ -545,7 +549,7 @@ mod tests {
     fn a_zero_row_basis_is_handled() {
         // A model with no rows has an empty basis; nothing here may panic on it.
         let mut b = Basis::all_logical(0);
-        assert!(b.refactorize(&[], 1e-9).is_ok());
+        assert!(b.refactorize(&[], 1e-9, None).is_ok());
         let mut out = Vec::new();
         b.ftran(&[], &mut out);
         assert!(out.is_empty());

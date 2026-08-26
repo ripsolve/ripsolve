@@ -40,9 +40,16 @@ pub struct Lu {
 
 /// The basis could not be factored.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Singular {
+pub enum FactorError {
     /// A basis position with no acceptable pivot; the caller should replace it.
-    pub position: usize,
+    Singular { position: usize },
+    /// The caller's deadline passed mid-factorization.
+    ///
+    /// Factorizing is one call however long it takes, and on a large basis that is
+    /// long: 255386 rows of MIPLIB's neos-4754521-awarau took 166 seconds, during
+    /// which the simplex had not begun and so had nothing to check a clock between.
+    /// A five second limit ran for 193.
+    OutOfTime,
 }
 
 /// Relative threshold a pivot must meet against the largest entry in its column.
@@ -65,8 +72,12 @@ pub struct Singular {
 ///   feasibility and optimality tolerances then mean the same thing in every row,
 ///   which this, operating inside the factorization, never touches.
 const PIVOT_THRESHOLD: f64 = 0.01;
+
 /// Columns examined per pivot search before settling for the best seen.
 const MAX_COLUMN_SEARCH: usize = 4;
+
+/// Elimination steps between clock reads during a factorization.
+const FACTOR_CLOCK_INTERVAL: usize = 1024;
 
 impl Lu {
     pub fn dimension(&self) -> usize {
@@ -78,7 +89,8 @@ impl Lu {
         m: usize,
         columns: &[(Vec<usize>, Vec<f64>)],
         zero_tol: f64,
-    ) -> Result<Lu, Singular> {
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Lu, FactorError> {
         debug_assert_eq!(columns.len(), m);
 
         // Active submatrix, column-major by basis position.
@@ -139,51 +151,56 @@ impl Lu {
         // moves down by one at a time and is corrected on the way past.
         let mut min_len = 0usize;
 
-        for _step in 0..m {
+        for step in 0..m {
+            // One factorization is a single call to the caller, so the deadline has to
+            // be read here or not at all until it finishes.
+            if step.is_multiple_of(FACTOR_CLOCK_INTERVAL)
+                && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                return Err(FactorError::OutOfTime);
+            }
             shortlist.clear();
             let mut shortest_live = None;
-            let mut first_live_len = None;
-            // Indexing rather than iterating because the loop compacts the bucket it
-            // is reading, which an iterator would hold borrowed.
+            // Candidates are *popped* rather than scanned. Walking a bucket to compact
+            // it costs its whole length at every step, and with `-I` every column sits
+            // in the length-one bucket, so that was quadratic: factorizing the
+            // all-logical basis of MIPLIB's neos-4754521-awarau, 255386 rows of
+            // nothing but a diagonal, took 65 seconds. Popping stops at the few
+            // candidates actually wanted, and stale entries are discarded as they
+            // surface.
+            // Indexing rather than iterating: the loop pops from the bucket it reads,
+            // which an iterator would hold borrowed.
             #[allow(clippy::needless_range_loop)]
             'buckets: for len in min_len..=m {
-                let mut keep = 0;
-                for pos in 0..buckets[len].len() {
-                    let j = buckets[len][pos];
-                    // Stale entry: the column has since been pivoted out, or moved to
-                    // another bucket.
+                while shortlist.len() < MAX_COLUMN_SEARCH {
+                    let Some(j) = buckets[len].pop() else {
+                        break;
+                    };
+                    // The column has since been pivoted out, or moved bucket.
                     if col_done[j] || col_len[j] != len {
                         continue;
                     }
-                    buckets[len][keep] = j;
-                    keep += 1;
                     if shortest_live.is_none() {
                         shortest_live = Some(j);
                     }
-                    if shortlist.len() < MAX_COLUMN_SEARCH {
-                        shortlist.push(j);
-                    }
+                    shortlist.push(j);
                 }
-                // Compact this bucket so the stale entries are not walked again.
-                buckets[len].truncate(keep);
-                if keep > 0 && first_live_len.is_none() {
-                    first_live_len = Some(len);
-                }
-                if shortlist.len() >= MAX_COLUMN_SEARCH {
+                if !shortlist.is_empty() {
+                    // Everything below this length is exhausted, so later steps start
+                    // here rather than walking the empty buckets again.
+                    min_len = len;
                     break 'buckets;
                 }
             }
-            // Every bucket below the first live one is now known empty.
-            min_len = first_live_len.unwrap_or(min_len);
 
             let mut best: Option<(usize, usize, f64, usize)> = None; // (row, col, value, cost)
             for (examined, &j) in shortlist.iter().enumerate() {
                 if cols[j].is_empty() {
-                    return Err(Singular { position: j });
+                    return Err(FactorError::Singular { position: j });
                 }
                 let max_abs = cols[j].iter().map(|&(_, v)| v.abs()).fold(0.0f64, f64::max);
                 if max_abs <= zero_tol {
-                    return Err(Singular { position: j });
+                    return Err(FactorError::Singular { position: j });
                 }
                 for &(i, v) in &cols[j] {
                     // Stability first: a sparser pivot is worthless if it is tiny.
@@ -206,8 +223,16 @@ impl Lu {
                 // The sparsest column still active is the one to report, matching what
                 // the caller repairs by swapping in a logical.
                 let position = shortest_live.unwrap_or(0);
-                return Err(Singular { position });
+                return Err(FactorError::Singular { position });
             };
+
+            // Candidates that were looked at but not pivoted are still live and were
+            // taken out of their bucket by the pop, so they go back.
+            for &j in &shortlist {
+                if j != pj {
+                    buckets[col_len[j].min(m)].push(j);
+                }
+            }
 
             row_done[pi] = true;
             col_done[pj] = true;
@@ -485,7 +510,7 @@ mod tests {
         // The all-logical starting basis is -I, the case every solve begins from.
         let m = 5;
         let columns: Vec<(Vec<usize>, Vec<f64>)> = (0..m).map(|i| (vec![i], vec![-1.0])).collect();
-        let lu = Lu::factor(m, &columns, 1e-12).unwrap();
+        let lu = Lu::factor(m, &columns, 1e-12, None).unwrap();
         assert_solves(m, &columns, &lu, 1e-9);
         // Perfectly triangular: no fill beyond the diagonal.
         assert_eq!(lu.nnz(), m);
@@ -502,7 +527,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 4.0],
         ];
         let columns = sparse(m, &dense);
-        let lu = Lu::factor(m, &columns, 1e-12).unwrap();
+        let lu = Lu::factor(m, &columns, 1e-12, None).unwrap();
         assert_solves(m, &columns, &lu, 1e-9);
     }
 
@@ -515,7 +540,7 @@ mod tests {
                 .map(|_| (0..m).map(|_| rng.value()).collect())
                 .collect();
             let columns = sparse(m, &dense);
-            if let Ok(lu) = Lu::factor(m, &columns, 1e-12) {
+            if let Ok(lu) = Lu::factor(m, &columns, 1e-12, None) {
                 assert_solves(m, &columns, &lu, 1e-6);
                 return;
             }
@@ -546,7 +571,7 @@ mod tests {
                 }
             }
             let columns = sparse(m, &dense);
-            if let Ok(lu) = Lu::factor(m, &columns, 1e-12) {
+            if let Ok(lu) = Lu::factor(m, &columns, 1e-12, None) {
                 assert_solves(m, &columns, &lu, 1e-5);
                 factored += 1;
             }
@@ -563,7 +588,7 @@ mod tests {
             vec![0.0, 1.0, 1.0],
             vec![1.0, 1.0, 2.0],
         ];
-        assert!(Lu::factor(m, &sparse(m, &dense), 1e-12).is_err());
+        assert!(Lu::factor(m, &sparse(m, &dense), 1e-12, None).is_err());
     }
 
     #[test]
@@ -574,10 +599,10 @@ mod tests {
             (Vec::new(), Vec::new()),
             (vec![2], vec![1.0]),
         ];
-        let err = Lu::factor(m, &columns, 1e-12)
+        let err = Lu::factor(m, &columns, 1e-12, None)
             .err()
             .expect("empty column is singular");
-        assert_eq!(err, Singular { position: 1 });
+        assert_eq!(err, FactorError::Singular { position: 1 });
     }
 
     #[test]
@@ -601,7 +626,7 @@ mod tests {
             *entry = 1.0;
         }
         let columns = sparse(m, &dense);
-        let lu = Lu::factor(m, &columns, 1e-12).unwrap();
+        let lu = Lu::factor(m, &columns, 1e-12, None).unwrap();
         assert_solves(m, &columns, &lu, 1e-7);
         // Fill-free would be 3m - 2 nonzeros; allow slack but not densification.
         assert!(
@@ -766,7 +791,8 @@ mod scale_tests {
         // downstream, for the simplex to conclude something false.
         for (m, structural) in [(200, 60), (500, 150), (900, 250)] {
             let columns = spread_basis(m, structural, 8, 0.5, 7 + m as u64);
-            let lu = Lu::factor(m, &columns, 1e-12).unwrap_or_else(|e| panic!("m = {m}: {e:?}"));
+            let lu =
+                Lu::factor(m, &columns, 1e-12, None).unwrap_or_else(|e| panic!("m = {m}: {e:?}"));
             let residual = worst_residual(m, &columns, &lu);
             assert!(
                 residual < 1e-7,
@@ -799,7 +825,7 @@ mod scale_tests {
         let well = worst_residual(
             m,
             &spread_basis(m, 120, 8, 0.0, 3),
-            &Lu::factor(m, &spread_basis(m, 120, 8, 0.0, 3), 1e-12).unwrap(),
+            &Lu::factor(m, &spread_basis(m, 120, 8, 0.0, 3), 1e-12, None).unwrap(),
         );
         assert!(
             well < 1e-10,
@@ -811,7 +837,7 @@ mod scale_tests {
         let bad = worst_residual(
             m,
             &bad_columns,
-            &Lu::factor(m, &bad_columns, 1e-12).unwrap(),
+            &Lu::factor(m, &bad_columns, 1e-12, None).unwrap(),
         );
         assert!(
             bad > well,
@@ -828,7 +854,7 @@ mod scale_tests {
         for (m, structural) in [(300, 90), (800, 240)] {
             let columns = spread_basis(m, structural, 8, 0.5, 11 + m as u64);
             let original: usize = columns.iter().map(|c| c.0.len()).sum();
-            let lu = Lu::factor(m, &columns, 1e-12).unwrap();
+            let lu = Lu::factor(m, &columns, 1e-12, None).unwrap();
             assert!(
                 lu.nnz() < 6 * original,
                 "m = {m}: {} nonzeros from {original}, fill has blown up",
@@ -844,7 +870,7 @@ mod scale_tests {
         let m = 400;
         let mut columns = realistic_basis(m, 120, 8, 31);
         let mut basis = crate::lp::basis::Basis::all_logical(m);
-        basis.refactorize(&columns, 1e-9).unwrap();
+        basis.refactorize(&columns, 1e-9, None).unwrap();
 
         let mut rng = Rng(5);
         for step in 0..60 {
