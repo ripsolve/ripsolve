@@ -36,6 +36,10 @@ use crate::sparse::SparseMatrix;
 
 /// Pivots between clock checks. Small enough to bound the overrun, large enough
 /// that reading the clock does not show up in a profile.
+/// Singular-basis repairs between clock reads. Each repair costs a factorization, so
+/// this is far smaller than the interval between simplex iterations.
+const REPAIR_CLOCK_INTERVAL: usize = 8;
+
 const CLOCK_INTERVAL: usize = 256;
 
 /// Factorizations kept per LP.
@@ -927,7 +931,14 @@ impl<'a> Solver<'a> {
     /// Rebuild the basis inverse, repairing singular positions with logicals.
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
-        for _ in 0..lp.m + 1 {
+        for attempt in 0..lp.m + 1 {
+            // Each attempt is a whole factorization, and the caller's clock is only
+            // read between simplex iterations, so a long run of repairs is invisible to
+            // it. On MIPLIB's hypothyroid-k1, 5195 rows, that let a 60 second limit run
+            // past 300 seconds inside a single call.
+            if attempt > 0 && attempt.is_multiple_of(REPAIR_CLOCK_INTERVAL) && lp.out_of_time() {
+                return Err(LpStatus::IterationLimit);
+            }
             self.basis_columns.resize_with(lp.m, Default::default);
             for (slot, &j) in self.basis_columns.iter_mut().zip(&self.basic) {
                 lp.column_sparse_into(j, &mut slot.0, &mut slot.1);
