@@ -311,6 +311,32 @@ Those solutions are poor, 2791 against an optimum of 137 on `v064c064`, but an
 incumbent of any quality switches pruning on. `v064c200` drops from 9916 nodes and
 5.7s to 3388 nodes and 2.25s.
 
+None of those three improves a solution; they only find one. That is the gap
+`graphdraw-gemcutter` exposed: the search reached 13176 against an optimum of 7118 and
+sat there, not for want of nodes but for want of anything looking near a good solution
+rather than near the relaxation.
+
+The improvement search fixes every integer column where the incumbent and the current
+relaxation already agree, and turns the search loose on what is left with a node budget
+and the incumbent as a cutoff. Two points agreeing on a column is weak evidence that a
+good solution has it there, and weak evidence over hundreds of columns leaves a model
+small enough to search properly. It is Danna, Rothberg and Le Pape's RINS, and it reuses
+the search rather than adding a mechanism.
+
+| | before | after |
+|---|---:|---:|
+| `graphdraw-gemcutter` (optimum 7118.5) | 13176.5 | 8150.5 |
+| `australia-abs-cta` (optimum 106.9) | 10865 | 2332.6 |
+
+The target class is unaffected, because there the heuristics already supply a good
+incumbent and the neighbourhood searches finish almost immediately: `v064c200` 1.19s,
+`mkp_200` 14.5s, both unchanged.
+
+What it does not do is find a first solution. On the instances where nothing is found at
+all, `neos-555001`, `nursesched-sprint02`, `piperout-27`, `hypothyroid-k1`, it has no
+incumbent to improve and changes nothing. Improvement and discovery are separate
+problems, and only one of them is addressed here.
+
 In-tree attempts are scheduled adaptively rather than on a fixed cadence. The
 interval doubles after an attempt that finds nothing and snaps back after one that
 succeeds. Because diving fails on whole instance families rather than the occasional

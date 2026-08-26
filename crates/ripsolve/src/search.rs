@@ -127,6 +127,22 @@ pub struct Options {
     /// search keeps its open set to roughly the tree depth, while best-bound holds
     /// every unexplored node.
     pub plunge_limit: usize,
+    /// Node interval between improvement searches. Zero disables them.
+    ///
+    /// Once an incumbent exists, the cheapest place to look for a better one is the
+    /// neighbourhood where the incumbent and the relaxation already agree. Fixing the
+    /// integer columns they agree on leaves a much smaller model whose optimum is a
+    /// better solution to the original, and it is reached by the same search rather
+    /// than by a separate mechanism.
+    ///
+    /// This is what the other heuristics here do not do: rounding, diving and the pump
+    /// all *find* a solution and none of them improves one. On MIPLIB's
+    /// graphdraw-gemcutter the search reaches 13176 against an optimum of 7118 and then
+    /// sits there, not for want of nodes but for want of anything that looks near a
+    /// good solution rather than near the relaxation.
+    pub improvement_frequency: usize,
+    /// Nodes an improvement search may spend before giving the budget back.
+    pub improvement_nodes: usize,
     /// Base node interval between in-tree heuristic attempts. Zero disables them.
     ///
     /// This is a starting point, not a fixed cadence: the interval doubles after
@@ -162,6 +178,8 @@ impl Default for Options {
             refactor_interval: 200,
             threads: 1,
             plunge_limit: 0,
+            improvement_frequency: 500,
+            improvement_nodes: 2_000,
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
@@ -331,6 +349,8 @@ struct NodeOutcome {
     exhausted: bool,
     /// Incumbents that came from a heuristic rather than from the relaxation.
     heuristic_hits: usize,
+    /// This node's relaxation, kept for the improvement search to compare against.
+    relaxation: Option<Vec<f64>>,
 }
 
 /// Everything needed to process nodes: an LP to re-solve them in, and the
@@ -421,6 +441,7 @@ impl<'a> Worker<'a> {
         let options = self.options;
         let mut out = NodeOutcome {
             incumbent: None,
+            relaxation: None,
             children: Vec::new(),
             exhausted: false,
             heuristic_hits: 0,
@@ -465,6 +486,12 @@ impl<'a> Worker<'a> {
 
         if !improves(solved.objective, incumbent, options.gap_tolerance) {
             return out;
+        }
+        // Kept only when an improvement search might use it, since it is a copy of the
+        // whole column vector at every node otherwise.
+        if options.improvement_frequency > 0 && index.is_multiple_of(options.improvement_frequency)
+        {
+            out.relaxation = Some(solved.x.clone());
         }
 
         // Cuts derived from this node's own relaxation, if it is one of the nodes
@@ -1196,6 +1223,20 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             incumbent = objective;
             incumbent_x = Some(x);
         }
+
+        // Improvement runs only where it can: it needs an incumbent to improve on and
+        // a relaxation to compare it against, and this node's own relaxation is the
+        // freshest one available.
+        if options.improvement_frequency > 0
+            && nodes.is_multiple_of(options.improvement_frequency)
+            && let Some(current) = &incumbent_x
+            && let Some(relaxation) = &outcome.relaxation
+            && let Some((objective, x)) = improve(problem, current, incumbent, relaxation, &options)
+        {
+            incumbent = objective;
+            incumbent_x = Some(x);
+            heuristic_solutions += 1;
+        }
         for child in outcome.children {
             open.push(child);
         }
@@ -1240,6 +1281,65 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 }
 
 /// The internal-form objective of an assignment.
+/// Look for a better incumbent in the neighbourhood the incumbent and the relaxation
+/// agree on.
+///
+/// Every integer column where the two already agree is fixed, and the search is turned
+/// loose on what is left with a node budget and the incumbent as a cutoff. The two
+/// points agreeing on a column is weak evidence that a good solution has it there, and
+/// weak evidence over hundreds of columns leaves a model small enough to search
+/// properly. This is Danna, Rothberg and Le Pape's RINS.
+///
+/// Returns a strictly better point, in internal minimization form, or `None`.
+///
+/// The sub-search runs with improvement off, which is what stops this recursing: a
+/// neighbourhood of a neighbourhood is the same idea applied to less and less, and the
+/// budget is better spent on the original.
+fn improve(
+    problem: &Problem,
+    incumbent: &[f64],
+    incumbent_objective: f64,
+    relaxation: &[f64],
+    options: &Options,
+) -> Option<(f64, Vec<f64>)> {
+    let mut neighbourhood = problem.clone();
+    let mut fixed = 0usize;
+    for j in problem.integer_columns() {
+        if (incumbent[j] - relaxation[j]).abs() <= options.integrality_tolerance {
+            let value = incumbent[j];
+            neighbourhood.col_lb[j] = value;
+            neighbourhood.col_ub[j] = value;
+            fixed += 1;
+        }
+    }
+    // Nothing agreed, or everything did. Neither leaves a model worth searching: the
+    // first is the original problem again, the second is the incumbent again.
+    let integers = problem.integer_columns().count();
+    if fixed == 0 || fixed == integers {
+        return None;
+    }
+
+    let found = solve(
+        &neighbourhood,
+        Options {
+            improvement_frequency: 0,
+            max_nodes: options.improvement_nodes,
+            threads: 1,
+            // The sub-search inherits the deadline, so a budget spent here is a budget
+            // taken from the search that asked for it, not added to the run.
+            time_limit: options.time_limit,
+            ..*options
+        },
+    );
+
+    let x = found.x;
+    if x.len() != problem.n_cols() {
+        return None;
+    }
+    let objective = objective_at(problem, &x);
+    (objective < incumbent_objective).then_some((objective, x))
+}
+
 fn objective_at(problem: &Problem, x: &[f64]) -> f64 {
     problem.obj.iter().zip(x).map(|(c, &v)| c * v).sum()
 }
@@ -1284,6 +1384,56 @@ mod tests {
     use crate::lp::Lp;
     use crate::model::{RowSense, Sense};
     use crate::sparse::SparseMatrix;
+
+    /// Maximize `x0 + 2 x1 + 3 x2` subject to `x0 + x1 + x2 <= 2`, all binary.
+    ///
+    /// The optimum takes `x1` and `x2`, for 5. An incumbent that took `x0` and `x1`,
+    /// for 3, is the sort of thing a rounding heuristic produces.
+    fn knapsackish() -> Problem {
+        let mut model = crate::model::Builder::new(Sense::Maximize);
+        let x0 = model.binary("x0");
+        let x1 = model.binary("x1");
+        let x2 = model.binary("x2");
+        model.objective(&[(x0, 1.0), (x1, 2.0), (x2, 3.0)]);
+        model.row(&[(x0, 1.0), (x1, 1.0), (x2, 1.0)], RowSense::Le, 2.0);
+        model.build()
+    }
+
+    #[test]
+    fn improvement_searches_where_the_incumbent_and_relaxation_agree() {
+        let p = knapsackish();
+        let options = Options::default();
+        // Internal form is minimization, so the incumbent's 3 is -3 and better is more
+        // negative.
+        let incumbent = vec![1.0, 1.0, 0.0];
+        let value = objective_at(&p, &incumbent);
+        assert_eq!(value, -3.0);
+
+        // The relaxation agrees on `x0` and disagrees elsewhere, so `x0` is fixed and
+        // the rest is searched. With `x0` at one the best remaining is `x2`, for 4.
+        let relaxation = vec![1.0, 0.5, 1.0];
+        let (improved, x) = improve(&p, &incumbent, value, &relaxation, &options)
+            .expect("a better point exists in that neighbourhood");
+        assert_eq!(improved, -4.0);
+        assert_eq!(x[0], 1.0, "the agreed column stays where both put it");
+        assert!(improved < value);
+    }
+
+    #[test]
+    fn improvement_declines_when_the_neighbourhood_is_the_whole_problem_or_none_of_it() {
+        let p = knapsackish();
+        let options = Options::default();
+        let incumbent = vec![1.0, 1.0, 0.0];
+        let value = objective_at(&p, &incumbent);
+
+        // Agreeing on nothing leaves the original problem, which the search is already
+        // doing.
+        let disagrees = vec![0.0, 0.0, 1.0];
+        assert!(improve(&p, &incumbent, value, &disagrees, &options).is_none());
+
+        // Agreeing on everything leaves the incumbent, which cannot be improved on.
+        assert!(improve(&p, &incumbent, value, &incumbent, &options).is_none());
+    }
 
     fn node(bound: f64, depth: usize) -> Node {
         // A node's basis is irrelevant to the ordering under test.
