@@ -286,6 +286,41 @@ The cache holds several entries rather than one, because best-bound selection do
 not visit the tree in an order that keeps a single entry warm. One entry measured an
 8 to 20% hit rate. What recurs is siblings, which share a parent's basis.
 
+### Where the remaining throughput goes
+
+The MIPLIB instances that find no solution are not short of heuristics, they are short of
+nodes: 1, 17, 50 and 350 of them in twenty-five seconds. Profiling `neos-555001`, 3474
+rows, puts the time in the triangular solves and in pricing, roughly a fifth each, with
+factorization and node setup behind them.
+
+The factors are the surprise. Measured at the point of refactorization, they carry
+essentially no fill:
+
+| instance | rows | factor nonzeros | basis nonzeros | fill |
+|---|---:|---:|---:|---:|
+| `v064c1000n100` | 1000 | 2986 | 2986 | 1.00 |
+| `neos-555001` | 3474 | 3861 | 3856 | 1.00 |
+| `piperout-27` | 18442 | 50837 | 50441 | 1.01 |
+
+So the solves are not doing arithmetic, they are walking. Each `ftran` makes four passes
+of length `m`: permute in, solve `L`, solve `U`, permute out. The numeric work along the
+way touches about `m` nonzeros in total, and a single entering column has a handful. The
+iteration rate follows the row count and not the nonzero count, dropping 14x between
+3474 rows and 18442 while the model grows 5x.
+
+The fix for this is a hyper-sparse triangular solve: find the positions reachable from
+the right-hand side's nonzeros and visit only those, rather than scanning `0..m` four
+times. That is precisely the regime where it pays, since near-zero fill means the
+reachable set from a sparse right-hand side stays small. It is a substantial and
+error-prone change to the most load-bearing code here, and the gain is bounded by
+pricing and the ratio test, which are `O(n)` and `O(m)` and would then dominate.
+
+One smaller thing was measured and rejected on the way. Both solves allocated an
+`m`-length buffer per call, which on `neos-555001` is 128000 allocations of 27KB and
+showed as 5.8% in `malloc`. Reusing a thread-local buffer removed the allocations and
+changed the iteration rate by nothing measurable, so it was not kept: the allocator
+returns the same size class each time and the cost was never really there.
+
 Two things were measured and not adopted. Forrest-Tomlin updates would shorten the
 eta file, and the `Basis` interface was built so the swap needs no change to the
 simplex, but sweeping the refactorization interval over an 80x range moves solve time
