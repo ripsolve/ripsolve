@@ -40,6 +40,11 @@ use crate::sparse::SparseMatrix;
 /// this is far smaller than the interval between simplex iterations.
 const REPAIR_CLOCK_INTERVAL: usize = 8;
 
+/// Refactorize once the eta file's nonzeros reach this multiple of the factors' own.
+///
+/// The pivot-count interval remains as a ceiling; this is what usually fires.
+const ETA_GROWTH_LIMIT: f64 = 1.0;
+
 const CLOCK_INTERVAL: usize = 256;
 
 /// Factorizations kept per LP.
@@ -1247,7 +1252,8 @@ impl<'a> Solver<'a> {
             self.status[leaving] = Status::NonBasic(violated);
 
             *iterations += 1;
-            if self.basis.updates() >= self.lp.tol.refactor_interval
+            if (self.basis.updates() >= self.lp.tol.refactor_interval
+                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT))
                 && let Err(status) = self.refactorize()
             {
                 return Some(status);
@@ -1575,7 +1581,8 @@ impl<'a> Solver<'a> {
             }
 
             iterations += 1;
-            if self.basis.updates() >= self.lp.tol.refactor_interval
+            if (self.basis.updates() >= self.lp.tol.refactor_interval
+                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT))
                 && let Err(status) = self.refactorize()
             {
                 return self.done(status, iterations);

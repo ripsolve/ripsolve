@@ -180,6 +180,26 @@ impl Basis {
     }
 
     /// Nonzeros held in the factors, for diagnostics.
+    /// Whether the eta file has grown expensive enough to be worth rebuilding.
+    ///
+    /// Every solve replays the whole eta file, so its cost is its nonzero count, while
+    /// refactorizing costs roughly the factors' own. Comparing the two directly is what
+    /// makes this self-tuning, where a fixed pivot count cannot be: the same interval
+    /// that suits one model starves another. On MIPLIB's neos-555001, 3474 rows, an
+    /// interval of 200 pivots managed 328 nodes in twenty seconds where 50 managed 700,
+    /// and on neos-3048764-nadi, 3186 rows, the ordering is the other way round.
+    pub fn eta_file_is_expensive(&self, growth: f64) -> bool {
+        let etas: usize = self
+            .etas
+            .iter()
+            .chain(&self.post)
+            .map(|e| e.column.len() + 1)
+            .sum();
+        // A basis of logicals factorizes to almost nothing, so the ratio is measured
+        // against a floor rather than against zero.
+        etas as f64 > growth * (self.lu.nnz().max(self.m) as f64)
+    }
+
     pub fn nnz(&self) -> usize {
         self.lu.nnz()
             + self
