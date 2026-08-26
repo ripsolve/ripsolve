@@ -328,12 +328,42 @@ scan they replace:
 Iteration counts were identical, so the sparse path was numerically exact and simply not
 worth its bookkeeping. It is reverted.
 
-What that leaves is that the dense passes are not obviously wasteful after all, since a
-third of the entries they touch really are nonzero. The remaining costs to attack are
-the dual computation, a dense BTRAN of the basic costs on every iteration, and pricing,
-which is `O(n)` per iteration. Reduced costs updated incrementally from the pivot row
-would remove the first and shrink the second, and that is a different and larger change
-than this one.
+That leaves the dual computation, a dense BTRAN of the basic costs on every iteration,
+and pricing, which is `O(n)`. Reduced costs updated from the pivot row remove the first
+and shrink the second, so that was implemented too, and it is also slower.
+
+The premise checked out this time. A pivot row needs `B^-T e_r`, and a *unit* vector's
+solution really is hyper-sparse where a column's is not: 0.4% of the rows on
+`piperout-27` and 2.7% on `neos-555001`, against 32.6% and 12.4% for `B^-1 a_q`. Reading
+the pivot row from the row-wise model, restricted to those rows, touches a few hundred
+entries where pricing every column touches every nonzero. What went wrong is elsewhere:
+
+| | pricing as it is | reduced costs maintained |
+|---|---:|---:|
+| `mkp_200` | 11.2s | 13.4s |
+| `v064c200` | 1.69s | 1.75s |
+| `neos-555001`, nodes in 25s | 1289 | 443 |
+
+Iteration counts were identical on the first two, so the pivots were the same and the
+difference is bookkeeping.
+
+Three things are worth taking from it. Three quarters of `piperout-27`'s iterations are
+phase one, whose costs are the gradient of the bound violations and change whenever a
+step changes which basic variables are infeasible, so they cannot be carried across a
+pivot at all: the technique only ever applies to the other quarter. The saving is
+smaller than it looks, because this solver's models are extremely sparse, 1.77 nonzeros
+per column on `piperout-27`, so a reduced cost is a two-element dot product and reading
+one from an array is barely cheaper than computing it. And against that, maintaining
+them adds a BTRAN, a row-wise product and pattern bookkeeping to every pivot.
+
+Taken with the sparse-solve result, the picture is that the LP here is near a local
+optimum for the models it sees. The classical sparse-simplex techniques all trade
+per-column arithmetic for bookkeeping, and on a matrix this sparse there is not enough
+per-column arithmetic left to trade. Getting further would mean changing what is
+computed rather than how: partial or devex pricing so that `O(n)` per iteration stops
+being paid at all, which is the one direction not yet tried properly, the earlier
+partial pricing attempt having been reverted for returning a wrong answer rather than
+for being slow.
 
 One smaller thing was measured and rejected on the way. Both solves allocated an
 `m`-length buffer per call, which on `neos-555001` is 128000 allocations of 27KB and
