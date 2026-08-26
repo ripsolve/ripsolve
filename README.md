@@ -18,10 +18,16 @@ There is a command-line application, a Rust library, and a Python module shaped 
 rows. In that range it is quicker than HiGHS, SCIP and CBC on most of the benchmark
 set, and competitive with a leading commercial solver.
 
-Above that range it is not competitive, and the distance is not small. On a seeded
-random sample of 25 models from MIPLIB 2017, whose median size is 11,697 columns, it
-proved optimality on one and did not finish the root node on eleven. Reach for HiGHS
-or SCIP there.
+Outside that shape it is not competitive, and the distance is not small. On a seeded
+random sample of MIPLIB 2017's `easy` list, sixteen threads and a sixty-second limit for
+every solver, it closed **three of the sixteen instances a leading commercial solver
+closes**. Six of the thirteen it missed are ones that solver finishes in under three
+seconds. Reach for HiGHS or SCIP there.
+
+`bench/miplib_sample.py` reproduces that. It runs the reference first and skips any
+instance the reference cannot close within the same budget, because a timeout on both
+sides measures the instance rather than this solver, and it caches the reference's
+answers so a re-run costs only ripsolve's time.
 
 Implemented: LP and MPS readers, presolve, knapsack cover cuts, Gomory mixed-integer
 cuts, node-local cut separation, pseudocost branching, primal heuristics, a sparse LU
@@ -213,37 +219,43 @@ Every solver on one thread with the same 60-second limit, timing only the solve.
 optimality disagree on the optimum, so it is a differential test as much as a
 benchmark.
 
-| instance | ripsolve | HiGHS | SCIP | CBC |
-|---|---:|---:|---:|---:|
-| `v032c032` | **0.0s** | 0.0s | 0.0s | 0.0s |
-| `v048c048` | **0.0s** | 0.0s | 0.2s | 0.0s |
-| `v048c128` | **0.0s** | 0.1s | 0.2s | 0.1s |
-| `v064c064` | **0.0s** | 0.2s | 0.5s | 0.1s |
-| `v064c200` | **1.2s** | 1.9s | 1.4s | 2.6s |
-| `v081c162n009` | **0.6s** | 1.2s | 1.7s | 1.5s |
-| `v081c162n018` | **0.1s** | 0.5s | 1.1s | 0.4s |
-| `v128c256n100` | **0.0s** | 0.1s | 0.1s | none |
-| `v256c256n100` | **0.3s** | 0.6s | 0.9s | none |
-| `mkp_200` | 13.2s | **12.7s** | 23.2s | 21.2s |
-| `v128c1000n100` | 3.0s | 1.8s | **1.8s** | none |
-| `v064c1000n100` | 5.2s | 3.3s | **2.2s** | 7.0s |
+| instance | rows | ripsolve | HiGHS | SCIP | CBC |
+|---|---:|---:|---:|---:|---:|
+| `v032c032` | 32 | **0.0s** | 0.0s | 0.0s | 0.0s |
+| `v048c048` | 48 | **0.0s** | 0.1s | 0.2s | 0.0s |
+| `v048c128` | 128 | **0.0s** | 0.1s | 0.1s | 0.1s |
+| `v064c064` | 64 | **0.0s** | 0.2s | 0.5s | 0.1s |
+| `v081c162n018` | 162 | **0.2s** | 0.5s | 0.9s | 0.5s |
+| `v128c256n100` | 256 | **0.0s** | 0.1s | 0.1s | none |
+| `v256c256n100` | 256 | **0.3s** | 0.7s | 1.0s | none |
+| `v081c162n009` | 162 | **1.0s** | 1.2s | 1.7s | 1.6s |
+| `mkp_200` | 30 | **11.5s** | 12.6s | 22.8s | 20.3s |
+| `v064c200` | 200 | 1.7s | 1.8s | **1.4s** | 2.6s |
+| `v128c1000n100` | 1000 | 5.6s | 1.8s | **1.8s** | none |
+| `v064c1000n100` | 1000 | 14.0s | 3.2s | **2.2s** | 6.6s |
 
-Fastest or tied on nine of twelve, and every proven optimum agrees. The three it
-loses are the largest, which is the boundary described above. CBC finds nothing on
-three.
+Fastest or tied on nine of twelve, and every proven optimum agrees. The models it loses
+are the widest: both thousand-row instances, and `v064c200` by a fifth of a second. CBC
+finds nothing at all on three.
 
 Against a leading commercial solver on the same models and the same limit, matching
 thread counts so the comparison is of algorithms rather than of core usage:
 
 | | single-threaded | sixteen threads |
 |---|---|---|
-| within 1x | eight of twelve | eleven of twelve |
-| 2x | `v064c200`, `v064c1000n100`, `v128c1000n100` | none |
-| worst | `mkp_200` at 6x | `mkp_200` at 3x |
+| within 1x | six of twelve | eight of twelve |
+| 2x to 3x | `v081c162n009`, `v256c256n100`, `v064c200` | `v048c128`, `v128c1000n100`, `mkp_200`, `v064c1000n100` |
+| worst | `v064c1000n100` and `mkp_200` at 7x | `v064c1000n100` at 3x |
 
-Every objective it proves matches. Two models are outside reach: `v064c1000n020`
-yields no feasible point to either solver, and `mkp_500` ends at a 1% gap where the
-commercial solver closes it.
+Every objective it proves matches. Two models sit outside: `v064c1000n020` yields no
+feasible point to either solver, and `mkp_500` reaches the same 6191 the commercial
+solver does at one thread, but does not close it at sixteen, where the extra workers
+find more incumbents and prove less.
+
+All three tables come from one sitting on one machine, which matters more than it
+sounds: absolute times here drifted by a factor of two across a day of benchmarking, so
+figures are comparable within a table and not against an older copy of this file. Every
+comparison runs both solvers in the same session for that reason.
 
 The commercial solver is unnamed here because the licence in use is an academic one,
 and rather than read its terms as permission to publish benchmarks under its name, the
