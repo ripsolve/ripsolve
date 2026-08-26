@@ -13,7 +13,7 @@ No dependency links against another solver.
 
 ```toml
 [dependencies]
-ripsolve = "0.2"
+ripsolve = "0.3"
 ```
 
 ```rust
