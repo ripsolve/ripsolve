@@ -138,6 +138,15 @@ def run_ripsolve(path):
 
 ORACLE_CACHE = OUT / "miplib_oracle.json"
 
+# How far two "optimal" answers may sit apart before it means something.
+#
+# Both solvers stop at a relative gap of 1e-4, which is their default and the field's,
+# so each may sit that far from the true optimum and they may sit on opposite sides of
+# it. Judging agreement at solver precision instead calls that a disagreement: app2-1
+# came back 19296 against 19295.5, a relative difference of 2.6e-5, which is both
+# answers being correct to the tolerance they were asked for.
+AGREEMENT_TOLERANCE = 2.5e-4
+
 
 def load_oracle_cache():
     if ORACLE_CACHE.exists():
@@ -270,14 +279,16 @@ def main():
             # Only meaningful when both proved optimality.
             if r["status"] == "optimal" and r["obj"] and o["obj"]:
                 a, b = float(r["obj"]), float(o["obj"])
-                row["agree"] = "yes" if abs(a - b) <= 1e-6 * max(1.0, abs(b)) else "NO"
+                apart = abs(a - b) / max(1.0, abs(b))
+                row["agree"] = "yes" if apart <= AGREEMENT_TOLERANCE else "NO"
                 if row["agree"] == "NO":
                     disagreements += 1
+                    row["note"] = f"objectives differ by {apart:.3e} relative"
             scored += 1
             print(f"{i:3}/{len(sample)} {name:28} {cols:>7}c {rows_:>7}r  "
                   f"ripsolve {r['status']:<10} {r['seconds']:>6}s   "
                   f"reference optimal {o['seconds']:>6}s{mark}"
-                  + ("  OBJECTIVES DISAGREE" if row.get("agree") == "NO" else ""))
+                  + (f"  OBJECTIVES DISAGREE: {row['note']}" if row.get("agree") == "NO" else ""))
             writer.writerow(row); handle.flush()
 
     print(f"\n{solved}/{scored} solved of the instances the reference closes; "
