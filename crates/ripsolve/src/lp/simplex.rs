@@ -929,6 +929,13 @@ impl<'a> Solver<'a> {
     }
 
     /// Rebuild the basis inverse, repairing singular positions with logicals.
+    /// Rebuild the factors, repairing a singular basis by swapping in logicals.
+    ///
+    /// The error carries the status to report, and it is never `Infeasible`: failing to
+    /// factorize a basis says nothing about whether the model has a feasible point.
+    /// Callers used to collapse any failure to `Infeasible`, which turned a repair that
+    /// merely ran out of time into a false proof: hypothyroid-k1, which HiGHS solves in
+    /// 16s, came back "Infeasible" in 65s.
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
         for attempt in 0..lp.m + 1 {
@@ -1209,8 +1216,8 @@ impl<'a> Solver<'a> {
             if self.alpha[r].abs() <= pivot_tol {
                 // The pivot row and column disagree about this element's magnitude,
                 // which means the inverse has drifted. Rebuild and try again.
-                if self.refactorize().is_err() {
-                    return Some(LpStatus::Infeasible);
+                if let Err(status) = self.refactorize() {
+                    return Some(status);
                 }
                 *iterations += 1;
                 continue;
@@ -1235,9 +1242,10 @@ impl<'a> Solver<'a> {
             self.status[leaving] = Status::NonBasic(violated);
 
             *iterations += 1;
-            if self.basis.updates() >= self.lp.tol.refactor_interval && self.refactorize().is_err()
+            if self.basis.updates() >= self.lp.tol.refactor_interval
+                && let Err(status) = self.refactorize()
             {
-                return Some(LpStatus::Infeasible);
+                return Some(status);
             }
         }
         None
@@ -1465,8 +1473,10 @@ impl<'a> Solver<'a> {
         let mut stalled = 0usize;
         let mut bland_run = BLAND_RUN;
 
-        if !self.factorized && self.refactorize().is_err() {
-            return self.done(LpStatus::Infeasible, 0);
+        if !self.factorized
+            && let Err(status) = self.refactorize()
+        {
+            return self.done(status, 0);
         }
 
         // A warm start inherits dual feasibility from its parent, so the dual method
@@ -1560,9 +1570,10 @@ impl<'a> Solver<'a> {
             }
 
             iterations += 1;
-            if self.basis.updates() >= self.lp.tol.refactor_interval && self.refactorize().is_err()
+            if self.basis.updates() >= self.lp.tol.refactor_interval
+                && let Err(status) = self.refactorize()
             {
-                return self.done(LpStatus::Infeasible, iterations);
+                return self.done(status, iterations);
             }
         }
 
