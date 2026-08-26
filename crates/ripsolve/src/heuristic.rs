@@ -132,6 +132,61 @@ impl Default for Limits {
     }
 }
 
+/// How much more iteration budget a pump re-solve gets than a dive step.
+const PUMP_ITERATION_FACTOR: usize = 4;
+/// Unfinished re-solves in a row before the pump gives up.
+const MAX_SOLVE_FAILURES: usize = 3;
+/// Total pump work, as a multiple of one re-solve's budget.
+///
+/// Rounds alone do not bound this: once a round is allowed to finish its re-solve, a
+/// round on a large model can cost thousands of pivots, and sixty of those is most of a
+/// search's budget spent on a heuristic that may well fail. On MIPLIB's piperout-27 the
+/// pump ran 26 seconds of a 45 second limit and found nothing.
+const PUMP_TOTAL_BUDGET: usize = 8;
+
+/// Cycles tolerated before the pump restarts somewhere else entirely.
+const RESTART_AFTER_CYCLES: usize = 3;
+/// One in this many integer columns is moved by a restart.
+const RESTART_FRACTION: usize = 10;
+
+/// SplitMix64 again, for the same reason it is used in the instance generator: a
+/// heuristic that perturbs randomly must still give the same answer on the same model
+/// every time, or a benchmark measures the seed rather than the solver.
+struct Perturb(u64);
+
+impl Perturb {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        if bound == 0 {
+            0
+        } else {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+}
+
+/// A fingerprint of the integer part of a candidate, for detecting a repeat.
+///
+/// The pump cycles, and it does not only cycle with period one. Comparing against the
+/// previous target catches the shortest case and misses every longer one, which then
+/// runs until the round limit doing nothing.
+fn fingerprint(problem: &Problem, x: &[f64]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for j in problem.integer_columns() {
+        let bits = (x[j].round() as i64) as u64;
+        hash ^= bits.wrapping_add(j as u64);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
 /// Is this binary assignment feasible for every row and column bound?
 pub fn is_feasible(problem: &Problem, x: &[f64], tolerance: f64) -> bool {
     for (j, &v) in x.iter().enumerate() {
@@ -393,9 +448,16 @@ fn pump_inner(
     // Only the objective changes between rounds, so the previous basis stays primal
     // feasible and re-optimizing from it is far cheaper than a cold solve.
     let mut warm = basis.clone();
-    let mut previous: Option<Vec<f64>> = None;
+    // Every target seen since the last restart. A one-step memory catches only a cycle
+    // of period one and leaves every longer one to run out the round limit.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Deterministic tie-breaking for perturbation, so a run is reproducible.
     let mut tick = 0usize;
+    let mut rng = Perturb(0x5EED_1234_ABCD_0001);
+    let mut cycles = 0usize;
+    let mut failures = 0usize;
+    let ceiling = limits.max_iterations_per_solve * PUMP_TOTAL_BUDGET;
+    let mut spent = 0usize;
 
     for _ in 0..limits.max_pump_rounds {
         let mut target = snap(problem, &x);
@@ -407,10 +469,32 @@ fn pump_inner(
             });
         }
 
-        // A repeated target means the pump has cycled. Flip the columns that were
-        // hardest to round (the ones furthest from the integer they landed on)
-        // which is the standard escape and keeps the walk deterministic.
-        if previous.as_ref() == Some(&target) {
+        let repeated = !seen.insert(fingerprint(problem, &target));
+        if repeated {
+            cycles += 1;
+        }
+
+        // Small flips get out of a short cycle. They do not get out of a basin: once
+        // the walk keeps returning to the same neighbourhood, nudging a handful of
+        // columns returns it there again. After a few cycles the pump restarts
+        // instead, perturbing a tenth of the integer columns to somewhere else
+        // entirely and forgetting where it has been.
+        if cycles >= RESTART_AFTER_CYCLES {
+            cycles = 0;
+            seen.clear();
+            let integers: Vec<usize> = problem.integer_columns().collect();
+            let disturb = (integers.len() / RESTART_FRACTION).max(1);
+            for _ in 0..disturb {
+                let j = integers[rng.below(integers.len())];
+                let lb = problem.col_lb[j];
+                let ub = problem.col_ub[j];
+                if !lb.is_finite() || !ub.is_finite() || ub <= lb {
+                    continue;
+                }
+                let span = (ub - lb) as usize + 1;
+                target[j] = lb + rng.below(span.max(1)) as f64;
+            }
+        } else if repeated {
             let mut by_distance: Vec<usize> = (0..n).filter(|&j| problem.is_integer(j)).collect();
             by_distance.sort_by(|&a, &b| {
                 let d = |j: usize| (x[j] - x[j].round()).abs();
@@ -429,7 +513,6 @@ fn pump_inner(
                 target[j] = away.clamp(problem.col_lb[j], problem.col_ub[j]);
             }
         }
-        previous = Some(target.clone());
 
         // Minimize the distance to the target over the original constraint set.
         //
@@ -454,11 +537,33 @@ fn pump_inner(
             })
             .collect();
         lp.set_costs(&costs);
-        let solved = lp.solve_warm(&warm, None, limits.max_iterations_per_solve);
+        // The distance LP is a full re-optimization, not the handful of pivots a dive
+        // step takes, so it gets room to finish. At the ordinary per-solve limit the
+        // first round of this pump hit the cap on MIPLIB's nursesched-sprint02 and
+        // piperout-27 and the whole heuristic gave up having done nothing, which looked
+        // from outside exactly like a pump that had run and failed.
+        let solved = lp.solve_warm(
+            &warm,
+            None,
+            limits.max_iterations_per_solve * PUMP_ITERATION_FACTOR,
+        );
         *iterations += solved.iterations;
-        if solved.status != LpStatus::Optimal {
+        spent += solved.iterations;
+        if spent > ceiling {
             return None;
         }
+        if solved.status != LpStatus::Optimal {
+            // One unfinished re-solve is a reason to try elsewhere, not to abandon the
+            // search. The walk restarts from a perturbed point, and only repeated
+            // failures end it.
+            failures += 1;
+            if failures >= MAX_SOLVE_FAILURES {
+                return None;
+            }
+            cycles = RESTART_AFTER_CYCLES;
+            continue;
+        }
+        failures = 0;
         x = solved.x;
         warm = solved.basis;
     }

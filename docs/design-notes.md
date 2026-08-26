@@ -307,6 +307,35 @@ between rounding and re-optimizing the original constraint set under a distance
 objective, so its LP stays feasible throughout. It finds solutions on five of the six
 models where diving finds none.
 
+The pump was given restarts, and they did not do what they were meant to. Three
+defects turned up on the way and are worth separating from the result.
+
+It only noticed a cycle of period one, by comparing against the previous target, so a
+longer cycle ran out the round limit doing nothing. It now fingerprints every target
+since the last restart.
+
+Small flips escape a short cycle but not a basin: once the walk keeps returning to the
+same neighbourhood, nudging a handful of columns returns it there again. After three
+cycles it now restarts, moving a tenth of the integer columns and forgetting where it
+has been. The perturbation is a seeded SplitMix64 so a run stays reproducible.
+
+The third was a plain bug. A re-solve that hit the per-solve iteration cap ended the
+whole pump, and the distance LP is a full re-optimization rather than the handful of
+pivots a dive step takes. On `nursesched-sprint02` and `piperout-27` the first round hit
+the cap and the heuristic returned having done nothing, which from outside is
+indistinguishable from a pump that ran and failed. It now restarts on an unfinished
+re-solve and gives up only after three in a row.
+
+None of that finds a first solution on the models it was aimed at. `neos-555001` runs
+10000 rounds and 81000 pivots without reaching feasibility; the other two run properly
+now and still fail. The pump is bounded to eight re-solves' worth of work in total for
+that reason, because a heuristic that fails should not first spend 26 seconds of a 45
+second budget doing it.
+
+What this leaves is that these models need feasibility machinery of a different kind,
+propagation-based rather than rounding-based, and that the pump's failures here are
+genuine rather than an artefact of it being throttled.
+
 Those solutions are poor, 2791 against an optimum of 137 on `v064c064`, but an
 incumbent of any quality switches pruning on. `v064c200` drops from 9916 nodes and
 5.7s to 3388 nodes and 2.25s.
