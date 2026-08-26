@@ -83,7 +83,9 @@ Useful flags for `solve`:
 | `--local-cut-frequency <n>` | Separate cuts at one node in every `n`. Default 10, `0` disables |
 | `--cut-rounds <n>` | Rounds of root cut separation. Default 0 |
 | `--no-presolve` | Skip presolve |
-| `-v` | Print the value of every column |
+| `--values <none\|nonzero\|all>` | Print column values, one per line |
+| `--solution <PATH>` | Write the solution to a file as `name value` lines |
+| `-v` | Shorthand for `--values nonzero` |
 
 A run that hits its time limit reports the best solution found and the remaining gap
 rather than failing.
@@ -169,37 +171,33 @@ let solution = search::solve(&problem, search::Options::default());
 println!("{:?} {:?}", solution.status, solution.objective);
 ```
 
-`Problem` is a plain struct with public fields, so a model is assembled rather than
-built through a builder. Rows are held in range form, `lb <= a'x <= ub`, and objective
-coefficients are stored in minimization form, so a maximization negates them on the way
-in. Maximizing `3b + 2n` subject to `2b + n <= 12`:
+`Builder` assembles a model a column and a row at a time. Objective coefficients are
+written in the sense you ask for. Maximizing `3b + 2n` subject to `2b + n <= 12`:
 
 ```rust
-use ripsolve::model::{Problem, RowSense, Sense, VarType};
-use ripsolve::{SparseMatrix, search};
+use ripsolve::model::{Builder, RowSense, Sense};
+use ripsolve::search;
 
-let (lb, ub) = RowSense::Le.bounds(12.0);
-let problem = Problem {
-    name: "example".into(),
-    sense: Sense::Maximize,
-    obj: vec![-3.0, -2.0],          // minimization form
-    obj_offset: 0.0,
-    matrix: SparseMatrix::from_triplets(1, 2, [(0, 0, 2.0), (0, 1, 1.0)]),
-    row_lb: vec![lb],
-    row_ub: vec![ub],
-    col_lb: vec![0.0, 0.0],
-    col_ub: vec![1.0, 10.0],        // b is binary, n is integer in [0, 10]
-    col_type: vec![VarType::Integer, VarType::Integer],
-    col_names: vec!["b".into(), "n".into()],
-    row_names: vec!["c0".into()],
-};
+let mut model = Builder::new(Sense::Maximize).named("example");
+let b = model.binary("b");
+let n = model.integer("n", 0.0, 10.0);
+model.objective(&[(b, 3.0), (n, 2.0)]);
+model.row(&[(b, 2.0), (n, 1.0)], RowSense::Le, 12.0);
+
+let problem = model.build();
+problem.validate()?;
 
 let solution = search::solve(&problem, search::Options::default());
 assert_eq!(solution.objective, Some(23.0));
 ```
 
-A binary column is an integer column bounded to `[0, 1]`. Nothing treats that as a
-distinct case, because branching splits a range and degenerates to fixing at 0 or 1.
+`continuous` adds a column with no integrality requirement, and `range` adds a row
+bounded on both sides. A binary column is an integer column bounded to `[0, 1]`;
+nothing treats that as a distinct case, because branching splits a range and
+degenerates to fixing at 0 or 1.
+
+`Problem` is also a plain struct with public fields, so it can be filled in directly
+when translating a model from somewhere else.
 
 `search::Options` carries the tuning knobs, including `threads`, `time_limit`,
 `gap_tolerance`, `local_cut_frequency` and `cut_rounds`. The library defaults to one

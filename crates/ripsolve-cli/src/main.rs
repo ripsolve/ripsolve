@@ -1,5 +1,16 @@
 use std::path::PathBuf;
 
+/// Which column values `solve` should print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Values {
+    /// Print none of them.
+    None,
+    /// Print only the columns away from zero, which is usually what is interesting.
+    Nonzero,
+    /// Print every column, including the zeros.
+    All,
+}
+
 use anyhow::{Context, Result};
 use ripsolve::Problem;
 use ripsolve::generate::{Kind, Spec};
@@ -40,9 +51,15 @@ enum Command {
         /// Relative optimality gap to stop at. 0 demands a proof of optimality.
         #[arg(long, default_value_t = 1e-4)]
         gap: f64,
-        /// Print the value of every column.
+        /// Which column values to print: none, nonzero, or all.
+        #[arg(long, value_enum, default_value_t = Values::None)]
+        values: Values,
+        /// Shorthand for `--values nonzero`.
         #[arg(short, long)]
         verbose: bool,
+        /// Also write the solution to this file, one `name value` pair per line.
+        #[arg(long, value_name = "PATH")]
+        solution: Option<PathBuf>,
         /// Skip presolve.
         #[arg(long)]
         no_presolve: bool,
@@ -124,7 +141,9 @@ fn main() -> Result<()> {
             max_nodes,
             time_limit,
             gap,
+            values,
             verbose,
+            solution: solution_path,
             no_presolve,
             cut_rounds,
             cuts_per_round,
@@ -166,17 +185,39 @@ fn main() -> Result<()> {
                             solution.gap() * 100.0
                         );
                     }
-                    if verbose {
-                        // Print every column that is not at zero, with its value:
-                        // a general integer can be 3, not just 0 or 1.
-                        let nonzero: Vec<String> = problem
+                    // `-v` is the old spelling of `--values nonzero` and still works.
+                    let wanted = if verbose && values == Values::None {
+                        Values::Nonzero
+                    } else {
+                        values
+                    };
+                    if wanted != Values::None {
+                        // One per line rather than one long line: a model with
+                        // thousands of columns is unreadable otherwise, and a line per
+                        // column is what `grep` and `awk` expect.
+                        let width = problem
                             .col_names
                             .iter()
-                            .zip(&solution.x)
-                            .filter(|(_, v)| v.abs() > 1e-9)
-                            .map(|(n, v)| format!("{n}={v}"))
-                            .collect();
-                        println!("nonzero: {}", nonzero.join(" "));
+                            .map(|n| n.len())
+                            .max()
+                            .unwrap_or(0)
+                            .min(40);
+                        println!("values:");
+                        for (name, value) in problem.col_names.iter().zip(&solution.x) {
+                            // A general integer can be 3, not just 0 or 1, so the value
+                            // is printed rather than the name alone.
+                            if wanted == Values::All || value.abs() > 1e-9 {
+                                println!("  {name:<width$} {value}");
+                            }
+                        }
+                    }
+                    if let Some(path) = &solution_path {
+                        let mut out = String::new();
+                        for (name, value) in problem.col_names.iter().zip(&solution.x) {
+                            out.push_str(&format!("{name} {value}\n"));
+                        }
+                        std::fs::write(path, out)
+                            .with_context(|| format!("writing {}", path.display()))?;
                     }
                 }
                 None => println!("status:    {:?}", solution.status),

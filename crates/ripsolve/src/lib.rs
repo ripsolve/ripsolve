@@ -25,46 +25,45 @@
 //! Both LP and MPS are read, chosen by file extension, or explicitly with
 //! [`Problem::from_file_as`].
 //!
-//! # Building a model directly
+//! # Building a model
 //!
-//! [`Problem`] is a plain struct with public fields, so a model is assembled rather
-//! than built through a builder. Rows are held in range form, `lb <= a'x <= ub`, which
-//! is what [`RowSense::bounds`] converts a written sense into. Objective coefficients
-//! are always stored in minimization form; a maximization negates them on the way in,
-//! and [`Problem::objective_value`] converts a solved value back.
+//! [`Builder`] assembles a model a column and a row at a time. Objective coefficients
+//! are written in the sense you ask for, and the conversion to the solver's internal
+//! minimization form happens on `build`.
 //!
 //! Maximize `3b + 2n` subject to `2b + n <= 12`, with `b` binary and `n` integer in
 //! `[0, 10]`:
 //!
 //! ```
-//! use ripsolve::model::{Problem, RowSense, Sense, VarType};
-//! use ripsolve::{SparseMatrix, search};
+//! use ripsolve::model::{Builder, RowSense, Sense};
+//! use ripsolve::search;
 //!
-//! let (lb, ub) = RowSense::Le.bounds(12.0);
-//! let problem = Problem {
-//!     name: "example".into(),
-//!     sense: Sense::Maximize,
-//!     // Minimization form: the maximization objective negated.
-//!     obj: vec![-3.0, -2.0],
-//!     obj_offset: 0.0,
-//!     matrix: SparseMatrix::from_triplets(1, 2, [(0, 0, 2.0), (0, 1, 1.0)]),
-//!     row_lb: vec![lb],
-//!     row_ub: vec![ub],
-//!     col_lb: vec![0.0, 0.0],
-//!     col_ub: vec![1.0, 10.0],
-//!     col_type: vec![VarType::Integer, VarType::Integer],
-//!     col_names: vec!["b".into(), "n".into()],
-//!     row_names: vec!["c0".into()],
-//! };
-//! problem.validate().unwrap();
+//! let mut model = Builder::new(Sense::Maximize).named("example");
+//! let b = model.binary("b");
+//! let n = model.integer("n", 0.0, 10.0);
+//! model.objective(&[(b, 3.0), (n, 2.0)]);
+//! model.row(&[(b, 2.0), (n, 1.0)], RowSense::Le, 12.0);
+//!
+//! let problem = model.build();
+//! problem.validate()?;
 //!
 //! let solution = search::solve(&problem, search::Options::default());
 //! assert_eq!(solution.objective, Some(23.0));
+//! # Ok::<(), ripsolve::ModelError>(())
 //! ```
 //!
 //! A binary column is an integer column bounded to `[0, 1]`. Nothing in the solver
 //! treats that as a distinct case, because branching splits a range and degenerates to
 //! fixing at 0 or 1 on its own.
+//!
+//! [`Builder::continuous`] adds a column with no integrality requirement, and
+//! [`Builder::range`] adds a row bounded on both sides, `lb <= a\'x <= ub`, which is the
+//! form rows are held in internally.
+//!
+//! [`Problem`] is a plain struct with public fields, so it can also be filled in
+//! directly when a model is being translated from somewhere else. Doing so means
+//! keeping the parallel vectors consistent and writing the objective already negated
+//! for a maximization, which is what the builder exists to avoid.
 //!
 //! # Controlling the search
 //!
@@ -111,6 +110,6 @@ pub mod reader;
 pub mod search;
 pub mod sparse;
 
-pub use model::{ModelError, Problem, RowSense, Sense};
+pub use model::{Builder, ModelError, Problem, RowSense, Sense, VarType};
 pub use reader::{Format, ReadError};
 pub use sparse::SparseMatrix;

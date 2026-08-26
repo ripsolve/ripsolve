@@ -83,6 +83,157 @@ impl RowSense {
     }
 }
 
+/// A row held while the model is being assembled: terms, then its two bounds.
+type PendingRow = (Vec<(usize, f64)>, f64, f64);
+
+/// Assembles a [`Problem`] a column and a row at a time.
+///
+/// [`Problem`] is a plain struct and can be filled in directly, but doing so means
+/// keeping nine parallel vectors consistent and writing the objective in minimization
+/// form by hand. This does both for you.
+///
+/// ```
+/// use ripsolve::model::{Builder, RowSense, Sense};
+/// use ripsolve::search;
+///
+/// // Maximize 3b + 2n subject to 2b + n <= 12, b binary and n integer in [0, 10].
+/// let mut model = Builder::new(Sense::Maximize);
+/// let b = model.binary("b");
+/// let n = model.integer("n", 0.0, 10.0);
+/// model.objective(&[(b, 3.0), (n, 2.0)]);
+/// model.row(&[(b, 2.0), (n, 1.0)], RowSense::Le, 12.0);
+/// let problem = model.build();
+///
+/// let solution = search::solve(&problem, search::Options::default());
+/// assert_eq!(solution.objective, Some(23.0));
+/// ```
+pub struct Builder {
+    sense: Sense,
+    obj: Vec<f64>,
+    col_lb: Vec<f64>,
+    col_ub: Vec<f64>,
+    col_type: Vec<VarType>,
+    col_names: Vec<String>,
+    rows: Vec<PendingRow>,
+    row_names: Vec<String>,
+    name: String,
+}
+
+impl Builder {
+    pub fn new(sense: Sense) -> Self {
+        Self {
+            sense,
+            obj: Vec::new(),
+            col_lb: Vec::new(),
+            col_ub: Vec::new(),
+            col_type: Vec::new(),
+            col_names: Vec::new(),
+            rows: Vec::new(),
+            row_names: Vec::new(),
+            name: String::new(),
+        }
+    }
+
+    /// Name the model, as it appears in [`Problem::name`].
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
+    /// Add a column, returning its index for use in rows and the objective.
+    pub fn column(&mut self, name: &str, lb: f64, ub: f64, kind: VarType) -> usize {
+        self.obj.push(0.0);
+        self.col_lb.push(lb);
+        self.col_ub.push(ub);
+        self.col_type.push(kind);
+        self.col_names.push(name.to_string());
+        self.obj.len() - 1
+    }
+
+    /// A column restricted to `{0, 1}`.
+    pub fn binary(&mut self, name: &str) -> usize {
+        self.column(name, 0.0, 1.0, VarType::Integer)
+    }
+
+    /// A column restricted to the integers in `[lb, ub]`.
+    pub fn integer(&mut self, name: &str, lb: f64, ub: f64) -> usize {
+        self.column(name, lb, ub, VarType::Integer)
+    }
+
+    /// A column free to take any value in `[lb, ub]`.
+    pub fn continuous(&mut self, name: &str, lb: f64, ub: f64) -> usize {
+        self.column(name, lb, ub, VarType::Continuous)
+    }
+
+    /// Set the objective from `(column, coefficient)` pairs.
+    ///
+    /// Written in the sense given to [`Builder::new`]; the conversion to the solver's
+    /// internal minimization form happens in [`Builder::build`].
+    pub fn objective(&mut self, terms: &[(usize, f64)]) {
+        for c in self.obj.iter_mut() {
+            *c = 0.0;
+        }
+        for &(j, c) in terms {
+            self.obj[j] += c;
+        }
+    }
+
+    /// Add a row `terms <sense> rhs`, returning its index.
+    pub fn row(&mut self, terms: &[(usize, f64)], sense: RowSense, rhs: f64) -> usize {
+        let (lb, ub) = sense.bounds(rhs);
+        self.range(terms, lb, ub)
+    }
+
+    /// Add a row in range form, `lb <= terms <= ub`, returning its index.
+    pub fn range(&mut self, terms: &[(usize, f64)], lb: f64, ub: f64) -> usize {
+        let i = self.rows.len();
+        self.rows.push((terms.to_vec(), lb, ub));
+        self.row_names.push(format!("c{i}"));
+        i
+    }
+
+    /// Rename the most recently added row.
+    pub fn row_named(&mut self, name: &str) {
+        if let Some(last) = self.row_names.last_mut() {
+            *last = name.to_string();
+        }
+    }
+
+    /// Finish the model.
+    ///
+    /// The result is not validated; call [`Problem::validate`] for that.
+    pub fn build(self) -> Problem {
+        let n = self.obj.len();
+        let m = self.rows.len();
+        // The solver minimizes, so a maximization is negated on the way in and
+        // `Problem::objective_value` negates the answer back.
+        let flip = if self.sense == Sense::Maximize {
+            -1.0
+        } else {
+            1.0
+        };
+        let triplets = self
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (terms, _, _))| terms.iter().map(move |&(j, a)| (i, j, a)));
+        Problem {
+            name: self.name,
+            sense: self.sense,
+            obj: self.obj.iter().map(|c| c * flip).collect(),
+            obj_offset: 0.0,
+            matrix: SparseMatrix::from_triplets(m, n, triplets),
+            row_lb: self.rows.iter().map(|r| r.1).collect(),
+            row_ub: self.rows.iter().map(|r| r.2).collect(),
+            col_lb: self.col_lb,
+            col_ub: self.col_ub,
+            col_type: self.col_type,
+            col_names: self.col_names,
+            row_names: self.row_names,
+        }
+    }
+}
+
 impl Problem {
     pub fn n_cols(&self) -> usize {
         self.obj.len()
@@ -229,6 +380,66 @@ pub enum ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_builder_negates_a_maximization_and_reports_it_back() {
+        // The solver minimizes, so a maximization is stored negated. What the caller
+        // wrote must come back out of `objective_value`, which is the part that is easy
+        // to get backwards when filling the struct by hand.
+        let mut model = Builder::new(Sense::Maximize);
+        let x = model.binary("x");
+        model.objective(&[(x, 7.0)]);
+        let p = model.build();
+
+        assert_eq!(p.obj, vec![-7.0], "stored in minimization form");
+        assert_eq!(
+            p.objective_value(-7.0),
+            7.0,
+            "reported in the caller's sense"
+        );
+
+        let mut same = Builder::new(Sense::Minimize);
+        let y = same.binary("y");
+        same.objective(&[(y, 7.0)]);
+        assert_eq!(same.build().obj, vec![7.0], "a minimization is left alone");
+    }
+
+    #[test]
+    fn the_builder_places_coefficients_where_it_says() {
+        let mut model = Builder::new(Sense::Minimize).named("m");
+        let a = model.continuous("a", 0.0, 10.0);
+        let b = model.integer("b", -3.0, 3.0);
+        model.row(&[(a, 2.0), (b, -1.0)], RowSense::Ge, 4.0);
+        model.row_named("first");
+        model.range(&[(b, 1.0)], -1.0, 2.0);
+        let p = model.build();
+
+        assert_eq!((p.n_cols(), p.n_rows()), (2, 2));
+        assert_eq!(p.row_names, vec!["first".to_string(), "c1".to_string()]);
+        // `Ge` becomes a range open at the top, and the explicit range is kept as given.
+        assert_eq!(p.row_lb, vec![4.0, -1.0]);
+        assert_eq!(p.row_ub, vec![f64::INFINITY, 2.0]);
+        assert_eq!((p.col_lb[b], p.col_ub[b]), (-3.0, 3.0));
+        assert!(p.is_integer(b) && !p.is_integer(a));
+        assert!(!p.is_binary(b), "an integer in [-3, 3] is not binary");
+
+        let csr = p.matrix.to_csr();
+        let (cols, vals) = csr.column(0);
+        assert_eq!(cols, &[a, b]);
+        assert_eq!(vals, &[2.0, -1.0]);
+        p.validate().expect("the assembled model is well formed");
+    }
+
+    #[test]
+    fn setting_the_objective_twice_replaces_it() {
+        // `objective` is a setter, not an accumulator, so a second call is a correction
+        // rather than a doubling. Repeated columns within one call do accumulate.
+        let mut model = Builder::new(Sense::Minimize);
+        let x = model.binary("x");
+        model.objective(&[(x, 1.0)]);
+        model.objective(&[(x, 2.0), (x, 3.0)]);
+        assert_eq!(model.build().obj, vec![5.0]);
+    }
 
     fn tiny(sense: Sense, offset: f64) -> Problem {
         Problem {
