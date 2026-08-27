@@ -432,6 +432,67 @@ Two models gain outright and the rest lose wall time to the pivot row. Crucially
 does nothing for the three relaxations that do not finish at all, which is what it was
 re-tried for.
 
+### What the iteration counts are actually being compared against
+
+A correction to the numbers quoted elsewhere here. Comparing our relaxation solves
+against a reference solver's default settings compares against a *presolved* model,
+which is not the same input at all. With the reference solver's presolve turned off:
+
+| LP relaxation | ripsolve | reference, presolve on | reference, presolve off |
+|---|---:|---:|---:|
+| `p200x1188c` | 454 | 46 | 525 |
+| `dsbmip` | 1733 | 1623 | 1719 |
+| `decomp1` | 4210 | 2230 | 3268 |
+| `neos-1445532` | 4562 | 1197 | 3320 |
+| `n13-3` | 1811 | 327 | 1051 |
+| `neos-1582420` | 3730 | 1178 | 1165 |
+| `neos-595904` | 5756 | 660 | 742 |
+
+Like for like the simplex is within 1.0 to 1.4x on several of these and ahead on one,
+rather than the 2 to 9x the default comparison suggests. The gap that comparison was
+really measuring is presolve, and the relaxation path here does not presolve at all.
+
+That does not excuse the models that never finish, because presolve is not what rescues
+those either: without it the reference solver still takes 4502 iterations on
+`neos-850681`, 10422 on `s55` and 23666 on `gasprod1-2`, all of which it finishes.
+
+### Phase 1 is where the real gap is
+
+Splitting the iterations by phase locates it. `s55` spends every one of 60000
+iterations in phase 1 and never reaches a feasible basis at all, on a model the
+reference solver solves outright in 10422; `neos-850681` spends 54%. Phase 1 also
+dominates several relaxations that do finish: 92% of `decomp1`, 81% of `n13-3`, 73% of
+`misc07`.
+
+The reason is structural. Phase 1 shares the phase-2 ratio test, which stops at the
+first breakpoint. That fixes at most one infeasibility per pivot, and at a degenerate
+vertex, where many basic variables sit exactly on their bounds and the first breakpoint
+is at zero, it fixes none and moves nothing. The textbook answer is the long-step rule:
+the phase-1 objective is piecewise linear and convex in the step, falling at the
+entering column's reduced cost and flattening by `|beta_i|` each time a basic variable
+crosses a bound, so the minimum is the first breakpoint at which the slope reaches
+zero, which may be many breakpoints along.
+
+It was implemented and reverted. The rule itself works: on `lu_pivot_regression` the
+sum of violations falls from 1.35e4 to 81.25 within 2000 iterations. It then cycles,
+and the model goes from 622 iterations to not finishing in 500000.
+
+What the cycle exposes is worth keeping even though the change is not. The anti-cycling
+here counts steps of length zero, which is a proxy for the objective not moving, and
+the short-step rule makes the two coincide. The long-step rule breaks that equivalence:
+it takes a full step of 0.157 every iteration, trading one bound for another, and
+leaves the total violation at exactly 8.1254231825e1 for as long as it is allowed to
+run. Because the step is not zero, Bland's rule is never reached. Measuring objective
+progress rather than step length makes the detector fire, and was tried, but by then
+the long steps have walked the basis somewhere the short-step rule cannot recover from
+either, so it still does not finish.
+
+So a long-step phase 1 needs its own anti-cycling, not the one that came with the
+short-step rule. That is the next thing to build, and it is a prerequisite rather than
+an optimization: a single variable carrying the entire remaining violation, with a
+negligible pivot in every column that could reduce it, is a situation the current phase
+1 cannot leave by any route.
+
 ### The Harris ratio test
 
 Those three relaxations stall rather than mislead: thousands of consecutive
