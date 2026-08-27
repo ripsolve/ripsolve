@@ -743,6 +743,32 @@ rather than incidental: workers expand nodes that a serial search would have pru
 against an incumbent it had already found, so total node count rises with thread
 count even as wall-clock time falls. `mkp_200` goes from 19522 nodes to 49432.
 
+## Measuring the search
+
+The parallel search is not deterministic, and single runs of it are not evidence.
+Workers expand nodes in whatever order they finish, so the incumbent found first
+differs between runs of the same binary on the same model, and everything downstream
+follows it. Repeated runs at sixteen threads spread by several points of final gap:
+`neos-911970` over 19.01%, 21.59% and 22.61%, `beavma` over 9.99%, 13.17% and 11.54%.
+
+That is wider than most of the changes worth measuring, and it has already produced a
+false result recorded in this history. A single sweep showed `cap6000` improving from a
+4.08% gap to 0.58% and the improvement was attributed to a change in the dual method.
+Rerunning it three times on that build and three more on the build without the change
+gives 4.0816% every time. The 0.58% was one lucky ordering.
+
+Single threaded, the same solve is exactly reproducible: `beavma` returns 8.7117% three
+times running. So an A/B of an algorithmic change belongs at one thread, and the
+sixteen-thread numbers belong only in headline results where the comparison is against
+another solver rather than against another build of this one.
+
+The trap this falls into is measuring the loudest number rather than the one the change
+acts on. A related case earlier: a change to the dual method's stall detection was read
+as harmless because final gaps barely moved, when it had cut the node count on
+`drayage-25-23` from 98 to 4. The gaps could not move, because that instance finds no
+incumbent either way, so the only number that could show the damage was the one not
+being watched.
+
 ## Correctness practices
 
 Several bugs in this project were invisible to unit tests and were caught only by
