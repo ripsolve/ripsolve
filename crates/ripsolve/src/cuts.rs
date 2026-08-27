@@ -497,10 +497,13 @@ struct VariableBound {
 }
 
 /// A column of the row being rounded, after bound substitution has been applied.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Term {
     /// A column of the model itself.
     Column(usize),
+    /// The complement `1 - y` of a binary column, which is what lets the rounding see
+    /// a binary the point is holding near one rather than near zero.
+    Complement(usize),
     /// The slack `s_j = factor * y - x_j` of column `j` against its variable upper
     /// bound. It is continuous and nonnegative, which is all the rounding needs.
     Residual(usize),
@@ -598,24 +601,24 @@ pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
             if terms.iter().any(|&(j, _)| problem.col_lb[j] != 0.0) {
                 continue;
             }
-            // Both the row as written and the row with its continuous columns
-            // substituted are worth rounding, and which one bites is not predictable
-            // from the row alone.
-            for substitute in [false, true] {
-                let (substituted, rhs) = if substitute {
-                    match substitute_bounds(problem, &terms, bound, x, &vubs) {
-                        Some(pair) => pair,
-                        None => continue,
-                    }
-                } else {
-                    (
-                        terms.iter().map(|&(j, a)| (Term::Column(j), a)).collect(),
-                        bound,
-                    )
-                };
-                if let Some(cut) =
-                    mir_from_row(problem, &substituted, rhs, x, &vubs, MAX_MIR_DIVISORS)
-                {
+            // Each rewriting of the row is exact, and which one the rounding bites on
+            // is not predictable from the row alone, so all four are tried: as written,
+            // with continuous columns put on their variable bounds, with binaries near
+            // one complemented, and with both.
+            let plain: Vec<(Term, f64)> =
+                terms.iter().map(|&(j, a)| (Term::Column(j), a)).collect();
+            let mut rewritings = vec![(plain.clone(), bound)];
+            if let Some(pair) = substitute_bounds(problem, &terms, bound, x, &vubs) {
+                rewritings.push(pair);
+            }
+            for index in 0..rewritings.len() {
+                let (row, rhs) = &rewritings[index];
+                if let Some(pair) = complement_binaries(problem, row, *rhs, x) {
+                    rewritings.push(pair);
+                }
+            }
+            for (row, rhs) in &rewritings {
+                if let Some(cut) = mir_from_row(problem, row, *rhs, x, &vubs, MAX_MIR_DIVISORS) {
                     found.push(cut);
                 }
             }
@@ -674,7 +677,8 @@ fn substitute_bounds(
     // Substitution can put weight on a binary the row already mentioned.
     coefficients.sort_by_key(|&(term, _)| match term {
         Term::Column(j) => (0usize, j),
-        Term::Residual(j) => (1, j),
+        Term::Complement(j) => (1, j),
+        Term::Residual(j) => (2, j),
     });
     coefficients.dedup_by(|later, held| {
         if later.0 == held.0 {
@@ -686,6 +690,43 @@ fn substitute_bounds(
     });
     coefficients.retain(|&(_, a)| a.abs() > TOL);
     Some((coefficients, bound))
+}
+
+/// Replace binaries the point holds near one by their complements.
+///
+/// The rounding only reads a column's distance from zero, so a binary sitting near one
+/// contributes nothing it can act on. Rewriting `y` as `1 - y'` moves that column back
+/// to the end the derivation can use, and shifts the constant it carries onto the
+/// right-hand side. This is exact, so the rewritten row holds wherever the original
+/// does. Returns `None` when nothing was complemented and the caller has already
+/// rounded the row as it stands.
+fn complement_binaries(
+    problem: &Problem,
+    terms: &[(Term, f64)],
+    bound: f64,
+    x: &[f64],
+) -> Option<(Vec<(Term, f64)>, f64)> {
+    let mut coefficients: Vec<(Term, f64)> = Vec::with_capacity(terms.len());
+    let mut rhs = bound;
+    let mut complemented = false;
+
+    for &(term, a) in terms {
+        let Term::Column(j) = term else {
+            coefficients.push((term, a));
+            continue;
+        };
+        let binary =
+            problem.is_integer(j) && problem.col_lb[j] == 0.0 && problem.col_ub[j] == 1.0;
+        if !binary || x[j] <= 0.5 {
+            coefficients.push((term, a));
+            continue;
+        }
+        // a y = a - a y', so the constant moves across.
+        coefficients.push((Term::Complement(j), -a));
+        rhs -= a;
+        complemented = true;
+    }
+    complemented.then_some((coefficients, rhs))
 }
 
 /// The most violated MIR cut over a handful of divisors, if any is violated at all.
@@ -703,6 +744,7 @@ fn mir_from_row(
 ) -> Option<Cut> {
     let is_integer = |term: Term| match term {
         Term::Column(j) => problem.is_integer(j),
+        Term::Complement(_) => true,
         Term::Residual(_) => false,
     };
 
@@ -760,9 +802,15 @@ fn mir_from_row(
 /// binary and the continuous column it came from.
 fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) -> Option<Cut> {
     let mut coefficients: Vec<(usize, f64)> = Vec::with_capacity(rounded.len() * 2);
+    let mut rhs = rhs;
     for &(term, c) in rounded {
         match term {
             Term::Column(j) => coefficients.push((j, c)),
+            Term::Complement(j) => {
+                // c (1 - y) on the left is -c y with c taken off the right.
+                coefficients.push((j, -c));
+                rhs -= c;
+            }
             Term::Residual(j) => {
                 let vub = vubs[j]?;
                 coefficients.push((vub.binary, c * vub.factor));
@@ -1198,6 +1246,29 @@ mod tests {
         assert!(variable_upper_bounds(&mixed_knapsack(4.5, 3.0))
             .iter()
             .all(Option::is_none));
+    }
+
+    #[test]
+    fn complementing_moves_a_binary_near_one_back_to_zero() {
+        // Only the binary the point holds above a half is rewritten, and the constant
+        // it carries moves onto the right-hand side.
+        let p = mixed_knapsack(7.4, 3.0);
+        let x = [0.0, 1.0, 0.25, 0.0];
+        let terms = [
+            (Term::Column(0), 1.0),
+            (Term::Column(1), 3.0),
+            (Term::Column(2), 3.0),
+            (Term::Column(3), 3.0),
+        ];
+        let (rewritten, rhs) =
+            complement_binaries(&p, &terms, 7.4, &x).expect("a binary sits above a half");
+        assert!((rhs - 4.4).abs() < 1e-9, "rhs {rhs}");
+        assert_eq!(rewritten[0], (Term::Column(0), 1.0));
+        assert_eq!(rewritten[1], (Term::Complement(1), -3.0));
+        assert_eq!(rewritten[2], (Term::Column(2), 3.0));
+
+        // With every binary at zero there is nothing to move.
+        assert!(complement_binaries(&p, &terms, 7.4, &[0.0; 4]).is_none());
     }
 
     #[test]
