@@ -487,11 +487,64 @@ progress rather than step length makes the detector fire, and was tried, but by 
 the long steps have walked the basis somewhere the short-step rule cannot recover from
 either, so it still does not finish.
 
-So a long-step phase 1 needs its own anti-cycling, not the one that came with the
-short-step rule. That is the next thing to build, and it is a prerequisite rather than
-an optimization: a single variable carrying the entire remaining violation, with a
-negligible pivot in every column that could reduce it, is a situation the current phase
-1 cannot leave by any route.
+The rule was then finished properly on the `longstep-phase1` branch, which is kept
+unmerged. Two real defects in it turned up, both worth knowing about:
+
+- A crossing that computes to a small *negative* step was being discarded rather than
+  clamped to zero. A basic variable a hair outside a bound, but not far enough outside
+  to count as violating it, is pushed further out the moment the step begins, so its
+  kink belongs at zero; dropping it loses that slope entirely. The short-step rule
+  already clamps, and says why in a comment. Without the clamp the walk starts uphill
+  while believing it starts downhill: at one vertex the true slope is +0.49 where the
+  reduced cost alone reports -0.56.
+- The slope is a reduced cost plus a running sum of `|beta|` terms of the same size, so
+  at a degenerate vertex it reaches zero by exact cancellation. Tested against a hard
+  zero it misses by an ulp and the walk steps straight past the minimum. On `s55` a
+  slope of -1 met a first crossing of weight 1 at a step of zero, and the walk went on
+  to a step of 1.6e-3 that improved nothing, indefinitely.
+
+With both fixed the rule is correct and does what it claims, and it still is not worth
+shipping:
+
+| LP relaxation | short step | long step |
+|---|---:|---:|
+| `misc07` | 464 | 409 |
+| `lu_pivot_regression` | 622 | 694 |
+| `decomp1` | 4210 | 4307 |
+| `n13-3` | 1811 | 2106 |
+| `s55` | never finishes | never finishes |
+
+Breakpoints per pivot were not the bottleneck. It also needs the stall detector to
+measure the objective rather than the step length, since it takes full-length steps
+that improve nothing, and making that change causes Bland's rule to engage earlier and
+leaves `s55` stuck at a worse point than before, a violation of 9.875 against 5.225.
+
+### Where phase 1 actually gets stuck, and what it points at
+
+What `s55` does is now clear. Phase 1 removes 99.99% of the infeasibility, 9.7e4 down
+to about 5, within 30000 iterations, and then stops dead at a degenerate vertex with
+three violating rows out of 9892. Every column pricing likes there has a true
+directional derivative of exactly zero, so nothing enters that can improve the
+objective, and Bland's rule walks between bases at the same point taking steps of
+length zero.
+
+The reason pricing likes them is worth stating, because it is not a tuning matter. The
+phase-1 cost vector scores a basic variable by whether it currently violates a bound,
+so it is blind to the kink at a variable sitting exactly *on* one, and blindest of all
+at a fixed variable, where the two bounds coincide and any movement at all is a
+violation. On `s55` the entering column's reduced cost claims a slope of -1 where the
+true one-sided slope is 0, and the whole of that difference is one fixed basic variable
+whose bounds are `[0, 0]`. A smooth reduced cost cannot see a kink, so no ratio test,
+short, long or Harris, can repair a column choice made this way.
+
+That is the ceiling on the primal method here, and it is why the reference solver does
+not hit it: its default is the dual simplex, which has no primal phase 1 to get stuck
+in. It solves `s55` in 10422 iterations and `neos-850681` in 4502 with its presolve
+turned off. A dual simplex already exists here and is used for warm starts; what it
+lacks for a cold start is a dual-feasible basis to begin from, which for a bounded
+model is mostly a matter of parking each nonbasic column on the bound that gives its
+reduced cost the right sign. That, rather than another primal ratio rule, is where the
+next attempt should go.
 
 ### The Harris ratio test
 
