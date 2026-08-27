@@ -395,6 +395,65 @@ choosing a column: it is also the reason the chosen column is numerically safe, 
 reason the iteration count is stable across models. A replacement needs to supply both,
 not just a better score.
 
+### Re-measuring pricing once the ratio test was sound
+
+The conclusion above, that Dantzig's rule was doing double duty as a numerical
+safeguard, turned out to be half right in a way worth correcting. The safeguard was
+real, but it was compensating for a defect in the ratio test rather than being a
+property of the pricing rule.
+
+The ratio test accepted any pivot above the absolute tolerance, including an entry a
+billionth the size of the largest in its own transformed column. On MIPLIB's
+neos-850681 one such pivot took the basis inverse from entries of 1e4 to 1e15 in two
+iterations, after which the solve reported a feasible relaxation infeasible. Dantzig's
+rule avoided the worst of that only by tending to pick columns that did not provoke it.
+So both earlier pricing rejections rested on evidence gathered over a broken ratio
+test: partial pricing's wrong answer, and devex's unexplained bad case on `nile`, are
+both the signature of that bug.
+
+With the guard in place devex was implemented again and re-measured. It is no longer
+erratic, and the objective it reaches now agrees with Dantzig's everywhere, but it is
+not worth shipping for a plainer reason: the pivot row costs a BTRAN and a pass over
+the nonbasic columns, which roughly doubles what an iteration spends on pricing, and
+the iteration count does not fall nearly enough to pay for it.
+
+| LP relaxation | Dantzig | devex |
+|---|---:|---:|
+| `misc07` | 464 pivots, 25.8ms | 201 pivots, 10.7ms |
+| `neos-3610173-itata` | 2496 pivots, 238ms | 1280 pivots, 74ms |
+| `decomp1` | 4210 pivots, 1.08s | 3817 pivots, 1.40s |
+| `neos-1445532` | 4562 pivots, 794ms | 4089 pivots, 1.06s |
+| `neos-1582420` | 3730 pivots, 2.97s | 4605 pivots, 4.49s |
+| `n13-3` | 1811 pivots, 111ms | 2185 pivots, 198ms |
+| `neos-850681` | iteration limit | iteration limit |
+| `s55` | iteration limit | iteration limit |
+
+Two models gain outright and the rest lose wall time to the pivot row. Crucially it
+does nothing for the three relaxations that do not finish at all, which is what it was
+re-tried for.
+
+### The Harris ratio test
+
+Those three relaxations stall rather than mislead: thousands of consecutive
+zero-length steps, with the objective on `neos-850681` creeping from 2087.475 towards
+2087.0 over hundreds of thousands of pivots. That is degeneracy, and the textbook
+answer is Harris's two-pass ratio test. Pass one finds the furthest the entering
+variable could move if every basic variable were allowed to overshoot its bound by the
+feasibility tolerance; pass two takes the largest pivot within that band. It should
+both stabilize the basis and let a step be nonzero where the exact rule can only stall.
+
+It was implemented and reverted. It failed `a_feasible_relaxation_is_not_reported_infeasible`,
+the regression test kept for exactly this class of bug, and it left `neos-850681` at the
+iteration limit and slower than before. The mechanism is inherent to the plain form:
+the chosen step is the selected row's breakpoint rather than the shortest one, so every
+pivot may leave a basic variable up to a tolerance outside its bounds, and those
+violations accumulate until phase 1 gives up on a feasible model. Controlling that is
+what bound shifting is for, and Harris without shifting is not a partial version of the
+technique but a broken one.
+
+So the degeneracy on those three relaxations remains open, and the next thing to try is
+shifting itself rather than another pricing or ratio rule.
+
 One smaller thing was measured and rejected on the way. Both solves allocated an
 `m`-length buffer per call, which on `neos-555001` is 128000 allocations of 27KB and
 showed as 5.8% in `malloc`. Reusing a thread-local buffer removed the allocations and
