@@ -212,6 +212,32 @@ pub struct Solution {
 }
 
 impl Solution {
+    /// A result carrying no solution: the search ended before it held one.
+    ///
+    /// Written once because the fields that must be absent are easy to get subtly
+    /// wrong when spelled out at each exit, and a bound left over from a previous
+    /// phase would be read as a proof of something.
+    fn without_solution(
+        status: Status,
+        nodes: usize,
+        simplex_iterations: usize,
+        presolve: Option<presolve::Stats>,
+    ) -> Self {
+        Self {
+            status,
+            objective: None,
+            x: Vec::new(),
+            bound: f64::NAN,
+            nodes,
+            simplex_iterations,
+            presolve,
+            cuts_added: 0,
+            heuristic_solutions: 0,
+            root_bound: f64::NAN,
+            root_bound_after_cuts: f64::NAN,
+        }
+    }
+
     /// Remaining optimality gap, relative to the incumbent. Zero when proven.
     pub fn gap(&self) -> f64 {
         match self.objective {
@@ -870,6 +896,164 @@ struct Node {
 }
 
 /// Solve a mixed-integer program to proven optimality.
+/// What separating at the root produced.
+struct RootCuts {
+    /// The model carrying the cuts that survived, when any were kept. `None` means the
+    /// caller's model is still the one to search.
+    model: Option<Problem>,
+    lp: Lp,
+    root: LpSolution,
+    added: usize,
+    iterations: usize,
+}
+
+/// Separate cuts at the root, re-solving after each round.
+///
+/// Cut at the root only. Separating deeper in the tree is stronger still and is what
+/// [`Options::local_cut_frequency`] does; those cuts are valid for one subtree, while
+/// these are valid everywhere and so are added to the model once.
+///
+/// Returns the model to search rather than rebinding the caller's, which is what keeps
+/// "the presolved model" and "the presolved model plus cuts" from being the same
+/// variable.
+fn separate_at_root(
+    problem: &Problem,
+    mut lp: Lp,
+    mut root: LpSolution,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> RootCuts {
+    // Nothing to do, and in particular no reason to clone the model, which is the
+    // common case since root cutting is off by default.
+    if options.cut_rounds == 0 {
+        return RootCuts {
+            model: None,
+            lp,
+            root,
+            added: 0,
+            iterations: 0,
+        };
+    }
+
+    let mut added = 0usize;
+    let mut iterations = 0usize;
+    let mut problem = problem;
+    // Cut at the root only. Separating deeper in the tree ("local cuts") is
+    // stronger still, but it needs the cut pool to track which nodes each cut is
+    // valid for; these are globally valid, so adding them once to the model is
+    // both simpler and correct everywhere.
+
+    // The model without any cut rows. Each round rebuilds from here rather than
+    // appending to the previous round's model, which is what lets a cut leave again.
+    let base = problem.clone();
+    let mut model: Option<Problem> = None;
+    let mut with_cuts;
+    // Cuts currently carried in the model, each with a count of consecutive resolves
+    // it has sat slack through.
+    let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
+
+    for _ in 0..options.cut_rounds {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        if root.status != LpStatus::Optimal
+            || integral_solution(problem, &root.x, options.integrality_tolerance).is_some()
+        {
+            break;
+        }
+        // Two families with different reach: covers need a row that reads as a
+        // knapsack, while GMI comes off the tableau and applies to any fractional
+        // basic column. On dense random rows the second is usually the only one that
+        // finds anything.
+        let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
+        found.extend(cuts::separate_gomory(
+            &lp,
+            &root.basis,
+            &root.x,
+            options.cuts_per_round,
+        ));
+        // Separation is deliberately generous; this is where the model's row count is
+        // actually decided. Ranking by efficacy and dropping near-parallel duplicates
+        // keeps the rows that move the bound and discards the ones that only cost an
+        // LP column scan at every node below.
+        let found = cuts::select(found, &root.x, options.cuts_per_round);
+        if found.is_empty() {
+            break;
+        }
+        added += found.len();
+        active.extend(found.into_iter().map(|c| (c, 0)));
+
+        with_cuts = base.clone();
+        let rows: Vec<cuts::Cut> = active.iter().map(|(c, _)| c.clone()).collect();
+        with_cuts.add_cuts(&rows);
+
+        let mut candidate = Lp::relaxation(&with_cuts);
+        candidate.set_deadline(deadline);
+        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        iterations += resolved.iterations;
+        if resolved.status != LpStatus::Optimal {
+            // Keep the model that is known to solve rather than pressing on with one
+            // that does not; the bound already gained is still sound.
+            break;
+        }
+
+        // A cut that has gone slack is no longer shaping the relaxation, but it still
+        // costs work in every LP below it. Later rounds routinely make earlier rounds'
+        // cuts redundant, so age them out rather than accumulating.
+        for (cut, age) in &mut active {
+            if cut.is_tight(&resolved.x, CUT_SLACK_TOLERANCE) {
+                *age = 0;
+            } else {
+                *age += 1;
+            }
+        }
+        active.retain(|&(_, age)| age < CUT_MAX_AGE);
+
+        model = Some(with_cuts);
+        problem = model.as_ref().expect("just set");
+        lp = candidate;
+        root = resolved;
+    }
+
+    // One last purge before the tree opens. Every remaining slack cut would otherwise
+    // be carried through every node LP for the rest of the search, and a row that is
+    // inactive at the optimum of a convex program cannot be holding the bound up:
+    // dropping it leaves the same point optimal. The re-solve is a guard against that
+    // reasoning meeting a degenerate basis, not an expectation of change.
+    if root.status == LpStatus::Optimal
+        && active
+            .iter()
+            .any(|(c, _)| !c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
+    {
+        let rows: Vec<cuts::Cut> = active
+            .iter()
+            .filter(|(c, _)| c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut trimmed = base.clone();
+        trimmed.add_cuts(&rows);
+        let mut candidate = Lp::relaxation(&trimmed);
+        candidate.set_deadline(deadline);
+        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        iterations += resolved.iterations;
+        // Keep the trimmed model only if it really did hold the bound.
+        if resolved.status == LpStatus::Optimal
+            && resolved.objective >= root.objective - 1e-9 * root.objective.abs().max(1.0)
+        {
+            model = Some(trimmed);
+            lp = candidate;
+            root = resolved;
+        }
+    }
+    RootCuts {
+        model,
+        lp,
+        root,
+        added,
+        iterations,
+    }
+}
+
 pub fn solve(problem: &Problem, options: Options) -> Solution {
     let started = Instant::now();
 
@@ -882,19 +1066,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         reduced = problem.clone();
         match presolve::presolve(&mut reduced, 20) {
             Outcome::Infeasible => {
-                return Solution {
-                    status: Status::Infeasible,
-                    objective: None,
-                    x: Vec::new(),
-                    bound: f64::NAN,
-                    nodes: 0,
-                    simplex_iterations: 0,
-                    presolve: None,
-                    cuts_added: 0,
-                    heuristic_solutions: 0,
-                    root_bound: f64::NAN,
-                    root_bound_after_cuts: f64::NAN,
-                };
+                return Solution::without_solution(Status::Infeasible, 0, 0, None);
             }
             Outcome::Reduced(stats) => (&reduced, Some(stats)),
         }
@@ -933,133 +1105,19 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             _ if deadline.is_some_and(|d| Instant::now() >= d) => Status::TimeLimit,
             _ => Status::NodeLimit,
         };
-        return Solution {
-            status,
-            objective: None,
-            x: Vec::new(),
-            bound: f64::NAN,
-            nodes,
-            simplex_iterations: iterations,
-            presolve: presolve_stats,
-            cuts_added: 0,
-            heuristic_solutions: 0,
-            root_bound: f64::NAN,
-            root_bound_after_cuts: f64::NAN,
-        };
+        return Solution::without_solution(status, nodes, iterations, presolve_stats);
     }
 
     let first_bound = root.objective;
 
-    // Cut at the root only. Separating deeper in the tree ("local cuts") is
-    // stronger still, but it needs the cut pool to track which nodes each cut is
-    // valid for; these are globally valid, so adding them once to the model is
-    // both simpler and correct everywhere.
-    let mut cuts_added = 0usize;
-    let mut root = root;
-    let mut with_cuts;
-    let mut problem = problem;
-
-    // The model without any cut rows. Each round rebuilds from here rather than
-    // appending to the previous round's model, which is what lets a cut leave again.
-    let base = problem.clone();
-    // Cuts currently carried in the model, each with a count of consecutive resolves
-    // it has sat slack through.
-    let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
-
-    for _ in 0..options.cut_rounds {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            break;
-        }
-        if root.status != LpStatus::Optimal
-            || integral_solution(problem, &root.x, options.integrality_tolerance).is_some()
-        {
-            break;
-        }
-        // Two families with different reach: covers need a row that reads as a
-        // knapsack, while GMI comes off the tableau and applies to any fractional
-        // basic column. On dense random rows the second is usually the only one that
-        // finds anything.
-        let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
-        found.extend(cuts::separate_gomory(
-            &lp,
-            &root.basis,
-            &root.x,
-            options.cuts_per_round,
-        ));
-        // Separation is deliberately generous; this is where the model's row count is
-        // actually decided. Ranking by efficacy and dropping near-parallel duplicates
-        // keeps the rows that move the bound and discards the ones that only cost an
-        // LP column scan at every node below.
-        let found = cuts::select(found, &root.x, options.cuts_per_round);
-        if found.is_empty() {
-            break;
-        }
-        cuts_added += found.len();
-        active.extend(found.into_iter().map(|c| (c, 0)));
-
-        with_cuts = base.clone();
-        let rows: Vec<cuts::Cut> = active.iter().map(|(c, _)| c.clone()).collect();
-        with_cuts.add_cuts(&rows);
-
-        let mut candidate = Lp::relaxation(&with_cuts);
-        candidate.set_deadline(deadline);
-        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
-        iterations += resolved.iterations;
-        if resolved.status != LpStatus::Optimal {
-            // Keep the model that is known to solve rather than pressing on with one
-            // that does not; the bound already gained is still sound.
-            break;
-        }
-
-        // A cut that has gone slack is no longer shaping the relaxation, but it still
-        // costs work in every LP below it. Later rounds routinely make earlier rounds'
-        // cuts redundant, so age them out rather than accumulating.
-        for (cut, age) in &mut active {
-            if cut.is_tight(&resolved.x, CUT_SLACK_TOLERANCE) {
-                *age = 0;
-            } else {
-                *age += 1;
-            }
-        }
-        active.retain(|&(_, age)| age < CUT_MAX_AGE);
-
-        reduced = with_cuts;
-        problem = &reduced;
-        lp = candidate;
-        root = resolved;
-    }
-
-    // One last purge before the tree opens. Every remaining slack cut would otherwise
-    // be carried through every node LP for the rest of the search, and a row that is
-    // inactive at the optimum of a convex program cannot be holding the bound up:
-    // dropping it leaves the same point optimal. The re-solve is a guard against that
-    // reasoning meeting a degenerate basis, not an expectation of change.
-    if root.status == LpStatus::Optimal
-        && active
-            .iter()
-            .any(|(c, _)| !c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
-    {
-        let rows: Vec<cuts::Cut> = active
-            .iter()
-            .filter(|(c, _)| c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
-            .map(|(c, _)| c.clone())
-            .collect();
-        let mut trimmed = base.clone();
-        trimmed.add_cuts(&rows);
-        let mut candidate = Lp::relaxation(&trimmed);
-        candidate.set_deadline(deadline);
-        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
-        iterations += resolved.iterations;
-        // Keep the trimmed model only if it really did hold the bound.
-        if resolved.status == LpStatus::Optimal
-            && resolved.objective >= root.objective - 1e-9 * root.objective.abs().max(1.0)
-        {
-            reduced = trimmed;
-            problem = &reduced;
-            lp = candidate;
-            root = resolved;
-        }
-    }
+    let cut = separate_at_root(problem, lp, root, &options, deadline);
+    iterations += cut.iterations;
+    let cuts_added = cut.added;
+    let mut lp = cut.lp;
+    let root = cut.root;
+    // Held here so the borrow below outlives the branch that produced it.
+    let with_cuts_model = cut.model;
+    let problem = with_cuts_model.as_ref().unwrap_or(problem);
 
     let root_bound = root.objective;
     let mut open = OpenNodes::new(options.plunge_limit);

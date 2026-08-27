@@ -559,6 +559,8 @@ struct Solver<'a> {
     entry_hint: Entry,
     /// True when `basis` already factorizes `basic`, so entry can skip the rebuild.
     factorized: bool,
+    /// Values of the basic variables, recomputed after a refactorization.
+    basic_values: Vec<f64>,
 }
 
 /// What the ratio test decided.
@@ -616,6 +618,7 @@ impl<'a> Solver<'a> {
             rhs: vec![0.0; m],
             entry_hint: Entry::Primal,
             factorized: false,
+            basic_values: Vec::new(),
         };
         solver.recompute_basic_values();
         solver
@@ -656,6 +659,7 @@ impl<'a> Solver<'a> {
             lp,
             basis: factors.unwrap_or_else(|| Basis::all_logical(m)),
             factorized,
+            basic_values: Vec::new(),
             basic: start.basic.clone(),
             status,
             z,
@@ -694,12 +698,16 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        let mut out = std::mem::take(&mut self.alpha);
+        // Its own buffer rather than borrowing `alpha`. `alpha` means one thing, the
+        // entering column transformed by the basis, and it is read by the ratio test
+        // and the basis update after this returns. Lending it out as scratch is how a
+        // change to one of those quietly corrupts the other, which has happened here.
+        let mut out = std::mem::take(&mut self.basic_values);
         self.basis.ftran(&self.rhs, &mut out);
         for (i, &v) in out.iter().enumerate() {
             self.z[self.basic[i]] = v;
         }
-        self.alpha = out;
+        self.basic_values = out;
     }
 
     /// Total bound violation across the basic variables.
