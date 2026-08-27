@@ -1138,6 +1138,7 @@ impl<'a> Solver<'a> {
         // the iteration limit.
         const BLAND_RUN: usize = 20;
         let mut stalled = 0usize;
+        let mut degenerate = 0usize;
         let mut bland_run = BLAND_RUN;
 
         while *iterations < max_iterations {
@@ -1268,6 +1269,21 @@ impl<'a> Solver<'a> {
             // cold-start dual entry on the `dual-cold-start` branch, where it is kept.
             // Warm starts, which is all this method does here, have not shown it.
             stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
+            // The counter above reads primal step length. Degeneracy here is a zero
+            // *ratio*: the entering column was already priced at zero, so the dual
+            // objective cannot move whatever the step turns out to be, and no count of
+            // steps can see it.
+            //
+            // Counting ratios and escalating to Bland's rule was tried and reverted,
+            // because zero ratios are ordinary rather than exceptional in this method
+            // and Bland is slow: drayage-25-23 fell from 98 nodes in a minute to 4.
+            // Handing the node over is the cheaper answer to the same signal. The
+            // primal loop continues from this basis and brings its own way out of a
+            // cycle, so nothing is given up by leaving here.
+            degenerate = if best_ratio <= tol { degenerate + 1 } else { 0 };
+            if degenerate > STALL_LIMIT {
+                return None;
+            }
             self.z[entering] += step;
             for i in 0..self.lp.m {
                 let bj = self.basic[i];
@@ -1536,10 +1552,23 @@ impl<'a> Solver<'a> {
             Entry::Primal
         };
         if entry == Entry::Dual {
-            match self.run_dual(max_iterations, cutoff, &mut iterations) {
-                Some(status) => return self.done(status, iterations),
-                // Ran out of iterations inside the dual method.
-                None => return self.done(LpStatus::IterationLimit, iterations),
+            // The dual method is the right one for a warm start and usually repairs the
+            // single bound a branch changed in a few pivots, which is why it is tried
+            // first. On the models where it is not, it was spending the node's whole
+            // budget and the node was abandoned: MIPLIB's drayage-25-23 opened four
+            // nodes in a minute, each of them a dual solve that ran to the iteration
+            // cap, where the primal method opens thousands and resolves them.
+            //
+            // So it gets a share of the budget rather than all of it, and what it has
+            // not finished is handed to the primal loop below, which continues from the
+            // basis it reached. Answering the node slowly beats not answering it, and
+            // the general case is untouched because the dual method almost always
+            // finishes well inside its share.
+            const DUAL_SHARE: usize = 2;
+            if let Some(status) =
+                self.run_dual(max_iterations / DUAL_SHARE, cutoff, &mut iterations)
+            {
+                return self.done(status, iterations);
             }
         }
 
