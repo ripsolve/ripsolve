@@ -482,6 +482,315 @@ pub fn separate_gomory(
     found
 }
 
+/// Most divisors tried per row when deriving a mixed-integer rounding cut.
+const MAX_MIR_DIVISORS: usize = 6;
+
+/// A variable upper bound, `x_j <= factor * x_binary`, read off a two-column row.
+///
+/// This is the structure behind every fixed-charge model: a continuous column may only
+/// take a value when the binary that pays for it is on. MIPLIB's beavma is half made of
+/// these rows.
+#[derive(Clone, Copy)]
+struct VariableBound {
+    binary: usize,
+    factor: f64,
+}
+
+/// A column of the row being rounded, after bound substitution has been applied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Term {
+    /// A column of the model itself.
+    Column(usize),
+    /// The slack `s_j = factor * y - x_j` of column `j` against its variable upper
+    /// bound. It is continuous and nonnegative, which is all the rounding needs.
+    Residual(usize),
+}
+
+/// Variable upper bounds for every continuous column that has one.
+///
+/// Only rows with exactly two columns are read. A tighter bound wins, since it is the
+/// one that constrains the substituted row most.
+fn variable_upper_bounds(problem: &Problem) -> Vec<Option<VariableBound>> {
+    let mut bounds: Vec<Option<VariableBound>> = vec![None; problem.n_cols()];
+    let csr = problem.matrix.to_csr();
+
+    for i in 0..problem.n_rows() {
+        let (cols, vals) = csr.column(i);
+        if cols.len() != 2 {
+            continue;
+        }
+        for &(sign, bound) in &[(1.0f64, problem.row_ub[i]), (-1.0f64, -problem.row_lb[i])] {
+            // Only `... <= 0` rows give a bound that vanishes when the binary is off.
+            if bound.abs() > TOL || !bound.is_finite() {
+                continue;
+            }
+            for (first, second) in [(0usize, 1usize), (1, 0)] {
+                let (j, a) = (cols[first], sign * vals[first]);
+                let (y, b) = (cols[second], sign * vals[second]);
+                // `a x_j + b y <= 0` with `a > 0 > b` reads `x_j <= (-b / a) y`.
+                if problem.is_integer(j) || a <= TOL || b >= -TOL {
+                    continue;
+                }
+                if !problem.is_integer(y) || problem.col_lb[y] != 0.0 || problem.col_ub[y] != 1.0 {
+                    continue;
+                }
+                let factor = -b / a;
+                if bounds[j].is_none_or(|held| factor < held.factor) {
+                    bounds[j] = Some(VariableBound { binary: y, factor });
+                }
+            }
+        }
+    }
+    bounds
+}
+
+/// Separate mixed-integer rounding cuts violated by `x`.
+///
+/// Covers need a row that reads as a knapsack, and Gomory cuts come off the tableau.
+/// Neither exploits the commonest structure in a mixed model: a row mixing integer and
+/// continuous columns, where rounding the integer part gives an inequality the
+/// relaxation does not know about.
+///
+/// For a row `sum a_j x_j <= b` with every column at a lower bound of zero, dividing by
+/// `d > 0` and writing `f = frac(b/d)`, `f_j = frac(a_j/d)`, the inequality
+///
+/// ```text
+///     sum_{integer j} (floor(a_j/d) + max(0, (f_j - f) / (1 - f))) x_j
+///   + sum_{continuous j} min(0, a_j/d) / (1 - f) * x_j
+///   <= floor(b / d)
+/// ```
+///
+/// holds for every integer-feasible point. Only negative continuous coefficients
+/// contribute, which is what makes it bite on rows where a continuous column is held
+/// down by an integer one.
+///
+/// Applying that to the model's rows as written is close to useless, which measurement
+/// bore out: the relaxation already respects each row on its own, so the rounding has
+/// almost nothing to remove. The strength comes from first substituting continuous
+/// columns by their variable upper bounds, `x_j = factor * y - s_j`. That moves weight
+/// onto the binary `y`, which the rounding can then act on, and it is what makes the
+/// derivation reach fixed-charge structure at all.
+///
+/// Every column in the row must sit at a lower bound of zero. Shifting a column that
+/// does not is a further step this does not take, so such rows are skipped rather than
+/// cut incorrectly.
+pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
+    let csr = problem.matrix.to_csr();
+    let vubs = variable_upper_bounds(problem);
+    let mut found: Vec<Cut> = Vec::new();
+
+    for i in 0..problem.n_rows() {
+        let (cols, vals) = csr.column(i);
+        if cols.is_empty() {
+            continue;
+        }
+        // A range row gives two one-sided rows to try; an equality gives nothing this
+        // reduction can use, since it has no slack to round against.
+        let lb = problem.row_lb[i];
+        let ub = problem.row_ub[i];
+        for &(sign, bound) in &[(1.0f64, ub), (-1.0f64, -lb)] {
+            if !bound.is_finite() || lb == ub {
+                continue;
+            }
+            // Written as `sum a_j x_j <= b`, negating a `>=` row to get there.
+            let terms: Vec<(usize, f64)> =
+                cols.iter().zip(vals).map(|(&j, &v)| (j, sign * v)).collect();
+            if terms.iter().any(|&(j, _)| problem.col_lb[j] != 0.0) {
+                continue;
+            }
+            // Both the row as written and the row with its continuous columns
+            // substituted are worth rounding, and which one bites is not predictable
+            // from the row alone.
+            for substitute in [false, true] {
+                let (substituted, rhs) = if substitute {
+                    match substitute_bounds(problem, &terms, bound, x, &vubs) {
+                        Some(pair) => pair,
+                        None => continue,
+                    }
+                } else {
+                    (
+                        terms.iter().map(|&(j, a)| (Term::Column(j), a)).collect(),
+                        bound,
+                    )
+                };
+                if let Some(cut) =
+                    mir_from_row(problem, &substituted, rhs, x, &vubs, MAX_MIR_DIVISORS)
+                {
+                    found.push(cut);
+                }
+            }
+        }
+    }
+
+    found.sort_by(|a, b| {
+        b.violation(x)
+            .partial_cmp(&a.violation(x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    found.truncate(limit);
+    found
+}
+
+/// Replace continuous columns by their variable upper bounds where that tightens the
+/// row at the current point.
+///
+/// Substituting `x_j = factor * y - s_j` is exact, so the rewritten row holds wherever
+/// the original does. It is worth doing only for a column sitting near its variable
+/// upper bound, where the residual `s_j` is near zero and the rounding therefore has
+/// something to work with. Returns `None` when no column was substituted, since that
+/// leaves the row unchanged and the caller has already rounded it.
+fn substitute_bounds(
+    problem: &Problem,
+    terms: &[(usize, f64)],
+    bound: f64,
+    x: &[f64],
+    vubs: &[Option<VariableBound>],
+) -> Option<(Vec<(Term, f64)>, f64)> {
+    let mut coefficients: Vec<(Term, f64)> = Vec::with_capacity(terms.len() * 2);
+    let mut substituted = false;
+
+    for &(j, a) in terms {
+        let vub = vubs[j].filter(|_| !problem.is_integer(j) && a.abs() > TOL);
+        let Some(vub) = vub else {
+            coefficients.push((Term::Column(j), a));
+            continue;
+        };
+        // Closer to the variable upper bound than to zero is the standard test: it is
+        // the end the relaxation is leaning on, so it is the one worth rewriting.
+        let ceiling = vub.factor * x[vub.binary];
+        if ceiling - x[j] >= x[j] {
+            coefficients.push((Term::Column(j), a));
+            continue;
+        }
+        // a x_j = a factor y - a s_j.
+        coefficients.push((Term::Column(vub.binary), a * vub.factor));
+        coefficients.push((Term::Residual(j), -a));
+        substituted = true;
+    }
+    if !substituted {
+        return None;
+    }
+
+    // Substitution can put weight on a binary the row already mentioned.
+    coefficients.sort_by_key(|&(term, _)| match term {
+        Term::Column(j) => (0usize, j),
+        Term::Residual(j) => (1, j),
+    });
+    coefficients.dedup_by(|later, held| {
+        if later.0 == held.0 {
+            held.1 += later.1;
+            true
+        } else {
+            false
+        }
+    });
+    coefficients.retain(|&(_, a)| a.abs() > TOL);
+    Some((coefficients, bound))
+}
+
+/// The most violated MIR cut over a handful of divisors, if any is violated at all.
+///
+/// The divisors tried are the magnitudes of the integer columns' own coefficients,
+/// which is the standard choice: dividing by one of them is what makes that column's
+/// rounded coefficient land on an integer.
+fn mir_from_row(
+    problem: &Problem,
+    terms: &[(Term, f64)],
+    bound: f64,
+    x: &[f64],
+    vubs: &[Option<VariableBound>],
+    divisors: usize,
+) -> Option<Cut> {
+    let is_integer = |term: Term| match term {
+        Term::Column(j) => problem.is_integer(j),
+        Term::Residual(_) => false,
+    };
+
+    let mut candidates: Vec<f64> = terms
+        .iter()
+        .filter(|&&(term, a)| is_integer(term) && a.abs() > TOL)
+        .map(|&(_, a)| a.abs())
+        .collect();
+    candidates.sort_by(|a, b| b.total_cmp(a));
+    candidates.dedup_by(|a, b| (*a - *b).abs() <= TOL);
+    candidates.truncate(divisors);
+
+    let mut best: Option<(f64, Cut)> = None;
+    for divisor in candidates {
+        let scaled_rhs = bound / divisor;
+        let floor_rhs = scaled_rhs.floor();
+        let f = scaled_rhs - floor_rhs;
+        // No fractional part means the rounding gives back the row it started from.
+        if f <= TOL || f >= 1.0 - TOL {
+            continue;
+        }
+
+        let mut rounded: Vec<(Term, f64)> = Vec::with_capacity(terms.len());
+        for &(term, a) in terms {
+            let scaled = a / divisor;
+            let coefficient = if is_integer(term) {
+                let whole = scaled.floor();
+                let fraction = scaled - whole;
+                whole + ((fraction - f) / (1.0 - f)).max(0.0)
+            } else {
+                scaled.min(0.0) / (1.0 - f)
+            };
+            if coefficient.abs() > TOL {
+                rounded.push((term, coefficient));
+            }
+        }
+        if rounded.is_empty() {
+            continue;
+        }
+
+        let Some(cut) = restate(&rounded, floor_rhs, vubs) else {
+            continue;
+        };
+        let violation = cut.violation(x);
+        if violation > MIN_VIOLATION && best.as_ref().is_none_or(|(v, _)| violation > *v) {
+            best = Some((violation, cut));
+        }
+    }
+    best.map(|(_, cut)| cut)
+}
+
+/// Rewrite a rounded row back in terms of the model's own columns.
+///
+/// A residual carries `s_j = factor * y - x_j`, so its coefficient splits between the
+/// binary and the continuous column it came from.
+fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) -> Option<Cut> {
+    let mut coefficients: Vec<(usize, f64)> = Vec::with_capacity(rounded.len() * 2);
+    for &(term, c) in rounded {
+        match term {
+            Term::Column(j) => coefficients.push((j, c)),
+            Term::Residual(j) => {
+                let vub = vubs[j]?;
+                coefficients.push((vub.binary, c * vub.factor));
+                coefficients.push((j, -c));
+            }
+        }
+    }
+
+    coefficients.sort_by_key(|&(j, _)| j);
+    coefficients.dedup_by(|later, held| {
+        if later.0 == held.0 {
+            held.1 += later.1;
+            true
+        } else {
+            false
+        }
+    });
+    coefficients.retain(|&(_, a)| a.abs() > TOL);
+    if coefficients.is_empty() {
+        return None;
+    }
+    Some(Cut {
+        coefficients,
+        lb: f64::NEG_INFINITY,
+        ub: rhs,
+    })
+}
+
 /// Separate knapsack cover cuts violated by `x`.
 ///
 /// Returns at most `limit` cuts, strongest violation first.
@@ -755,6 +1064,182 @@ mod tests {
             );
         }
         cuts.len()
+    }
+
+    /// A mixed-integer knapsack: a continuous column and several integer ones meeting
+    /// the same demand. This is the shape MIR exists for, and rounding the integer part
+    /// of the row is exactly what the relaxation cannot do for itself.
+    fn mixed_knapsack(demand: f64, weight: f64) -> Problem {
+        // Columns: x0 continuous in [0, 4]; y0, y1, y2 binary. The continuous column is
+        // priced above the integer ones so the relaxation prefers a fractional integer.
+        let mut p = problem(
+            &[3.0, 1.0, 1.0, 1.0],
+            &[(&[1.0, weight, weight, weight], RowSense::Ge, demand)],
+        );
+        p.col_type[0] = crate::model::VarType::Continuous;
+        p.col_ub[0] = 4.0;
+        p
+    }
+
+    /// A fixed-charge model: continuous columns held down by binaries through variable
+    /// upper bound rows, sharing one capacity row. Rounding the rows as written finds
+    /// nothing here; this shape only yields a cut once the bounds are substituted.
+    fn fixed_charge(capacity: f64, cost: f64) -> Problem {
+        // Columns: x0, x1 continuous in [0, 4]; y0, y1 binary.
+        let mut p = problem(
+            &[-1.0, -1.0, cost, cost],
+            &[
+                (&[1.0, 0.0, -4.0, 0.0], RowSense::Le, 0.0),
+                (&[0.0, 1.0, 0.0, -4.0], RowSense::Le, 0.0),
+                (&[1.0, 1.0, 0.0, 0.0], RowSense::Le, capacity),
+            ],
+        );
+        p.col_type[0] = crate::model::VarType::Continuous;
+        p.col_type[1] = crate::model::VarType::Continuous;
+        p.col_ub[0] = 4.0;
+        p.col_ub[1] = 4.0;
+        p
+    }
+
+    /// MIR is the one family here that reasons about continuous columns, so
+    /// enumerating binary points is not enough to check it. Fixing the integer
+    /// columns leaves a polytope in the continuous ones, and the cut is valid exactly
+    /// when its activity cannot be pushed past its right-hand side anywhere on that
+    /// polytope. That maximum is itself an LP, so validity is checked by solving one
+    /// per integer assignment rather than by sampling points.
+    fn assert_mir_is_valid(p: &Problem, label: &str) -> usize {
+        let relaxed = Lp::relaxation(p).solve();
+        if relaxed.status != LpStatus::Optimal {
+            return 0;
+        }
+        let cuts = separate_mir(p, &relaxed.x, 32);
+        let integers: Vec<usize> = (0..p.n_cols()).filter(|&j| p.is_integer(j)).collect();
+        assert!(integers.len() <= 12);
+        assert!(integers.iter().all(|&j| p.col_ub[j] == 1.0));
+
+        for cut in &cuts {
+            for mask in 0u32..(1u32 << integers.len()) {
+                let mut sub = p.clone();
+                for (bit, &j) in integers.iter().enumerate() {
+                    let value = f64::from((mask >> bit) & 1);
+                    sub.col_lb[j] = value;
+                    sub.col_ub[j] = value;
+                }
+                sub.obj = vec![0.0; p.n_cols()];
+                for &(j, a) in &cut.coefficients {
+                    sub.obj[j] = -a;
+                }
+                let solved = Lp::relaxation(&sub).solve();
+                if solved.status == LpStatus::Infeasible {
+                    continue;
+                }
+                assert_eq!(solved.status, LpStatus::Optimal, "{label}: subproblem status");
+                let most = -solved.objective;
+                assert!(
+                    most <= cut.ub + 1e-6,
+                    "{label}: cut {:?} <= {} is violated by {most} at integer mask {mask}",
+                    cut.coefficients,
+                    cut.ub
+                );
+            }
+            assert!(
+                cut.violation(&relaxed.x) > MIN_VIOLATION,
+                "{label}: cut does not separate the relaxation"
+            );
+        }
+        cuts.len()
+    }
+
+    #[test]
+    fn mir_cuts_a_mixed_knapsack_without_losing_a_solution() {
+        // Demand is swept so the row's fractional part lands differently each time,
+        // which is what makes the derivation pick a different divisor.
+        let mut total = 0;
+        for demand in [2.5, 4.5, 5.25, 6.5, 7.4] {
+            for weight in [2.0, 3.0, 4.0] {
+                total += assert_mir_is_valid(
+                    &mixed_knapsack(demand, weight),
+                    &format!("mixed knapsack demand {demand} weight {weight}"),
+                );
+            }
+        }
+        assert!(total > 0, "no MIR cut was produced by any mixed knapsack");
+    }
+
+    #[test]
+    fn bound_substitution_reaches_fixed_charge_structure() {
+        // Substitution is the step that makes MIR useful, and it is also the step most
+        // likely to produce a subtly invalid cut, since the row it rounds is no longer
+        // one of the model's own.
+        let mut total = 0;
+        for capacity in [1.5, 2.5, 3.5, 5.5, 6.5, 7.5] {
+            for cost in [0.5, 1.0, 2.0] {
+                total += assert_mir_is_valid(
+                    &fixed_charge(capacity, cost),
+                    &format!("fixed charge cap {capacity} cost {cost}"),
+                );
+            }
+        }
+        assert!(total > 0, "bound substitution found nothing in a fixed-charge model");
+    }
+
+    #[test]
+    fn a_variable_upper_bound_is_read_off_a_two_column_row() {
+        let p = fixed_charge(3.5, 1.0);
+        let bounds = variable_upper_bounds(&p);
+        for (column, binary) in [(0usize, 2usize), (1, 3)] {
+            let vub = bounds[column].expect("continuous column has a variable bound");
+            assert_eq!(vub.binary, binary);
+            assert!((vub.factor - 4.0).abs() < 1e-9, "factor {}", vub.factor);
+        }
+        // The binaries themselves are not continuous columns and get no bound, nor does
+        // a model whose rows never pair a continuous column with a binary.
+        assert!(bounds[2].is_none() && bounds[3].is_none());
+        assert!(variable_upper_bounds(&mixed_knapsack(4.5, 3.0))
+            .iter()
+            .all(Option::is_none));
+    }
+
+    #[test]
+    fn mir_respects_a_pure_integer_knapsack() {
+        // With no continuous columns the derivation reduces to rounding the integer
+        // part, which the exhaustive binary check covers directly.
+        for capacity in [4.5, 5.5, 7.5, 9.5] {
+            let p = problem(
+                &[-3.0, -2.0, -2.0, -1.0],
+                &[(&[4.0, 3.0, 3.0, 2.0], RowSense::Le, capacity)],
+            );
+            let relaxed = Lp::relaxation(&p).solve();
+            let cuts = separate_mir(&p, &relaxed.x, 32);
+            for cut in &cuts {
+                for point in &feasible_points(&p) {
+                    assert!(
+                        cut.violation(point) <= 1e-9,
+                        "cap {capacity}: MIR cut {:?} <= {} removes {point:?}",
+                        cut.coefficients,
+                        cut.ub
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mir_skips_a_column_that_does_not_sit_at_zero() {
+        // The derivation assumes every column has a lower bound of zero. A row with a
+        // shifted column must be left alone rather than cut on a false premise.
+        let p = mixed_knapsack(4.5, 3.0);
+        let relaxed = Lp::relaxation(&p).solve();
+        assert!(!separate_mir(&p, &relaxed.x, 32).is_empty(), "row is cuttable as written");
+
+        let mut shifted = p.clone();
+        shifted.col_lb[0] = 1.0;
+        let relaxed = Lp::relaxation(&shifted).solve();
+        assert_eq!(relaxed.status, LpStatus::Optimal);
+        assert!(
+            separate_mir(&shifted, &relaxed.x, 32).is_empty(),
+            "cut derived from a row containing a shifted column"
+        );
     }
 
     #[test]

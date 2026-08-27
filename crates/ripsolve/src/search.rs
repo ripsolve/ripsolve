@@ -961,11 +961,13 @@ fn separate_at_root(
         {
             break;
         }
-        // Two families with different reach: covers need a row that reads as a
-        // knapsack, while GMI comes off the tableau and applies to any fractional
-        // basic column. On dense random rows the second is usually the only one that
-        // finds anything.
+        // Three families with different reach: covers need a row that reads as a
+        // knapsack, MIR needs a row mixing integer and continuous columns, and GMI
+        // comes off the tableau and applies to any fractional basic column. On dense
+        // random rows the last is usually the only one that finds anything, while on
+        // mixed models from MIPLIB the middle one carries most of the bound.
         let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
+        found.extend(cuts::separate_mir(problem, &root.x, options.cuts_per_round));
         found.extend(cuts::separate_gomory(
             &lp,
             &root.basis,
