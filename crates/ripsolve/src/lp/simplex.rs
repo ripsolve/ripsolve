@@ -710,20 +710,16 @@ impl<'a> Solver<'a> {
         self.basic_values = out;
     }
 
-    /// Total bound violation across the basic variables.
-    fn infeasibility(&self) -> f64 {
-        let tol = self.lp.tol.primal_feasibility;
-        let mut total = 0.0;
-        for (i, &j) in self.basic.iter().enumerate() {
-            let _ = i;
-            let v = self.z[j];
-            if v < self.lp.lower[j] - tol {
-                total += self.lp.lower[j] - v;
-            } else if v > self.lp.upper[j] + tol {
-                total += v - self.lp.upper[j];
+    /// The largest amount by which any basic variable sits outside its bounds.
+    fn worst_violation(&self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for &j in &self.basic {
+            let over = (self.lp.lower[j] - self.z[j]).max(self.z[j] - self.lp.upper[j]);
+            if over > worst {
+                worst = over;
             }
         }
-        total
+        worst
     }
 
     /// The phase-1 gradient of the basic costs, or the true costs in phase 2.
@@ -1500,8 +1496,15 @@ impl<'a> Solver<'a> {
         // fixed short spell does not: at twenty pivots, signed_c48_r48_s3 cycled until
         // the iteration limit.
         const BLAND_RUN: usize = 20;
+        // A bound violation at or below this is read as the width of the arithmetic
+        // rather than as evidence that the model has no feasible point.
+        const INFEASIBILITY_PROOF: f64 = 1e-5;
 
         let mut iterations = 0usize;
+        // How far a basic variable may sit outside its bounds before this solve calls
+        // the basis infeasible. It starts at the model's tolerance and only ever rises,
+        // never past `INFEASIBILITY_PROOF`, so the loop below cannot run forever.
+        let mut slack = self.lp.tol.primal_feasibility;
         let mut stalled = 0usize;
         let mut bland_run = BLAND_RUN;
 
@@ -1532,8 +1535,7 @@ impl<'a> Solver<'a> {
             if iterations.is_multiple_of(CLOCK_INTERVAL) && self.lp.out_of_time() {
                 return self.done(LpStatus::IterationLimit, iterations);
             }
-            let infeasibility = self.infeasibility();
-            let phase_one = infeasibility > self.lp.tol.primal_feasibility;
+            let phase_one = self.worst_violation() > slack;
 
             self.load_basic_costs(phase_one);
             let mut y = std::mem::take(&mut self.y);
@@ -1547,8 +1549,37 @@ impl<'a> Solver<'a> {
             }
             let Some((entering, sigma)) = self.price(phase_one, bland) else {
                 // No improving column. In phase 2 that is optimality; in phase 1 it
-                // means the infeasibility cannot be reduced further, so the LP has no
-                // feasible point at all.
+                // means the sum of bound violations sits at its minimum, and since
+                // that minimum is global for an LP, a nonzero one proves the model has
+                // no feasible point.
+                //
+                // Only if it really is nonzero. Maintaining feasibility and proving
+                // its absence want different tolerances, and reading the proof at the
+                // tolerance that decides phase entry leaves no room for the
+                // arithmetic. On MIPLIB's gasprod1-2 that is what happened: phase 1
+                // ran out of moves at a violation of 1.2e-7, one part in ten million
+                // on a model whose objective is 5e4, and a feasible relaxation was
+                // declared infeasible after 266067 iterations against a reference
+                // solver's 4901.
+                //
+                // A violation that small is the width of the arithmetic rather than a
+                // property of the model, so it is pulled out and the solve carries on
+                // into phase 2. Repairs are bounded so that a model which really is
+                // infeasible still terminates.
+                if phase_one {
+                    let worst = self.worst_violation();
+                    if worst <= INFEASIBILITY_PROOF {
+                        // Widening the tolerance rather than pulling the values back.
+                        // Moving them would leave `z` disagreeing with the basis it was
+                        // computed from, and the next refactorization would recover the
+                        // same violation and send the solve back through phase 1 over
+                        // it, which is the loop being escaped. Recording how noisy this
+                        // model's arithmetic actually is settles the question once and
+                        // survives refactorization.
+                        slack = worst * 1.01;
+                        continue;
+                    }
+                }
                 let status = if phase_one {
                     LpStatus::Infeasible
                 } else {
@@ -1889,6 +1920,36 @@ mod tests {
         assert_eq!(s.status, LpStatus::Optimal);
         assert!((s.objective - 6.0).abs() < 1e-9, "{}", s.objective);
         assert_feasible(&p, &s.x);
+    }
+
+    /// A model whose rows contradict each other by less than the arithmetic can
+    /// resolve is feasible for every practical purpose, and calling it infeasible is a
+    /// claim the solver has not got. A model that contradicts itself by a visible
+    /// margin still has to be caught, so both sides of that line are pinned here.
+    ///
+    /// On MIPLIB's gasprod1-2 the unrescued version reported a feasible relaxation
+    /// infeasible over a violation of 1.2e-7.
+    #[test]
+    fn a_contradiction_too_small_to_resolve_is_not_a_proof_of_infeasibility() {
+        // `x >= 0.5 + gap/2` against `x <= 0.5 - gap/2`, so the rows miss each other
+        // by exactly `gap`.
+        let contradiction = |gap: f64| {
+            solve(
+                &[1.0],
+                &[
+                    (&[1.0], RowSense::Ge, 0.5 + gap / 2.0),
+                    (&[1.0], RowSense::Le, 0.5 - gap / 2.0),
+                ],
+            )
+            .status
+        };
+
+        // Wider than the tolerance that decides feasibility, narrower than the one that
+        // decides a proof: rescued rather than reported.
+        assert_eq!(contradiction(1e-6), LpStatus::Optimal);
+        // A contradiction the model really does contain.
+        assert_eq!(contradiction(1e-3), LpStatus::Infeasible);
+        assert_eq!(contradiction(0.5), LpStatus::Infeasible);
     }
 
     #[test]
