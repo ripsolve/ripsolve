@@ -1255,16 +1255,19 @@ impl<'a> Solver<'a> {
             // Move the entering variable exactly far enough to place the leaving one
             // on the bound it was violating.
             let step = (target - self.z[leaving]) / -self.alpha[r];
-            // Degeneracy in the dual method is a zero *ratio*, not a zero step. The
-            // ratio is the entering column's reduced cost over its entry in the pivot
-            // row, so a zero one means that column was already priced at zero and the
-            // dual objective cannot move however far the primal step turns out to be.
-            // Counting primal steps, as this did, misses it entirely: on MIPLIB's
-            // drayage-100-23 the dual objective sat at exactly 240.4124 for half a
-            // million iterations, the primal infeasibility wandered between 2e4 and
-            // 2e7, and the anti-cycling never once engaged. Every warm start in the
-            // search enters through this method, so every node pays for it.
-            stalled = if best_ratio <= tol { stalled + 1 } else { 0 };
+            // Counted by primal step length, which is the wrong signal in principle:
+            // degeneracy here is a zero *ratio*, meaning the entering column was
+            // already priced at zero and the dual objective cannot move whatever the
+            // step is. Counting ratios instead was tried and reverted. It is the right
+            // signal and the wrong trade: zero ratios are ordinary in the dual method,
+            // so it hands nearly every node to Bland's rule, and Bland is slow. On
+            // MIPLIB's drayage-25-23 the search went from 98 nodes in a minute to 4.
+            //
+            // The pathology the ratio signal catches, a dual objective frozen while the
+            // step length keeps the counter at zero, was only ever reached through the
+            // cold-start dual entry on the `dual-cold-start` branch, where it is kept.
+            // Warm starts, which is all this method does here, have not shown it.
+            stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
             self.z[entering] += step;
             for i in 0..self.lp.m {
                 let bj = self.basic[i];
