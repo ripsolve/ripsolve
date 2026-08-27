@@ -28,7 +28,7 @@ fn main() {
     let mut rng = Rng(0x5DEECE66D);
 
     if scale > 0.0 {
-        let mut widen = |lo: &mut f64, hi: &mut f64, rng: &mut Rng| {
+        let widen = |lo: &mut f64, hi: &mut f64, rng: &mut Rng| {
             let reach = scale * (1.0 + lo.abs().max(hi.abs()).min(1e6)) * (1.0 + rng.next());
             if lo.is_finite() {
                 *lo -= reach;
