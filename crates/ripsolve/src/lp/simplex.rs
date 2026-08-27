@@ -838,7 +838,20 @@ impl<'a> Solver<'a> {
     fn ratio_test(&self, entering: usize, sigma: f64, phase_one: bool, bland: bool) -> Step {
         let lp = self.lp;
         let tol = lp.tol.primal_feasibility;
-        let pivot_tol = lp.tol.pivot;
+
+        // A pivot has to be significant against the *largest* entry of the transformed
+        // column, not merely nonzero. An entry that clears the absolute tolerance while
+        // being a billionth of its column leaves the next basis all but singular, and
+        // the damage is not local: on MIPLIB's neos-850681 one such pivot, 3.7e-5 in a
+        // column reaching 1.8e4, took the inverse from entries of 1e4 to 1e15 within two
+        // iterations. Everything read through it afterwards is noise, and the solve
+        // ended by reporting a feasible relaxation infeasible.
+        //
+        // The row holding the column maximum always clears this, so the test can never
+        // empty the candidate set and turn a pivot into a bound flip.
+        const RELATIVE_PIVOT: f64 = 1e-7;
+        let largest = self.alpha.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let pivot_tol = lp.tol.pivot.max(RELATIVE_PIVOT * largest);
 
         // The entering variable's own range, if both bounds are finite.
         let mut best = if lp.lower[entering].is_finite() && lp.upper[entering].is_finite() {
@@ -1760,6 +1773,51 @@ mod tests {
             col_names: (0..n).map(|j| format!("x{j}")).collect(),
             row_names: (0..m).map(|i| format!("c{i}")).collect(),
         }
+    }
+
+    /// The ratio test must not pivot on an entry that is negligible against the rest
+    /// of its column, even when that entry clears the absolute pivot tolerance and
+    /// offers the shortest step. Doing so leaves the next basis all but singular, and
+    /// on MIPLIB's neos-850681 it was the difference between converging on the true
+    /// relaxation bound and declaring a feasible model infeasible.
+    #[test]
+    fn the_ratio_test_refuses_a_pivot_that_is_negligible_in_its_column() {
+        let p = problem(
+            &[-1.0, -1.0, -1.0],
+            &[
+                (&[1.0, 0.0, 0.0], RowSense::Le, 1.0),
+                (&[0.0, 1.0, 0.0], RowSense::Le, 1.0),
+                (&[0.0, 0.0, 1.0], RowSense::Le, 1.0),
+            ],
+        );
+        let lp = Lp::relaxation(&p);
+        let mut solver = Solver::new(&lp);
+        solver.refactorize().expect("identity basis factorizes");
+        // Every logical rises towards a shared upper bound of one.
+        let rows: Vec<usize> = solver.basic.clone();
+        assert!(rows.iter().all(|&j| lp.upper[j] == 1.0));
+
+        // Row 0 offers the shortest step by far, but on an entry a hundred-millionth
+        // the size of the column's largest, well above the absolute floor of 1e-9.
+        // Rows 1 and 2 are sound, and row 1 is the shorter of them.
+        solver.alpha = vec![-1e-8, -2.0, -1.0];
+        for (&j, v) in rows.iter().zip([1.0 - 5e-9, -0.5, -2.0]) {
+            solver.z[j] = v;
+        }
+
+        let Step::Pivot { leaving_row, .. } = solver.ratio_test(0, 1.0, false, false) else {
+            panic!("a bounded column must produce a pivot");
+        };
+        assert_ne!(leaving_row, 0, "pivoted on an entry negligible in its column");
+        assert_eq!(leaving_row, 1);
+
+        // The same entry scaled up is no longer negligible and is chosen: the test is
+        // relative to the column, not an absolute floor on the entry.
+        solver.alpha[0] = -4.0;
+        let Step::Pivot { leaving_row, .. } = solver.ratio_test(0, 1.0, false, false) else {
+            panic!("a bounded column must produce a pivot");
+        };
+        assert_eq!(leaving_row, 0);
     }
 
     fn solve(obj: &[f64], rows: &[(&[f64], RowSense, f64)]) -> LpSolution {
