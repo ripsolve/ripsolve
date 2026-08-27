@@ -389,11 +389,32 @@ fn fix_columns_absent_from_every_row(
         if seen || problem.col_lb[j] == problem.col_ub[j] {
             continue;
         }
-        // Minimization: a non-negative cost prefers the lower bound.
-        let target = if problem.obj[j] > 0.0 {
-            problem.col_lb[j]
+        // Minimization: a positive cost prefers the lower bound, a negative one the
+        // upper, and a zero cost is indifferent and takes whichever bound exists.
+        let (favoured, other) = if problem.obj[j] < 0.0 {
+            (problem.col_ub[j], problem.col_lb[j])
         } else {
-            problem.col_ub[j]
+            (problem.col_lb[j], problem.col_ub[j])
+        };
+        // The bound has to exist. Fixing a column at an infinite one puts a value in
+        // the model that is not a number the rest of the solver can use: the column
+        // reads as `[inf, inf]`, every later feasibility check compares against it and
+        // fails, and a zero cost times an infinite value is a NaN objective. On
+        // MIPLIB's pigeon-08 that silently threw away every solution the heuristics
+        // found, twelve of them in fifteen seconds, and the model solves to an
+        // incumbent with presolve switched off. The singleton reduction next door
+        // already guards this; this one did not.
+        let target = if favoured.is_finite() {
+            favoured
+        } else if problem.obj[j] == 0.0 && other.is_finite() {
+            other
+        } else if problem.obj[j] == 0.0 {
+            // Free and costless: any value does, and zero is inside no bound to break.
+            0.0
+        } else {
+            // The objective improves without limit along this column, which is the
+            // LP's finding to report rather than presolve's.
+            continue;
         };
         if fix_column(problem, j, target, stats) {
             changed = true;
@@ -470,6 +491,45 @@ mod tests {
     use crate::generate::{Kind, Spec};
     use crate::model::{RowSense, Sense};
     use lp_parser_rs::problem::LpProblem;
+
+    /// A column no row constrains still has to end up somewhere the rest of the
+    /// solver can use. Fixing it at an infinite bound leaves the model reading
+    /// `[inf, inf]`, which every later feasibility check compares against and fails,
+    /// and which multiplies a zero cost into a NaN objective. On MIPLIB's pigeon-08
+    /// that discarded every solution the heuristics found.
+    #[test]
+    fn an_unconstrained_column_is_never_fixed_at_an_infinite_bound() {
+        for (cost, lower, upper) in [
+            (0.0, 0.0, f64::INFINITY),
+            (0.0, f64::NEG_INFINITY, 0.0),
+            (0.0, f64::NEG_INFINITY, f64::INFINITY),
+            (-1.0, 0.0, f64::INFINITY),
+            (1.0, f64::NEG_INFINITY, 0.0),
+        ] {
+            // Column 1 appears in no row; column 0 keeps the model non-trivial.
+            let mut p = problem(&[1.0, cost], &[(&[1.0, 0.0], RowSense::Ge, 1.0)]);
+            p.col_lb[1] = lower;
+            p.col_ub[1] = upper;
+            presolve(&mut p, 20);
+            assert!(
+                p.col_lb[1] <= p.col_ub[1],
+                "cost {cost} bounds [{lower}, {upper}] left an inverted range [{}, {}]",
+                p.col_lb[1],
+                p.col_ub[1]
+            );
+            if p.col_lb[1] == p.col_ub[1] {
+                assert!(
+                    p.col_lb[1].is_finite(),
+                    "cost {cost} bounds [{lower}, {upper}] fixed the column at {}",
+                    p.col_lb[1]
+                );
+                assert!(
+                    p.col_lb[1] >= lower && p.col_lb[1] <= upper,
+                    "cost {cost} fixed the column outside its own bounds"
+                );
+            }
+        }
+    }
 
     fn problem(obj: &[f64], rows: &[(&[f64], RowSense, f64)]) -> Problem {
         let n = obj.len();

@@ -340,7 +340,23 @@ fn dive_inner(
     // basis is nearly optimal for the next one; the node's grows staler with depth.
     let mut warm = basis.clone();
 
+    let mut steps = 0usize;
+    let trace = std::env::var_os("RIPSOLVE_TRACE").is_some();
+    let fractional = |x: &[f64]| {
+        (0..problem.n_cols())
+            .filter(|&j| problem.is_integer(j) && (x[j] - x[j].round()).abs() > tol)
+            .count()
+    };
+    if trace {
+        eprintln!(
+            "  dive: starting, {} of {} integer columns fractional, budget {} steps",
+            fractional(&x),
+            (0..problem.n_cols()).filter(|&j| problem.is_integer(j)).count(),
+            limits.max_dive_steps
+        );
+    }
     for _ in 0..limits.max_dive_steps {
+        steps += 1;
         // The column closest to already being decided.
         let next = x
             .iter()
@@ -396,8 +412,14 @@ fn dive_inner(
         }
         if !advanced {
             // Neither value works, so the fixings made so far are jointly infeasible.
+            if trace {
+                eprintln!("  dive: dead-ended after {steps} steps, {} still fractional", fractional(&x));
+            }
             return None;
         }
+    }
+    if trace {
+        eprintln!("  dive: ran out of steps after {steps}, {} still fractional", fractional(&x));
     }
     None
 }
