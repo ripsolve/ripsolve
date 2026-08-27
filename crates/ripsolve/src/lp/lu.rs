@@ -74,7 +74,21 @@ pub enum FactorError {
 const PIVOT_THRESHOLD: f64 = 0.01;
 
 /// Columns examined per pivot search before settling for the best seen.
-const MAX_COLUMN_SEARCH: usize = 4;
+///
+/// Four was enough for a basis averaging one or two nonzeros per column, and far too
+/// few for a dense one. On MIPLIB's hypothyroid-k1, whose basis carries 126000
+/// nonzeros over 5195 rows, 92% of the solve is factorization, and the narrow search
+/// settles on pivots in dense rows that then propagate work: 85.8 million column
+/// eliminations, 149 columns touched per pivot against an average row of 24.
+///
+/// Widening it takes that relaxation from 295s to 174s and *reduces* the pivot count,
+/// 19081 to 15389, so the pivots are better conditioned as well as sparser. Sixteen is
+/// better still there, 167s, and worse on the sparse models, so eight is the balance.
+///
+/// The dense models in this solver's own range are unaffected either way: they are
+/// small enough that a zero-cost pivot turns up before the width binds, and their node
+/// and iteration counts do not move at all.
+const MAX_COLUMN_SEARCH: usize = 8;
 
 /// Elimination steps between clock reads during a factorization.
 const FACTOR_CLOCK_INTERVAL: usize = 1024;
