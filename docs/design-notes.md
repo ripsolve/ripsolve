@@ -546,6 +546,65 @@ model is mostly a matter of parking each nonbasic column on the bound that gives
 reduced cost the right sign. That, rather than another primal ratio rule, is where the
 next attempt should go.
 
+### Entering cold solves through the dual method
+
+Since phase 1 is where the primal method gets stuck, and the dual method has no phase 1
+to get stuck in, the obvious move is to start there. It was built on the
+`dual-cold-start` branch, which is kept unmerged.
+
+The starting basis costs nothing to work out. With every logical basic the basis is the
+identity and their costs are zero, so the duals are zero and each structural's reduced
+cost is exactly its objective coefficient; dual feasibility is then a sign condition per
+column, no factorization needed. A column that costs something to increase belongs at
+its lower bound, one that pays to increase at its upper, and a column whose cost points
+at a bound it does not have rules the method out for that model. Row selection is dual
+steepest edge, with the chosen row's weight taken exactly from the pivot row already in
+hand, `rho . rho`, rather than carried forward: the carried value took
+`drayage-100-23` 487230 iterations where the exact one takes 2374.
+
+Three defects turned up, and the first of them is now fixed on the main line because it
+was never about cold starts at all.
+
+- The dual method counted stalls by primal step length. Degeneracy there is a zero
+  *ratio*, meaning the entering column was already priced at zero and the dual objective
+  cannot move whatever the primal step is. On `drayage-100-23` the dual objective sat at
+  240.4124 for half a million iterations with the stall counter never leaving zero.
+- Steepest edge weights could grow until the score underflowed, and a selection rule
+  requiring a strict improvement over zero then skipped every violating row. That
+  reported a basis with a violation of 1.6e5 as optimal, returning -1.0 for a relaxation
+  whose optimum is 2087. A violating row must never be passed over, whatever it scores.
+- Primal feasibility means optimality only if the basis is also dual feasible, which the
+  ratio test preserves in exact arithmetic and drifts out of in this one. Assuming it
+  returned wrong optima on `gasprod1-2` and `s55`. Checked instead, and where the
+  invariant has lapsed the dual method now hands its basis to the primal loop rather
+  than ruling on it, which makes the two a sequence rather than a choice.
+
+The last two were caught by checking every relaxation objective against a reference
+solver rather than reading iteration counts, which is the only reason they did not
+survive. Eighteen of the twenty now agree; `gasprod1-2` solves for the first time, and
+`s55` and `neos-850681` no longer answer wrongly, they just do not finish.
+
+On relaxations the result is genuinely mixed: `neos-1582420` 3730 pivots to 937,
+`neos-595904` 5756 to 1473, `n13-3` 1811 to 1257, against `decomp1` 4210 to 8724,
+`neos-1445532` 4562 to 22197 and `cap6000` 810 to 6216.
+
+On the search it is worse, and that is what decides it. The same four instances solve,
+`mik-250-20-75-3` improves from 2.95% to 1.16% and two instances that had found no
+incumbent at all now find one, but most gaps widen: `decomp1` from 20.7s to 53.0s,
+`n13-3` from 21.8% to 37.1%, `neos-911970` from 48.1% to 77.6%.
+
+The tempting explanation, that node LPs are warm starts priced on steepest edge weights
+of one that are exact only at the identity basis, is wrong: restricting the rule to cold
+starts changes nothing. What is left is that the root relaxation is solved once and
+everything downstream reads its basis. Gomory cuts come off that tableau and branching
+reads its fractional values, so ending on a different optimal vertex redirects the whole
+search. The dual method reaches a different vertex, and on this set the vertex it
+reaches is usually the worse one to start from.
+
+That is a real finding about where the leverage is, and it is not in the relaxation.
+Getting the root LP to a better *vertex* rather than a better *objective* is the
+question the branch leaves open.
+
 ### The Harris ratio test
 
 Those three relaxations stall rather than mislead: thousands of consecutive
