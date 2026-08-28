@@ -710,6 +710,16 @@ impl Shared {
         f64::from_bits(self.best_bits.load(Ordering::Relaxed))
     }
 
+    /// The incumbent and the assignment that achieves it.
+    ///
+    /// Takes the lock, unlike [`Shared::incumbent`], because the improvement search
+    /// needs the point and not just its value. Called once every few hundred nodes,
+    /// so the copy is not on any hot path.
+    fn incumbent_solution(&self) -> (f64, Option<Vec<f64>>) {
+        let best = self.best.lock().expect("incumbent lock");
+        (best.0, best.1.clone())
+    }
+
     /// Install a better incumbent, if it really is better.
     ///
     /// Two workers can find improvements concurrently, so the comparison is redone
@@ -838,6 +848,27 @@ fn run_parallel(
                         && outcome.heuristic_hits > 0
                     {
                         shared.heuristic_hits.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    // Improve the incumbent from this node's relaxation, which the
+                    // serial driver has always done here and this one never did. The
+                    // omission left the parallel search with no way to repair a poor
+                    // first incumbent: on MIPLIB's cap6000 at two threads it sat on
+                    // -2355245 for the whole minute where the serial search reaches
+                    // -2451274 in three seconds and stops.
+                    //
+                    // `index` is drawn from the shared counter, so this fires once per
+                    // `improvement_frequency` nodes across the search as a whole,
+                    // exactly as it does serially, rather than once per worker.
+                    if let Some(relaxation) = &outcome.relaxation {
+                        let (value, current) = shared.incumbent_solution();
+                        if let Some(current) = current
+                            && let Some((objective, x)) =
+                                improve(problem, &current, value, relaxation, &options)
+                            && shared.offer(objective, x)
+                        {
+                            shared.heuristic_hits.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     shared.give_back(outcome.children);
                 }
