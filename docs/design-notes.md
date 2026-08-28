@@ -743,6 +743,42 @@ rather than incidental: workers expand nodes that a serial search would have pru
 against an incumbent it had already found, so total node count rises with thread
 count even as wall-clock time falls. `mkp_200` goes from 19522 nodes to 49432.
 
+### Why the pump does not rescue the starved instances
+
+Eight of the twenty instances in the tractable set finish with no incumbent at all, so
+no bound is worth anything on them. Diving is what fails there: given room to run it
+dead-ends rather than running out of steps, on `pigeon-08` with two columns left to
+decide and on `neos-1445532` after 1287 successful fixings. Backtracking the dive over
+its own trail was implemented and did not change the outcome.
+
+That leaves the feasibility pump, which is the tool for exactly this case because it
+fixes nothing and so cannot dead-end. It ran once, at the root, and only if rounding
+and diving had both already failed there. Running it again from node relaxations, so
+that it starts somewhere other than the root, was implemented and measured and produced
+no incumbent on any of the six.
+
+The reason is that the pump is not near-missing, it is not converging. Instrumenting how
+close its rounded point ever comes to feasible:
+
+| relaxation | closest snapped point, 60 rounds | at 600 rounds |
+|---|---:|---:|
+| `neos-1582420` | violates a row by 0.5 | 0.2 |
+| `neos-1445532` | 27.0 | 18.0 |
+| `neos-595904` | 187.0 | 119.0 |
+
+Ten times the rounds barely moves it, so the round limit is not what binds. Three
+explanations were tested and none holds: it is not the iteration budget, it is not the
+starting point, and it is not the linearization, which is only valid for binary columns
+but which every one of these models is, `neos-1582420` aside with a hundred general
+integers of span thirteen. The walk reaches a basin and the restart mechanism does not
+leave it.
+
+What the literature offers from here is a pump that carries a decaying fraction of the
+real objective, and a third stage that takes the closest point and searches a small
+model around it for the remaining violation. Both are real work rather than tuning, and
+neither is a small change. Until one of them exists, these instances have no route to a
+first solution, and their bounds cannot be spent.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
