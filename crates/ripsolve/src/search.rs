@@ -863,8 +863,14 @@ fn run_parallel(
                     if let Some(relaxation) = &outcome.relaxation {
                         let (value, current) = shared.incumbent_solution();
                         if let Some(current) = current
-                            && let Some((objective, x)) =
-                                improve(problem, &current, value, relaxation, &options)
+                            && let Some((objective, x)) = improve(
+                                problem,
+                                &current,
+                                value,
+                                relaxation,
+                                &options,
+                                remaining_of(options.time_limit, started),
+                            )
                             && shared.offer(objective, x)
                         {
                             shared.heuristic_hits.fetch_add(1, Ordering::Relaxed);
@@ -1322,7 +1328,14 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             && nodes.is_multiple_of(options.improvement_frequency)
             && let Some(current) = &incumbent_x
             && let Some(relaxation) = &outcome.relaxation
-            && let Some((objective, x)) = improve(problem, current, incumbent, relaxation, &options)
+            && let Some((objective, x)) = improve(
+                problem,
+                current,
+                incumbent,
+                relaxation,
+                &options,
+                remaining_of(options.time_limit, started),
+            )
         {
             incumbent = objective;
             incumbent_x = Some(x);
@@ -1371,6 +1384,11 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     }
 }
 
+/// What is left of a time limit that started at `started`, or `None` for no limit.
+fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
+    limit.map(|limit| limit.saturating_sub(started.elapsed()))
+}
+
 /// The internal-form objective of an assignment.
 /// Look for a better incumbent in the neighbourhood the incumbent and the relaxation
 /// agree on.
@@ -1392,7 +1410,13 @@ fn improve(
     incumbent_objective: f64,
     relaxation: &[f64],
     options: &Options,
+    remaining: Option<Duration>,
 ) -> Option<(f64, Vec<f64>)> {
+    // Out of time is out of time, and a sub-search with nothing left to spend would
+    // still pay for the model copy below.
+    if remaining.is_some_and(|left| left.is_zero()) {
+        return None;
+    }
     let mut neighbourhood = problem.clone();
     let mut fixed = 0usize;
     for j in problem.integer_columns() {
@@ -1416,9 +1440,12 @@ fn improve(
             improvement_frequency: 0,
             max_nodes: options.improvement_nodes,
             threads: 1,
-            // The sub-search inherits the deadline, so a budget spent here is a budget
-            // taken from the search that asked for it, not added to the run.
-            time_limit: options.time_limit,
+            // What is left of the caller's budget, not a fresh copy of it. A time
+            // limit is a duration and the sub-search starts its own clock, so passing
+            // the original handed it the whole limit again: an improvement beginning
+            // at fifty-five seconds of a sixty second run could spend another sixty.
+            // Measured, n13-3 returned at 71.6s against a 60s limit.
+            time_limit: remaining,
             ..*options
         },
     );
@@ -1503,7 +1530,7 @@ mod tests {
         // The relaxation agrees on `x0` and disagrees elsewhere, so `x0` is fixed and
         // the rest is searched. With `x0` at one the best remaining is `x2`, for 4.
         let relaxation = vec![1.0, 0.5, 1.0];
-        let (improved, x) = improve(&p, &incumbent, value, &relaxation, &options)
+        let (improved, x) = improve(&p, &incumbent, value, &relaxation, &options, None)
             .expect("a better point exists in that neighbourhood");
         assert_eq!(improved, -4.0);
         assert_eq!(x[0], 1.0, "the agreed column stays where both put it");
@@ -1520,10 +1547,63 @@ mod tests {
         // Agreeing on nothing leaves the original problem, which the search is already
         // doing.
         let disagrees = vec![0.0, 0.0, 1.0];
-        assert!(improve(&p, &incumbent, value, &disagrees, &options).is_none());
+        assert!(improve(&p, &incumbent, value, &disagrees, &options, None).is_none());
 
         // Agreeing on everything leaves the incumbent, which cannot be improved on.
-        assert!(improve(&p, &incumbent, value, &incumbent, &options).is_none());
+        assert!(improve(&p, &incumbent, value, &incumbent, &options, None).is_none());
+    }
+
+    /// A time limit is a duration and the sub-search starts its own clock, so it has
+    /// to be handed what is left of the caller's budget rather than a fresh copy of
+    /// it. Handing over the original let an improvement beginning near the end of a
+    /// run spend the whole limit again: n13-3 returned at 71.6s against a 60s limit,
+    /// and 60.3s once this was passed through.
+    ///
+    /// What this pins is that `remaining` is honoured at all. The early return and the
+    /// limit handed to the sub-search each produce the right answer on their own, so
+    /// neither fails this alone; removing both does. The early return is there to skip
+    /// a whole-model clone once the budget is gone, which is work rather than answer
+    /// and so is not visible from here.
+    #[test]
+    fn the_improvement_search_gets_what_is_left_of_the_budget_and_no_more() {
+        let p = knapsackish();
+        // A caller with a generous limit overall, which is the value the sub-search
+        // must *not* be handed once the run is nearly over.
+        let options = Options {
+            time_limit: Some(Duration::from_secs(30)),
+            ..Options::default()
+        };
+        let incumbent = vec![1.0, 1.0, 0.0];
+        let value = objective_at(&p, &incumbent);
+        let relaxation = vec![1.0, 0.5, 1.0];
+
+        // Nothing left means nothing spent, and no answer either.
+        assert!(
+            improve(
+                &p,
+                &incumbent,
+                value,
+                &relaxation,
+                &options,
+                Some(Duration::ZERO)
+            )
+            .is_none(),
+            "an exhausted budget still ran a sub-search"
+        );
+
+        // With budget it does the work it is there to do.
+        assert!(
+            improve(
+                &p,
+                &incumbent,
+                value,
+                &relaxation,
+                &options,
+                Some(Duration::from_secs(30))
+            )
+            .is_some(),
+            "a funded improvement search found nothing"
+        );
     }
 
     fn node(bound: f64, depth: usize) -> Node {
