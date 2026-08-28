@@ -779,6 +779,35 @@ model around it for the remaining violation. Both are real work rather than tuni
 neither is a small change. Until one of them exists, these instances have no route to a
 first solution, and their bounds cannot be spent.
 
+### Presolve cannot pay until the model is compacted
+
+Comparing our presolve against a reference solver's on the tractable set says we leave a
+great deal on the table: it keeps 9% of the columns of `neos-1445532` and 33% of the
+rows of `n13-3`, where we remove seventy-six columns from the first and nothing at all
+from the second. Counting structure says where that comes from. Doubleton equalities,
+which let a variable be substituted out, number 530 on `n13-3`, 127 on `neos-1445532`
+and 90 on `neos-850681`; duplicate rows number 1586 of `decomp1`'s 8357.
+
+Parallel row merging was implemented for the second of those, since it needs nothing
+that is not already here: one row a scalar multiple of another, so the survivor takes
+the intersection of both bound sets and the other is freed. It works, folding away 1565
+rows of `decomp1` and 59 of `dsbmip`, and it made the whole set slightly and uniformly
+slower. `decomp1` itself went from 20.8s to 25.6s having shed a fifth of its rows.
+
+The reason is that freeing a row does not remove it. `Lp::relaxation` takes `m` from
+`problem.n_rows()` and clones the matrix whole, so a row whose bounds have been widened
+to infinity still becomes a logical variable, still occupies a row of the basis and
+still enters every factorization. The reduction costs presolve time and returns nothing.
+That applies equally to the redundant-row and forcing-row reductions already here: they
+have been cosmetic at the LP level all along.
+
+So the order of work is the other way round from how it looks. Compacting the model,
+dropping freed rows and fixed columns and carrying a map back to the original indices,
+is not an optimization to add after the reductions; it is what any row reduction needs
+before it can pay for itself. It is also exactly the machinery doubleton aggregation
+would need, since substituting a variable out means removing a column and restoring it
+afterwards. One piece of work unlocks both, and neither is worth attempting without it.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
