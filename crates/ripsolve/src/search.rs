@@ -81,30 +81,41 @@ pub struct Options {
     pub local_cuts_per_node: usize,
     /// Rounds of cut separation at the root. Zero disables cuts.
     ///
-    /// Defaults to zero, which is not where a branch-and-*cut* solver expects to
-    /// end up. Measured over eleven models spanning this solver's target range,
-    /// cutting was slower on every one of them:
+    /// This defaulted to zero for a long time, on the strength of eleven generated
+    /// models over which cutting was slower on every one. That measurement still
+    /// holds, and it is still the wrong default, because the models it was taken over
+    /// are not the ones the answer turns on.
+    ///
+    /// On the generated knapsack and covering instances cutting costs about twice the
+    /// wall clock and buys nothing, since both configurations solve them either way:
     ///
     /// ```text
-    ///                  no cuts      3 rounds of 32
-    ///     mkp_200      17.1s          47.8s
-    ///     v064c200      1.7s           2.4s
-    ///     v081c162n009  0.8s           1.2s
-    ///     v048c048     0.01s          0.04s
+    ///                          no cuts    50 rounds of 64
+    ///     mkp_200               12.7s         27.5s
+    ///     covering_c60_r80_s3    8.2ms        19.2ms
+    ///     mkp_500               0.183% gap    0.194% gap
     /// ```
     ///
-    /// The cuts are not useless, they raise the root bound substantially, taking
-    /// v064c200 from 72.1 to 95.4 against an optimum of 225. They simply do not pay
-    /// for themselves here: separation is expensive, the cuts come out dense enough
-    /// to slow every subsequent LP, and best-bound node selection had already
-    /// captured most of what a better bound was worth. On `mkp_200` cutting even
-    /// *raised* the node count, 72150 to 91346, and on MIPLIB's markshare_4_0 it was
-    /// the difference between proving optimality in 21 seconds and not proving it at
-    /// all.
+    /// On MIPLIB the same comparison decides whether an instance is solved at all:
     ///
-    /// Turning this on is worthwhile when node count matters more than wall clock,
-    /// and would become worthwhile generally with cheaper separation and proper cut
-    /// selection by efficacy and orthogonality. Neither is implemented.
+    /// ```text
+    ///                          no cuts    50 rounds of 64
+    ///     nexp-50-20-1-1        47.3% gap     optimal in 1.3s
+    ///     neos-911970           72.8% gap      6.2% gap
+    ///     beavma                36.3% gap      8.2% gap
+    ///     n13-3                 47.0% gap     26.2% gap
+    ///     decomp1                1.9s         20.8s
+    /// ```
+    ///
+    /// Twice the time on a model that solves regardless is a smaller loss than never
+    /// solving one at all, so the default follows the second table. `decomp1` is the
+    /// price, and it is a real one.
+    ///
+    /// What changed in between is that the cuts got better rather than the reasoning:
+    /// mixed-integer rounding with bound substitution reaches structure the earlier
+    /// families could not, and selection by efficacy and orthogonality keeps the dense
+    /// ones out of the model. The old note said this would become worthwhile with
+    /// proper cut selection, and it did.
     pub cut_rounds: usize,
     /// Most cuts to add in a single round.
     pub cuts_per_round: usize,
@@ -172,9 +183,8 @@ impl Default for Options {
             presolve: true,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
-            // Off by default. See `cut_rounds`.
-            cut_rounds: 0,
-            cuts_per_round: 32,
+            cut_rounds: 50,
+            cuts_per_round: 64,
             refactor_interval: 200,
             threads: 1,
             plunge_limit: 0,

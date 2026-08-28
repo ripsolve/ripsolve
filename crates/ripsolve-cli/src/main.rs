@@ -63,12 +63,11 @@ enum Command {
         /// Skip presolve.
         #[arg(long)]
         no_presolve: bool,
-        /// Rounds of root cut separation. Off by default: cutting raises the root
-        /// bound but has measured slower on every model in this solver's range.
-        #[arg(long, default_value_t = 0)]
+        /// Rounds of root cut separation. Zero disables cuts.
+        #[arg(long, default_value_t = 50)]
         cut_rounds: usize,
         /// Most cuts to keep per separation round.
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 64)]
         cuts_per_round: usize,
         /// Separate cuts at one node in every N, not only at the root. 0 disables.
         #[arg(long, default_value_t = 10)]
