@@ -37,6 +37,8 @@ pub struct Stats {
     pub fixed_columns: usize,
     pub redundant_rows: usize,
     pub tightened_coefficients: usize,
+    /// Columns decided by probing, which is a subset of `fixed_columns`.
+    pub probed_columns: usize,
 }
 
 /// The result of presolving.
@@ -130,6 +132,14 @@ pub fn presolve(problem: &mut Problem, max_rounds: usize) -> Outcome {
         if fix_singleton_columns(problem, &rows, &mut stats) {
             changed = true;
         }
+
+        let before = stats.fixed_columns;
+        match probe(problem, &rows, &mut stats) {
+            Err(outcome) => return outcome,
+            Ok(true) => changed = true,
+            Ok(false) => {}
+        }
+        stats.probed_columns += stats.fixed_columns - before;
 
         if !changed {
             break;
@@ -285,6 +295,163 @@ fn propagate(
     } else {
         Propagation::Unchanged
     }
+}
+
+/// Tighten column bounds against every row until nothing moves, on scratch bounds.
+///
+/// The same reasoning as [`propagate`], but over a copy of the bounds and repeated to a
+/// fixpoint rather than applied once per row per round. That is what probing needs: it
+/// asks what follows from a column taking a value, which means propagating a
+/// hypothetical without disturbing the model.
+///
+/// Returns false as soon as the hypothesis is contradicted.
+fn propagate_all(
+    problem: &Problem,
+    rows: &[Row],
+    col_lb: &mut [f64],
+    col_ub: &mut [f64],
+    rounds: usize,
+) -> bool {
+    for _ in 0..rounds {
+        let mut changed = false;
+        for (i, row) in rows.iter().enumerate() {
+            let (row_lb, row_ub) = (problem.row_lb[i], problem.row_ub[i]);
+            if is_free(row_lb, row_ub) {
+                continue;
+            }
+            let (min_activity, max_activity) = activity(row, col_lb, col_ub);
+            if min_activity > row_ub + TOL || max_activity < row_lb - TOL {
+                return false;
+            }
+            for &(j, a) in row {
+                if a == 0.0 {
+                    continue;
+                }
+                let (lo, hi) = (a * col_lb[j], a * col_ub[j]);
+                let (own_min, own_max) = (lo.min(hi), lo.max(hi));
+                let contribution_lo = row_lb - (max_activity - own_max);
+                let contribution_hi = row_ub - (min_activity - own_min);
+                let (implied_lo, implied_hi) = if a > 0.0 {
+                    (contribution_lo / a, contribution_hi / a)
+                } else {
+                    (contribution_hi / a, contribution_lo / a)
+                };
+                let (implied_lo, implied_hi) = if problem.is_integer(j) {
+                    (
+                        ceil_with_tolerance(implied_lo),
+                        floor_with_tolerance(implied_hi),
+                    )
+                } else {
+                    (implied_lo, implied_hi)
+                };
+                let new_lb = col_lb[j].max(implied_lo);
+                let new_ub = col_ub[j].min(implied_hi);
+                if new_lb > new_ub + TOL {
+                    return false;
+                }
+                if new_lb > col_lb[j] + TOL || new_ub < col_ub[j] - TOL {
+                    col_lb[j] = new_lb;
+                    col_ub[j] = new_ub;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    true
+}
+
+/// Try each binary both ways and keep whatever must follow.
+///
+/// Setting a column and propagating answers a question the model states only
+/// implicitly: if this contradicts itself, the column is decided the other way. That is
+/// where a reference solver's advantage on binary models lives. It closes MIPLIB's
+/// `acc-tight2`, `ex9` and `ex10` in zero simplex iterations, the model collapsing
+/// under propagation before any relaxation is solved, and this solver finds no feasible
+/// point in any of them within a minute.
+///
+/// Columns fixed the same way down *both* branches are fixed outright as well: if a
+/// column must take a value whichever way another column goes, it must take it.
+///
+/// Bounded by a probe budget, because each probe propagates over the whole model and
+/// the largest instances here carry tens of thousands of binaries.
+fn probe(problem: &mut Problem, rows: &[Row], stats: &mut Stats) -> Result<bool, Outcome> {
+    /// Coefficient touches to spend on probing altogether.
+    ///
+    /// Each hypothesis sweeps the whole model, so the affordable number of probes falls
+    /// as the model grows. A flat count does not survive contact with the larger
+    /// instances: four hundred probes over `ex10`, at 1.16M nonzeros, is billions of
+    /// operations, and since presolve runs before the search and outside its deadline,
+    /// it simply ran past the time limit the caller asked for.
+    const WORK: usize = 200_000_000;
+    /// Propagation sweeps per hypothesis.
+    const ROUNDS: usize = 8;
+
+    let n = problem.n_cols();
+    let nnz = rows.iter().map(Vec::len).sum::<usize>().max(1);
+    let budget = (WORK / (ROUNDS * nnz)).clamp(0, 2_000);
+    let candidates: Vec<usize> = (0..n)
+        .filter(|&j| {
+            problem.is_integer(j)
+                && problem.col_lb[j] == 0.0
+                && problem.col_ub[j] == 1.0
+        })
+        .take(budget)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    let (mut down_lb, mut down_ub) = (vec![0.0; n], vec![0.0; n]);
+    let (mut up_lb, mut up_ub) = (vec![0.0; n], vec![0.0; n]);
+    for j in candidates {
+        // A column decided since the list was drawn has nothing left to probe.
+        if problem.col_lb[j] == problem.col_ub[j] {
+            continue;
+        }
+        down_lb.copy_from_slice(&problem.col_lb);
+        down_ub.copy_from_slice(&problem.col_ub);
+        down_ub[j] = 0.0;
+        let down = propagate_all(problem, rows, &mut down_lb, &mut down_ub, ROUNDS);
+
+        up_lb.copy_from_slice(&problem.col_lb);
+        up_ub.copy_from_slice(&problem.col_ub);
+        up_lb[j] = 1.0;
+        let up = propagate_all(problem, rows, &mut up_lb, &mut up_ub, ROUNDS);
+
+        match (down, up) {
+            (false, false) => return Err(Outcome::Infeasible),
+            (false, true) => {
+                if fix_column(problem, j, 1.0, stats) {
+                    changed = true;
+                }
+            }
+            (true, false) => {
+                if fix_column(problem, j, 0.0, stats) {
+                    changed = true;
+                }
+            }
+            (true, true) => {
+                // Neither way is ruled out, but a column both agree on is settled.
+                for k in 0..n {
+                    if k == j || problem.col_lb[k] == problem.col_ub[k] {
+                        continue;
+                    }
+                    if down_lb[k] == down_ub[k]
+                        && up_lb[k] == up_ub[k]
+                        && (down_lb[k] - up_lb[k]).abs() <= TOL
+                        && fix_column(problem, k, down_lb[k], stats)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn ceil_with_tolerance(v: f64) -> f64 {
