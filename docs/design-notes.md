@@ -801,12 +801,38 @@ still enters every factorization. The reduction costs presolve time and returns 
 That applies equally to the redundant-row and forcing-row reductions already here: they
 have been cosmetic at the LP level all along.
 
-So the order of work is the other way round from how it looks. Compacting the model,
-dropping freed rows and fixed columns and carrying a map back to the original indices,
-is not an optimization to add after the reductions; it is what any row reduction needs
-before it can pay for itself. It is also exactly the machinery doubleton aggregation
-would need, since substituting a variable out means removing a column and restoring it
-afterwards. One piece of work unlocks both, and neither is worth attempting without it.
+So the order of work looked the other way round from how it appears: compacting the
+model, dropping freed rows and fixed columns behind a map back to the original indices,
+looked like the prerequisite any row reduction needs before it can pay.
+
+It was built, measured over all 140 pure binary instances, and reverted. It works. A
+fixed column's contribution moves into the row bounds and the objective offset, a row
+left empty and violated is reported rather than discarded, and the expansion puts the
+solution back; `cap6000` sheds 62% of its nonzeros, five dense cardinality rows across
+all six thousand columns, and `mitre` loses 392 rows. What it does not do is help:
+
+| | closed | total time on those |
+|---|---:|---:|
+| without compaction | 24 of 140 | 151.2s |
+| with compaction | 24 of 140 | 172.5s |
+
+Not one instance changed hands, and the models that do close take 14% longer overall.
+`decomp1` improves by 31% and `cap6000` by 12% against `irp` at 71% worse and `decomp2`
+at 34%, and the `decomp1` and `decomp2` directions reproduce single threaded, so this is
+the change and not the parallel search's noise. Removing rows alters the basis ordering,
+which alters cut generation and branching, and the search that follows is simply a
+different one; some models come out ahead and more come out behind.
+
+The reason the systematic gain never arrives is that there is nothing to compact.
+`air04`, `air05`, `cod105`, `neos-820879` and `eil33-2`, all of them models the
+benchmark says we lose, come out of presolve at exactly their original size: no row, no
+column, no nonzero removed. Compaction can only remove what presolve has already
+finished with, and on the models that matter presolve has finished with nothing.
+
+That leaves the dependency intact but the order reversed. Compaction is still what
+doubleton aggregation needs, since substituting a variable out is a column removal, and
+the work is in the history to bring back with it. What it is not is a throughput fix in
+its own right, and shipping it on that expectation would have cost 14% for nothing.
 
 ## Measuring the search
 

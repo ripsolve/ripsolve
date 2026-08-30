@@ -117,12 +117,6 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
 fn presolve_does_not_change_any_optimum() {
     // Presolve is allowed to reduce the model however it likes, provided the answer
     // is identical. Checked on every sample, both ways.
-    //
-    // The assignment is checked as well as the objective, because presolve now
-    // compacts the model and compaction renumbers. A solution expanded back through
-    // the wrong map still carries the objective the search computed for it, so an
-    // objective comparison alone would not notice; a point that is the wrong length,
-    // or that the original model rejects, would go through unremarked.
     let data = fixtures();
     for entry in data["samples"].as_array().unwrap() {
         let file = entry["file"].as_str().unwrap();
@@ -152,6 +146,12 @@ fn presolve_does_not_change_any_optimum() {
             (a, b) => panic!("{file}: presolve {a:?}, plain {b:?}"),
         }
 
+        // The assignment, not just its value. An objective is computed on whatever
+        // model the search actually ran, so it stays self-consistent even when the
+        // point handed back does not belong to the original: a reduction that
+        // renumbered columns, or moved a constant it should have kept, would report a
+        // plausible number attached to the wrong vector. Comparing objectives alone
+        // cannot see that; asking the original model what it makes of the point can.
         if let Some(reported) = with.objective {
             assert_eq!(
                 with.x.len(),

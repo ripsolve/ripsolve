@@ -1103,52 +1103,24 @@ fn separate_at_root(
     }
 }
 
-/// Put a solution back into the original columns, if the model was compacted.
-///
-/// Compaction renumbers, so everything the search produced is in the compacted column
-/// space and has to be expanded before it leaves this module. The objective needs no
-/// such treatment: the constant the dropped columns contributed moved into the reduced
-/// model's own offset, so its objective is already the original's.
-fn expand(x: Option<Vec<f64>>, compaction: Option<&presolve::Compaction>) -> Vec<f64> {
-    match (x, compaction) {
-        (Some(x), Some(map)) => map.expand(&x),
-        (Some(x), None) => x,
-        (None, _) => Vec::new(),
-    }
-}
-
 pub fn solve(problem: &Problem, options: Options) -> Solution {
     let started = Instant::now();
 
-    // Presolve is sound (it never admits a point the original rejects) and preserves
-    // the optimum, so searching the reduced model answers the original question.
-    //
-    // It is then compacted, which is what makes its reductions worth anything. Presolve
-    // widens a redundant row to infinite bounds and pins a decided column by setting its
-    // bounds equal, but leaves both in the model, and `Lp::relaxation` gives every row a
-    // logical variable whether it constrains anything or not. Until they are removed a
-    // freed row still occupies a row of the basis and enters every factorization.
-    //
-    // Compaction renumbers, so unlike presolve alone it needs a way back, and the
-    // solution is expanded through that map on the way out.
+    // Presolve reduces in place and introduces no renumbering, so the reduced
+    // model's solution vector is directly the original's, there is no postsolve.
+    // It is sound (it never admits a point the original rejects) and preserves the
+    // optimum, so searching the reduced model answers the original question.
     let mut reduced;
-    let (problem, presolve_stats, compaction) = if options.presolve {
+    let (problem, presolve_stats) = if options.presolve {
         reduced = problem.clone();
-        let stats = match presolve::presolve(&mut reduced, 20) {
+        match presolve::presolve(&mut reduced, 20) {
             Outcome::Infeasible => {
                 return Solution::without_solution(Status::Infeasible, 0, 0, None);
             }
-            Outcome::Reduced(stats) => stats,
-        };
-        match presolve::compact(&reduced) {
-            Err(_) => return Solution::without_solution(Status::Infeasible, 0, 0, Some(stats)),
-            Ok((compacted, map)) => {
-                reduced = compacted;
-                (&reduced, Some(stats), Some(map))
-            }
+            Outcome::Reduced(stats) => (&reduced, Some(stats)),
         }
     } else {
-        (problem, None, None)
+        (problem, None)
     };
 
     let _ = problem.n_cols();
@@ -1306,7 +1278,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                 .incumbent_x
                 .as_ref()
                 .map(|_| problem.objective_value(result.incumbent)),
-            x: expand(result.incumbent_x, compaction.as_ref()),
+            x: result.incumbent_x.unwrap_or_default(),
             bound: problem.objective_value(internal_bound),
             nodes,
             simplex_iterations: iterations,
@@ -1410,7 +1382,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         objective: incumbent_x
             .as_ref()
             .map(|_| problem.objective_value(incumbent)),
-        x: expand(incumbent_x, compaction.as_ref()),
+        x: incumbent_x.unwrap_or_default(),
         bound: problem.objective_value(internal_bound),
         nodes,
         simplex_iterations: iterations,
