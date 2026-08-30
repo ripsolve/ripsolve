@@ -154,6 +154,21 @@ pub struct Options {
     pub improvement_frequency: usize,
     /// Nodes an improvement search may spend before giving the budget back.
     pub improvement_nodes: usize,
+    /// Nodes a relaxation-enforced neighbourhood search may explore, or zero to
+    /// disable it.
+    ///
+    /// The root relaxation decides most of a binary model on its own: it leaves 209 of
+    /// `ab71-20-100`'s 6689 integer columns fractional, 224 of `air05`'s 7195 and 805
+    /// of `mitre`'s 10724. Holding the decided ones where the relaxation put them and
+    /// searching only what is left is a much smaller problem, and often has a feasible
+    /// point in it.
+    ///
+    /// This is the heuristic for having nothing, rather than for improving something.
+    /// The improvement search next door needs an incumbent to build a neighbourhood
+    /// around, which is no use when the difficulty is that there is no incumbent: on
+    /// the pure binary benchmark, thirteen of fourteen instances an open-source solver
+    /// closes and this one does not end with no feasible point found at all.
+    pub rens_nodes: usize,
     /// Base node interval between in-tree heuristic attempts. Zero disables them.
     ///
     /// This is a starting point, not a fixed cadence: the interval doubles after
@@ -190,6 +205,7 @@ impl Default for Options {
             plunge_limit: 0,
             improvement_frequency: 500,
             improvement_nodes: 2_000,
+            rens_nodes: 5_000,
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
@@ -1219,6 +1235,20 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     &options.heuristic_limits,
                     &mut iterations,
                 )
+            })
+            // Last, and much the most expensive, because it is a search rather than a
+            // walk: hold the columns the relaxation has already decided and look for a
+            // point among the rest. The cheaper three fail together on the models that
+            // matter here, rounding because the relaxation is not nearly integral,
+            // diving because it dead-ends, and the pump because it does not converge.
+            .or_else(|| {
+                rens(
+                    problem,
+                    &root.x,
+                    &options,
+                    remaining_of(options.time_limit, started),
+                )
+                .map(|(objective, x)| heuristic::Incumbent { objective, x })
             });
         // Whatever produced the point, its continuous columns are still sitting where
         // the relaxation left them. Re-optimizing them is one LP and is often worth
@@ -1404,6 +1434,72 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         root_bound: problem.objective_value(first_bound),
         root_bound_after_cuts: problem.objective_value(root_bound),
     }
+}
+
+/// Search the neighbourhood the root relaxation points at, for a first feasible point.
+///
+/// Every integer column the relaxation already put on an integer is held there, and
+/// every column it left fractional is confined to the two integers either side of it.
+/// Both are restrictions of the original model, so whatever is found is feasible for
+/// the original; it need not be optimal, and is not claimed to be.
+///
+/// This is Danna, Rothberg and Le Pape's RINS turned around. RINS intersects an
+/// incumbent with the relaxation and so cannot run before one exists, which is exactly
+/// when a first point is wanted; here the relaxation is asked on its own.
+///
+/// The sub-search runs with this switched off, which is what stops it recursing.
+fn rens(
+    problem: &Problem,
+    relaxation: &[f64],
+    options: &Options,
+    remaining: Option<Duration>,
+) -> Option<(f64, Vec<f64>)> {
+    if options.rens_nodes == 0 || remaining.is_some_and(|left| left.is_zero()) {
+        return None;
+    }
+    let mut neighbourhood = problem.clone();
+    let mut held = 0usize;
+    let mut integers = 0usize;
+    for j in problem.integer_columns() {
+        integers += 1;
+        let value = relaxation[j];
+        let nearest = value.round();
+        if (value - nearest).abs() <= options.integrality_tolerance {
+            neighbourhood.col_lb[j] = nearest;
+            neighbourhood.col_ub[j] = nearest;
+            held += 1;
+        } else {
+            neighbourhood.col_lb[j] = neighbourhood.col_lb[j].max(value.floor());
+            neighbourhood.col_ub[j] = neighbourhood.col_ub[j].min(value.ceil());
+        }
+    }
+    // Nothing held leaves the original problem; everything held leaves the rounding the
+    // cheaper heuristics have already tried and failed on.
+    if held == 0 || held == integers {
+        return None;
+    }
+
+    let found = solve(
+        &neighbourhood,
+        Options {
+            rens_nodes: 0,
+            improvement_frequency: 0,
+            max_nodes: options.rens_nodes,
+            threads: 1,
+            time_limit: remaining,
+            ..*options
+        },
+    );
+    let x = found.x;
+    if x.len() != problem.n_cols() {
+        return None;
+    }
+    // The sub-search answers about its own restricted model, so what comes back is
+    // checked against the original rather than trusted.
+    if !crate::heuristic::is_feasible(problem, &x, options.heuristic_limits.feasibility_tolerance) {
+        return None;
+    }
+    Some((objective_at(problem, &x), x))
 }
 
 /// What is left of a time limit that started at `started`, or `None` for no limit.
