@@ -84,9 +84,8 @@ def main():
             "%s=%s/%ss" % (k, result[k]["status"][:3], result[k]["seconds"])
             for k in SOLVERS)), flush=True)
 
-    tally = {k: sum(1 for row in rows if screen.closed(row[4][k])) for k in SOLVERS}
-    print("\nclosed (optimal or proved infeasible): "
-          + ", ".join(f"{k} {tally[k]}/{len(rows)}" for k in SOLVERS))
+    tally = {k: sum(1 for row in rows if row[4][k]["status"] == "optimal") for k in SOLVERS}
+    print("\nsolved: " + ", ".join(f"{k} {tally[k]}/{len(rows)}" for k in SOLVERS))
     (OUT / "binary_results.json").write_text(json.dumps(
         {"rows": [[n, r, c, nz, res] for n, r, c, nz, res in rows], "tally": tally,
          "limit": screen.LIMIT, "threads": screen.THREADS}, indent=1))

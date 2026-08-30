@@ -834,6 +834,47 @@ doubleton aggregation needs, since substituting a variable out is a column remov
 the work is in the history to bring back with it. What it is not is a throughput fix in
 its own right, and shipping it on that expectation would have cost 14% for nothing.
 
+### Why the pure binary instances are not lost for one reason
+
+The pure binary benchmark is 140 instances, every column of every one confined to
+{0, 1}, and this solver closes 24 of them against 46 for HiGHS and 45 for SCIP. On the
+24 it does close it is usually the quickest of the open-source field, median rank one,
+so the machinery is not the difficulty; coverage is.
+
+Diagnosing the 33 it loses that an open-source solver closes, thirteen of fourteen
+sampled end with no feasible point at all. That looked like one problem with one answer,
+and it is not. Counting nodes explored in a minute separates it into three:
+
+- `ex9` and `ex10` reach **one node**, with or without cuts. The root relaxation alone
+  spends the whole budget; at 517112 and 1162000 nonzeros they are simply larger than
+  this LP is quick on.
+- `mitre` reaches **one node with root cutting on and 5126 with it off**. Nothing is
+  wrong with its LP; the root cut loop, fifty rounds each re-solving the model, eats the
+  minute before the search starts.
+- The `acc-tight` family reaches twenty-odd nodes either way and finds nothing in them.
+  That is the primal failure the count of starved instances suggested.
+
+Three causes, and each needs its own answer. Four attempts aimed at the wrong one:
+
+| attempt | what it did | result |
+|---|---|---|
+| clique cuts | 1296 to 10640 conflict edges found | shipped, no instance closed |
+| implication closure | neos18 182 triangles to 55245 | reverted, bound *worse* |
+| RENS | held 96.9% of air05's columns | reverted, one instance gained an incumbent |
+| probing with compaction | ex9 1867 columns and 7208 rows removed, LP 22% smaller | reverted |
+
+The last is the sharpest lesson. Probing found real reductions where nothing had before,
+compaction carried them into the LP, and the node count did not move: `ex9` explores one
+node either way, 10970 simplex iterations against 11036. A model 22% smaller does not
+help a search that never gets past its first node. Two instances that do close, `decomp2`
+and `cap6000`, came out 45% slower for it.
+
+The order to work in follows from the split rather than from the totals. `mitre` says the
+root cut loop needs a budget, since spending an entire run on it is worse than not cutting
+at all. `ex9` and `ex10` say the LP needs to be quicker on large models before anything
+built on top of it can matter. Only the `acc-tight` family is the primal problem that all
+four attempts above were aimed at.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

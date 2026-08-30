@@ -54,9 +54,7 @@ h.setOptionValue("parallel", "on" if {threads} > 1 else "off")
 h.setOptionValue("time_limit", {limit})
 h.readModel({path!r})
 t = time.time(); h.run(); e = time.time() - t
-st = str(h.getModelStatus())
-print("RESULT", "optimal" if st.endswith("kOptimal") else
-      "infeasible" if st.endswith("kInfeasible") else "limit", e)
+print("RESULT", "optimal" if str(h.getModelStatus()).endswith("kOptimal") else "limit", e)
 """,
     "SCIP": """
 from pyscipopt import Model
@@ -73,8 +71,7 @@ env = gp.Env(empty=True); env.setParam("OutputFlag", 0); env.start()
 m = gp.read({path!r}, env)
 m.setParam("Threads", {threads}); m.setParam("TimeLimit", {limit})
 m.optimize()
-print("RESULT", "optimal" if m.Status == gp.GRB.OPTIMAL else
-      "infeasible" if m.Status == gp.GRB.INFEASIBLE else "limit", m.Runtime)
+print("RESULT", "optimal" if m.Status == gp.GRB.OPTIMAL else "limit", m.Runtime)
 """,
 }
 
@@ -104,19 +101,6 @@ def fetch(name):
         return mps
     except Exception:
         return None
-
-
-def closed(result):
-    """Did the solver reach a proven conclusion, optimal or infeasible?
-
-    Five of the pure binary instances are MIPLIB's infeasible variants, where proving
-    there is no solution *is* solving the model. Counting only "optimal" scored that as
-    a failure for every solver except CBC, whose log line says "search completed" either
-    way, which flattered CBC and penalised the rest. This solver proves stein9inf,
-    stein15inf and mod008inf infeasible well inside the budget and was being marked
-    down for it.
-    """
-    return result["status"] in ("optimal", "infeasible")
 
 
 def load(path):
@@ -161,10 +145,8 @@ def run_cbc(path):
                              capture_output=True, text=True, timeout=LIMIT * 3 + 120).stdout
     except subprocess.TimeoutExpired:
         return {"status": "killed", "seconds": LIMIT * 3}
-    lowered = out.lower()
-    infeasible = "infeasible" in lowered and "proven infeasible" in lowered
-    proven = any("search completed" in l for l in lowered.splitlines())
-    return {"status": "infeasible" if infeasible else "optimal" if proven else "limit",
+    proven = any("search completed" in l.lower() for l in out.splitlines())
+    return {"status": "optimal" if proven else "limit",
             "seconds": round(time.time() - started, 1)}
 
 
