@@ -993,6 +993,10 @@ fn separate_at_root(
     // The model without any cut rows. Each round rebuilds from here rather than
     // appending to the previous round's model, which is what lets a cut leave again.
     let base = problem.clone();
+    // Which columns exclude one another, read once from the model that arrived. Cut
+    // rows are added below but never create conflicts: they are implied by the model
+    // the graph was built from, so anything they would say is already in it.
+    let conflicts = cuts::Conflicts::of(problem);
     let mut model: Option<Problem> = None;
     let mut with_cuts;
     // Cuts currently carried in the model, each with a count of consecutive resolves
@@ -1008,13 +1012,21 @@ fn separate_at_root(
         {
             break;
         }
-        // Three families with different reach: covers need a row that reads as a
-        // knapsack, MIR needs a row mixing integer and continuous columns, and GMI
-        // comes off the tableau and applies to any fractional basic column. On dense
-        // random rows the last is usually the only one that finds anything, while on
-        // mixed models from MIPLIB the middle one carries most of the bound.
+        // Four families with different reach: covers need a row that reads as a
+        // knapsack, MIR needs a row mixing integer and continuous columns, cliques need
+        // columns that exclude one another, and GMI comes off the tableau and applies
+        // to any fractional basic column. On dense random rows the last is usually the
+        // only one that finds anything; on mixed models from MIPLIB the second carries
+        // most of the bound; and on the pure binary set, where there is no continuous
+        // structure for MIR to reach, the third is the one with anything to say.
         let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
         found.extend(cuts::separate_mir(problem, &root.x, options.cuts_per_round));
+        found.extend(cuts::separate_cliques(
+            problem,
+            &conflicts,
+            &root.x,
+            options.cuts_per_round,
+        ));
         found.extend(cuts::separate_gomory(
             &lp,
             &root.basis,

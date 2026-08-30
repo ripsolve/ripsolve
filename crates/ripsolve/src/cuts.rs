@@ -839,6 +839,215 @@ fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) ->
     })
 }
 
+/// Which pairs of *literals* cannot hold at once.
+///
+/// A literal is a binary column asserted either way: `x_j` or `not x_j`. Working over
+/// literals rather than columns is the difference between reading a model's two-column
+/// rows and missing them entirely. A row saying `x + y <= 1` forbids both columns being
+/// one and is a conflict between the columns; a row saying `x - y <= 0` forbids nothing
+/// of the sort, it says `x` implies `y`, and setting both to one satisfies it. Over
+/// literals that second row is a conflict too, between `x` and `not y`.
+///
+/// That distinction decides whether there is anything here at all. The pure binary
+/// benchmark is full of two-column rows, `neos-5129192-manaia` alone carrying 319027,
+/// and reading them as column conflicts finds no edge whatsoever on `acc-tight2`,
+/// `mine-166-5`, `neos18`, `ab71-20-100` or `neos-953928`. They are implications, not
+/// exclusions.
+///
+/// Node `2j` is the literal `x_j = 1` and node `2j + 1` is `x_j = 0`.
+pub struct Conflicts {
+    /// For each literal, the literals it excludes, sorted.
+    neighbours: Vec<Vec<u32>>,
+}
+
+/// The node standing for column `j` taking `value`.
+fn literal(j: usize, value: bool) -> u32 {
+    (2 * j + usize::from(!value)) as u32
+}
+
+impl Conflicts {
+    /// Read the pairwise conflicts out of a model's two-column rows.
+    ///
+    /// Each row over binaries `p` and `q` is tried at all four assignments of the pair.
+    /// Any assignment the row rejects is a pair of literals that cannot hold together,
+    /// which is exactly an edge. Rows with other than two live columns are left alone:
+    /// the reasoning generalizes, but taking it from a long row means looking at every
+    /// pair in it, and one row here spans six thousand columns.
+    pub fn of(problem: &Problem) -> Self {
+        let n = problem.n_cols();
+        let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); 2 * n];
+        let csr = problem.matrix.to_csr();
+        for i in 0..problem.n_rows() {
+            let (cols, vals) = csr.column(i);
+            let live: Vec<(usize, f64)> = cols
+                .iter()
+                .zip(vals)
+                .filter(|&(_, &a)| a != 0.0)
+                .map(|(&j, &a)| (j, a))
+                .collect();
+            if live.len() != 2 {
+                continue;
+            }
+            let [(p, a), (q, b)] = [live[0], live[1]];
+            if !is_binary(problem, p) || !is_binary(problem, q) || p == q {
+                continue;
+            }
+            for vp in [false, true] {
+                for vq in [false, true] {
+                    let activity = a * f64::from(vp) + b * f64::from(vq);
+                    if activity < problem.row_lb[i] - TOL || activity > problem.row_ub[i] + TOL {
+                        let (lp, lq) = (literal(p, vp), literal(q, vq));
+                        neighbours[lp as usize].push(lq);
+                        neighbours[lq as usize].push(lp);
+                    }
+                }
+            }
+        }
+        for list in &mut neighbours {
+            list.sort_unstable();
+            list.dedup();
+        }
+        Self { neighbours }
+    }
+
+    fn conflicts(&self, p: u32, q: u32) -> bool {
+        self.neighbours[p as usize].binary_search(&q).is_ok()
+    }
+
+    /// Are there any conflicts at all? Building cliques is pointless otherwise.
+    pub fn is_empty(&self) -> bool {
+        self.neighbours.iter().all(Vec::is_empty)
+    }
+
+    /// How many triangles the graph holds, capped so a dense one cannot run away.
+    ///
+    /// A clique worth cutting on needs at least three literals: two of them restate a
+    /// row already in the model, which the relaxation therefore already respects.
+    pub fn triangles(&self) -> usize {
+        let mut count = 0usize;
+        for (a, list) in self.neighbours.iter().enumerate() {
+            for (i, &b) in list.iter().enumerate() {
+                if (b as usize) < a {
+                    continue;
+                }
+                for &c in &list[i + 1..] {
+                    if (c as usize) > b as usize && self.conflicts(b, c) {
+                        count += 1;
+                        if count >= 100_000 {
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// How many conflicting pairs were found.
+    pub fn edges(&self) -> usize {
+        self.neighbours.iter().map(Vec::len).sum::<usize>() / 2
+    }
+}
+
+/// Is this column a binary, including one already pinned to an end?
+fn is_binary(problem: &Problem, j: usize) -> bool {
+    problem.is_integer(j) && problem.col_lb[j] >= 0.0 && problem.col_ub[j] <= 1.0
+}
+
+/// Separate clique cuts violated by `x`.
+///
+/// Literals that pairwise exclude one another admit at most one true among them, so
+/// their values sum to no more than one. Written over columns, a clique holding the
+/// positive literals `P` and the negative literals `N` is
+///
+/// ```text
+///     sum_{j in P} x_j - sum_{j in N} x_j <= 1 - |N|
+/// ```
+///
+/// The rows the conflicts came from are already in the model, so a clique that is just
+/// one of them again says nothing new. What is worth having is a clique drawn across
+/// several rows, which no single row expresses and the relaxation has therefore never
+/// been told about.
+///
+/// Cliques are grown greedily from the most nearly-true literal outwards, taking the
+/// heaviest candidate excluded by everything already held. Greedy gives no guarantee of
+/// the largest clique, which is NP-hard to want; it gives a clique, and one the
+/// relaxation violates is worth adding whether or not something bigger existed.
+pub fn separate_cliques(
+    problem: &Problem,
+    conflicts: &Conflicts,
+    x: &[f64],
+    limit: usize,
+) -> Vec<Cut> {
+    if conflicts.is_empty() {
+        return Vec::new();
+    }
+    let value = |node: u32| -> f64 {
+        let j = node as usize / 2;
+        if node.is_multiple_of(2) { x[j] } else { 1.0 - x[j] }
+    };
+
+    // Only literals carrying weight can put a clique over one.
+    let mut seeds: Vec<u32> = (0..conflicts.neighbours.len() as u32)
+        .filter(|&node| {
+            is_binary(problem, node as usize / 2)
+                && value(node) > TOL
+                && !conflicts.neighbours[node as usize].is_empty()
+        })
+        .collect();
+    seeds.sort_by(|&a, &b| value(b).total_cmp(&value(a)));
+
+    let mut found: Vec<Cut> = Vec::new();
+    let mut used = vec![false; conflicts.neighbours.len()];
+    for &seed in &seeds {
+        if used[seed as usize] || found.len() >= limit {
+            continue;
+        }
+        let mut clique = vec![seed];
+        let mut total = value(seed);
+        // Anything joining must be excluded by every member, so only the seed's own
+        // conflicts are ever candidates.
+        let mut candidates: Vec<u32> = conflicts.neighbours[seed as usize]
+            .iter()
+            .copied()
+            .filter(|&node| value(node) > TOL)
+            .collect();
+        candidates.sort_by(|&a, &b| value(b).total_cmp(&value(a)));
+        for candidate in candidates {
+            // Both literals of one column exclude each other trivially, and a clique
+            // holding both states the tautology that exactly one of them holds.
+            if clique.iter().any(|&held| held / 2 == candidate / 2) {
+                continue;
+            }
+            if clique.iter().all(|&held| conflicts.conflicts(held, candidate)) {
+                clique.push(candidate);
+                total += value(candidate);
+            }
+        }
+        if clique.len() < 2 || total <= 1.0 + MIN_VIOLATION {
+            continue;
+        }
+        for &node in &clique {
+            used[node as usize] = true;
+        }
+        let negatives = clique.iter().filter(|&&node| !node.is_multiple_of(2)).count();
+        let mut coefficients: Vec<(usize, f64)> = clique
+            .iter()
+            .map(|&node| {
+                let j = node as usize / 2;
+                (j, if node.is_multiple_of(2) { 1.0 } else { -1.0 })
+            })
+            .collect();
+        coefficients.sort_by_key(|&(j, _)| j);
+        found.push(Cut {
+            coefficients,
+            lb: f64::NEG_INFINITY,
+            ub: 1.0 - negatives as f64,
+        });
+    }
+    found
+}
+
 /// Separate knapsack cover cuts violated by `x`.
 ///
 /// Returns at most `limit` cuts, strongest violation first.
@@ -1311,6 +1520,93 @@ mod tests {
             separate_mir(&shifted, &relaxed.x, 32).is_empty(),
             "cut derived from a row containing a shifted column"
         );
+    }
+
+    /// A clique cut says at most one of a set may be taken, so it is wrong the moment
+    /// any feasible point takes two. Checked by enumeration rather than by argument.
+    #[test]
+    fn clique_cuts_never_remove_a_feasible_point() {
+        // Three columns that pairwise exclude each other through separate rows, and a
+        // fourth that conflicts with only one of them, so it must not join the clique.
+        let p = problem(
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[
+                (&[1.0, 1.0, 0.0, 0.0], RowSense::Le, 1.0),
+                (&[1.0, 0.0, 1.0, 0.0], RowSense::Le, 1.0),
+                (&[0.0, 1.0, 1.0, 0.0], RowSense::Le, 1.0),
+                (&[1.0, 0.0, 0.0, 1.0], RowSense::Le, 1.0),
+            ],
+        );
+        let conflicts = Conflicts::of(&p);
+        let relaxed = Lp::relaxation(&p).solve();
+        assert_eq!(relaxed.status, LpStatus::Optimal);
+        let cuts = separate_cliques(&p, &conflicts, &relaxed.x, 16);
+        assert!(!cuts.is_empty(), "the triangle should have been found");
+
+        for cut in &cuts {
+            for point in &feasible_points(&p) {
+                assert!(
+                    cut.violation(point) <= 1e-9,
+                    "clique {:?} <= {} removes feasible point {point:?}",
+                    cut.coefficients,
+                    cut.ub
+                );
+            }
+            assert!(
+                cut.violation(&relaxed.x) > MIN_VIOLATION,
+                "a clique that does not separate the relaxation is not worth adding"
+            );
+        }
+    }
+
+    /// The conflict has to come from the row rather than from the pair merely appearing
+    /// together: two columns that can both be one are not in conflict, and a clique
+    /// built over them would cut off points the model allows.
+    #[test]
+    fn a_row_that_permits_both_columns_is_not_a_conflict() {
+        // `x + y <= 2` permits both, so there is no edge and nothing to separate.
+        let mut p = problem(&[-1.0, -1.0], &[(&[1.0, 1.0], RowSense::Le, 2.0)]);
+        p.col_ub = vec![1.0, 1.0];
+        assert!(Conflicts::of(&p).is_empty(), "a satisfiable pair was called a conflict");
+
+        // `x + y <= 1` forbids both, so there is.
+        let q = problem(&[-1.0, -1.0], &[(&[1.0, 1.0], RowSense::Le, 1.0)]);
+        assert!(!Conflicts::of(&q).is_empty(), "an exclusive pair was missed");
+    }
+
+    /// A clique is only valid if *every* pair in it conflicts. Growing one greedily
+    /// makes it easy to admit a column that conflicts with some members and not others,
+    /// which is exactly how such a cut goes wrong.
+    #[test]
+    fn a_clique_admits_only_columns_conflicting_with_all_of_it() {
+        // 0-1 and 0-2 conflict, 1-2 do not, so no clique larger than a pair exists.
+        let p = problem(
+            &[-1.0, -1.0, -1.0],
+            &[
+                (&[1.0, 1.0, 0.0], RowSense::Le, 1.0),
+                (&[1.0, 0.0, 1.0], RowSense::Le, 1.0),
+            ],
+        );
+        let conflicts = Conflicts::of(&p);
+        // A point the relaxation might reach with all three part-set.
+        let x = [0.5, 0.5, 0.5];
+        for cut in separate_cliques(&p, &conflicts, &x, 16) {
+            // Back to the literals the clique was built from: a positive coefficient
+            // is the column asserted true, a negative one the column asserted false.
+            let members: Vec<u32> = cut
+                .coefficients
+                .iter()
+                .map(|&(j, a)| literal(j, a > 0.0))
+                .collect();
+            for (a, &p1) in members.iter().enumerate() {
+                for &p2 in &members[a + 1..] {
+                    assert!(
+                        conflicts.conflicts(p1, p2),
+                        "clique {members:?} contains the compatible pair ({p1}, {p2})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
