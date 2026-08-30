@@ -7,8 +7,11 @@ set chosen this way cannot flatter the solver being measured, unlike a set scree
 by what other solvers already close.
 
 Membership is decided by `cargo run --example classify`, which reads the models with
-this solver's own reader. Checked against MIPLIB's own binary tag it agrees exactly
-on the instances held here.
+this solver's own reader, and not by MIPLIB's `binary` tag. The tag is looser than it
+sounds: it means an instance has no *general* integers, and admits continuous columns
+alongside the binaries. Of the 148 instances it tags binary and easy, eight are mixed
+under the definition here, from neos-4382714-ruvuma with a single continuous column to
+h80x6320 with 6320 of them against 6320 binaries.
 
 Usage:  bench/binary_bench.py [seconds] [threads] [--refresh]
 
@@ -35,9 +38,16 @@ screen.LIMIT = float(argv[0]) if len(argv) > 0 else 60.0
 screen.THREADS = int(argv[1]) if len(argv) > 1 else 16
 
 
+def easy_names():
+    """MIPLIB's easy classification, which every model here is also required to be in."""
+    path = OUT / "easy-v18.test"
+    return {l.strip().removesuffix(".mps.gz") for l in path.read_text().splitlines() if l.strip()}
+
+
 def pure_binary():
-    """Names of the locally held models whose every column is binary."""
-    models = sorted(screen.CACHE.glob("*.mps"))
+    """Names of the locally held easy models whose every column is binary."""
+    easy = easy_names()
+    models = sorted(p for p in screen.CACHE.glob("*.mps") if p.stem in easy)
     classify = ROOT / "target" / "release" / "examples" / "classify"
     if not classify.exists():
         sys.exit("build the classifier first: cargo build --release --example classify")
