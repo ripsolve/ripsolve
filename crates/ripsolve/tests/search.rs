@@ -117,6 +117,12 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
 fn presolve_does_not_change_any_optimum() {
     // Presolve is allowed to reduce the model however it likes, provided the answer
     // is identical. Checked on every sample, both ways.
+    //
+    // The assignment is checked as well as the objective, because presolve now
+    // compacts the model and compaction renumbers. A solution expanded back through
+    // the wrong map still carries the objective the search computed for it, so an
+    // objective comparison alone would not notice; a point that is the wrong length,
+    // or that the original model rejects, would go through unremarked.
     let data = fixtures();
     for entry in data["samples"].as_array().unwrap() {
         let file = entry["file"].as_str().unwrap();
@@ -144,6 +150,27 @@ fn presolve_does_not_change_any_optimum() {
             }
             (None, None) => {}
             (a, b) => panic!("{file}: presolve {a:?}, plain {b:?}"),
+        }
+
+        if let Some(reported) = with.objective {
+            assert_eq!(
+                with.x.len(),
+                problem.n_cols(),
+                "{file}: presolve returned {} values for {} columns",
+                with.x.len(),
+                problem.n_cols()
+            );
+            assert!(
+                ripsolve::heuristic::is_feasible(&problem, &with.x, 1e-6),
+                "{file}: the point presolve returned is not feasible for the original"
+            );
+            let restated = problem.objective_value(
+                problem.obj.iter().zip(&with.x).map(|(c, v)| c * v).sum::<f64>(),
+            );
+            assert!(
+                (restated - reported).abs() < 1e-6,
+                "{file}: reported {reported} but the point is worth {restated}"
+            );
         }
     }
 }
