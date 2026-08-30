@@ -157,6 +157,147 @@ pub fn presolve(problem: &mut Problem, max_rounds: usize) -> Outcome {
     Outcome::Reduced(stats)
 }
 
+/// What was dropped when a model was compacted, and how to get back.
+///
+/// Compaction removes rows and columns, so the reduced model's solution vector is no
+/// longer the original's and has to be put back. This carries the only thing needed for
+/// that: which original column each surviving column is, and the value every dropped
+/// one was fixed at.
+#[derive(Clone, Debug)]
+pub struct Compaction {
+    /// The original index of each column of the compacted model.
+    columns: Vec<usize>,
+    /// Every original column's fixed value, or `None` if it survived.
+    dropped: Vec<Option<f64>>,
+}
+
+impl Compaction {
+    /// Put a solution of the compacted model back into the original columns.
+    pub fn expand(&self, x: &[f64]) -> Vec<f64> {
+        let mut full = vec![0.0; self.dropped.len()];
+        for (j, value) in self.dropped.iter().enumerate() {
+            if let Some(value) = value {
+                full[j] = *value;
+            }
+        }
+        for (compact, &original) in self.columns.iter().enumerate() {
+            full[original] = x.get(compact).copied().unwrap_or(0.0);
+        }
+        full
+    }
+
+    /// How many rows and columns went.
+    pub fn removed(&self, rows: usize) -> (usize, usize) {
+        (rows, self.dropped.iter().filter(|d| d.is_some()).count())
+    }
+}
+
+/// Drop the rows and columns presolve has finished with.
+///
+/// Presolve widens a redundant row's bounds to infinity and pins a decided column by
+/// setting its bounds equal, but it leaves both in place, and everything downstream
+/// still pays for them: `Lp::relaxation` takes its row count from the model and gives
+/// every row a logical variable, so a freed row still occupies a row of the basis and
+/// enters every factorization. Until they are actually removed, a row reduction costs
+/// presolve time and returns nothing, which is what measurement showed: merging 1565
+/// parallel rows out of decomp1 made it slower, not faster.
+///
+/// A fixed column contributes a constant to every row it appears in and to the
+/// objective, so removing it moves that constant to the row's bounds and to the
+/// objective offset rather than losing it.
+///
+/// Returns the compacted model and the map back, or `Outcome::Infeasible` if dropping
+/// the fixed columns leaves a row that cannot be satisfied.
+pub fn compact(problem: &Problem) -> Result<(Problem, Compaction), Outcome> {
+    let n = problem.n_cols();
+    let m = problem.n_rows();
+
+    // A column is decided when its bounds meet. Only finite ones: an infinite "fixed"
+    // value is not a number the model can carry, and `fix_columns_absent_from_every_row`
+    // already refuses to create one.
+    let dropped: Vec<Option<f64>> = (0..n)
+        .map(|j| {
+            (problem.col_lb[j] == problem.col_ub[j] && problem.col_lb[j].is_finite())
+                .then_some(problem.col_lb[j])
+        })
+        .collect();
+    let kept_columns: Vec<usize> = (0..n).filter(|&j| dropped[j].is_none()).collect();
+    let mut position = vec![usize::MAX; n];
+    for (compact, &original) in kept_columns.iter().enumerate() {
+        position[original] = compact;
+    }
+
+    // What the dropped columns contribute to each row, which their bounds must absorb.
+    let csr = problem.matrix.to_csr();
+    let mut constant = vec![0.0; m];
+    for (i, shift) in constant.iter_mut().enumerate() {
+        let (cols, vals) = csr.column(i);
+        for (&j, &a) in cols.iter().zip(vals) {
+            if let Some(value) = dropped[j] {
+                *shift += a * value;
+            }
+        }
+    }
+
+    let mut triplets = Vec::new();
+    let mut row_lb = Vec::new();
+    let mut row_ub = Vec::new();
+    let mut row_names = Vec::new();
+    for (i, &shift) in constant.iter().enumerate() {
+        let (cols, vals) = csr.column(i);
+        let live: Vec<(usize, f64)> = cols
+            .iter()
+            .zip(vals)
+            .filter(|&(&j, &a)| dropped[j].is_none() && a != 0.0)
+            .map(|(&j, &a)| (position[j], a))
+            .collect();
+        // Subtracting a finite constant from an infinite bound leaves it infinite,
+        // which is what a one-sided row needs.
+        let (lb, ub) = (problem.row_lb[i] - shift, problem.row_ub[i] - shift);
+        if live.is_empty() {
+            // Nothing left to satisfy it with, so it is either already satisfied or
+            // the model has no solution.
+            if lb > TOL || ub < -TOL {
+                return Err(Outcome::Infeasible);
+            }
+            continue;
+        }
+        if is_free(lb, ub) {
+            continue;
+        }
+        let row = row_lb.len();
+        for (j, a) in live {
+            triplets.push((row, j, a));
+        }
+        row_lb.push(lb);
+        row_ub.push(ub);
+        row_names.push(problem.row_names[i].clone());
+    }
+
+    let offset: f64 = (0..n)
+        .filter_map(|j| dropped[j].map(|v| problem.obj[j] * v))
+        .sum();
+
+    let compacted = Problem {
+        name: problem.name.clone(),
+        sense: problem.sense,
+        obj: kept_columns.iter().map(|&j| problem.obj[j]).collect(),
+        obj_offset: problem.obj_offset + offset,
+        matrix: SparseMatrix::from_triplets(row_lb.len(), kept_columns.len(), triplets),
+        row_lb,
+        row_ub,
+        col_lb: kept_columns.iter().map(|&j| problem.col_lb[j]).collect(),
+        col_ub: kept_columns.iter().map(|&j| problem.col_ub[j]).collect(),
+        col_type: kept_columns.iter().map(|&j| problem.col_type[j]).collect(),
+        col_names: kept_columns
+            .iter()
+            .map(|&j| problem.col_names[j].clone())
+            .collect(),
+        row_names,
+    };
+    Ok((compacted, Compaction { columns: kept_columns, dropped }))
+}
+
 fn is_free(lb: f64, ub: f64) -> bool {
     lb == f64::NEG_INFINITY && ub == f64::INFINITY
 }
@@ -658,6 +799,63 @@ mod tests {
     use crate::generate::{Kind, Spec};
     use crate::model::{RowSense, Sense};
     use lp_parser_rs::problem::LpProblem;
+
+    /// Compaction has to carry the dropped columns' contribution rather than lose it:
+    /// a fixed column adds a constant to every row it appears in and to the objective.
+    #[test]
+    fn compaction_moves_a_fixed_column_into_the_bounds_it_leaves_behind() {
+        // `2x + 3y <= 10` with `y` pinned at 2, so what is left is `2x <= 4`.
+        let mut p = problem(&[1.0, 5.0], &[(&[2.0, 3.0], RowSense::Le, 10.0)]);
+        p.col_ub = vec![10.0, 10.0];
+        p.col_lb[1] = 2.0;
+        p.col_ub[1] = 2.0;
+
+        let (small, map) = compact(&p).expect("the model is satisfiable");
+        assert_eq!(small.n_cols(), 1, "the fixed column stayed in the model");
+        assert_eq!(small.n_rows(), 1);
+        assert!((small.row_ub[0] - 4.0).abs() < 1e-9, "row ub {}", small.row_ub[0]);
+        // The fixed column's own objective contribution, 5 * 2, moves to the offset.
+        assert!((small.obj_offset - 10.0).abs() < 1e-9, "offset {}", small.obj_offset);
+
+        // And the way back restores it.
+        let full = map.expand(&[1.5]);
+        assert_eq!(full.len(), 2);
+        assert!((full[0] - 1.5).abs() < 1e-9);
+        assert!((full[1] - 2.0).abs() < 1e-9, "the fixed column came back as {}", full[1]);
+    }
+
+    /// A row nothing constrains any more should not survive into the LP, which is the
+    /// whole point: `Lp::relaxation` gives every row a logical variable whether it
+    /// constrains anything or not.
+    #[test]
+    fn compaction_drops_rows_that_no_longer_constrain_anything() {
+        let mut p = problem(
+            &[1.0, 1.0],
+            &[
+                (&[1.0, 1.0], RowSense::Le, 1.0),
+                (&[1.0, 1.0], RowSense::Le, 5.0),
+            ],
+        );
+        // Free the second row the way presolve would, having found it redundant.
+        p.row_lb[1] = f64::NEG_INFINITY;
+        p.row_ub[1] = f64::INFINITY;
+        let (small, _) = compact(&p).expect("satisfiable");
+        assert_eq!(small.n_rows(), 1, "the freed row survived compaction");
+        assert_eq!(small.n_cols(), 2);
+    }
+
+    /// Dropping fixed columns can leave a row with nothing to satisfy it, and that is
+    /// a proof of infeasibility rather than a row to discard.
+    #[test]
+    fn compaction_reports_a_row_its_fixed_columns_cannot_satisfy() {
+        // `x + y >= 3` with both pinned at zero leaves `0 >= 3`.
+        let mut p = problem(&[1.0, 1.0], &[(&[1.0, 1.0], RowSense::Ge, 3.0)]);
+        for j in 0..2 {
+            p.col_lb[j] = 0.0;
+            p.col_ub[j] = 0.0;
+        }
+        assert_eq!(compact(&p).unwrap_err(), Outcome::Infeasible);
+    }
 
     /// A column no row constrains still has to end up somewhere the rest of the
     /// solver can use. Fixing it at an infinite bound leaves the model reading

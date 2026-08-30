@@ -117,6 +117,12 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
 fn presolve_does_not_change_any_optimum() {
     // Presolve is allowed to reduce the model however it likes, provided the answer
     // is identical. Checked on every sample, both ways.
+    //
+    // The assignment is checked as well as the objective, because presolve now
+    // compacts the model and compaction renumbers. A solution expanded back through
+    // the wrong map still carries the objective the search computed for it, so an
+    // objective comparison alone would not notice; a point that is the wrong length,
+    // or that the original model rejects, would go through unremarked.
     let data = fixtures();
     for entry in data["samples"].as_array().unwrap() {
         let file = entry["file"].as_str().unwrap();
