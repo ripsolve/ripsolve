@@ -969,6 +969,9 @@ fn separate_at_root(
     mut root: LpSolution,
     options: &Options,
     deadline: Option<Instant>,
+    // When to stop cutting and let the search have the rest, distinct from the run's
+    // own deadline; see the caller.
+    stop_cutting: Option<Instant>,
 ) -> RootCuts {
     // Nothing to do, and in particular no reason to clone the model, which is the
     // common case since root cutting is off by default.
@@ -1004,7 +1007,9 @@ fn separate_at_root(
     let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
 
     for _ in 0..options.cut_rounds {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|d| Instant::now() >= d)
+            || stop_cutting.is_some_and(|d| Instant::now() >= d)
+        {
             break;
         }
         if root.status != LpStatus::Optimal
@@ -1171,7 +1176,20 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 
     let first_bound = root.objective;
 
-    let cut = separate_at_root(problem, lp, root, &options, deadline);
+    // Cutting gets a share of the run rather than the run. Each round re-solves the
+    // whole model, so on a large one the loop can spend everything it is given: on
+    // MIPLIB's mitre the search reaches one node with fifty rounds of cutting and 5126
+    // with none, the difference being that the rounds consume the minute before the
+    // tree is ever entered. A bound that is never spent against is worth less than no
+    // bound and a search.
+    //
+    // A share rather than a fixed count because the cost of a round is the cost of an
+    // LP solve, which is what varies between the models where fifty rounds are free and
+    // the models where five are not.
+    let stop_cutting = options
+        .time_limit
+        .map(|limit| started + limit.mul_f64(ROOT_CUT_SHARE));
+    let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting);
     iterations += cut.iterations;
     let cuts_added = cut.added;
     let mut lp = cut.lp;
@@ -1405,6 +1423,14 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         root_bound_after_cuts: problem.objective_value(root_bound),
     }
 }
+
+/// The share of a run the root cut loop may spend before the search takes over.
+///
+/// Cutting earns its place on most models and cannot be allowed to earn it on all of
+/// them: a round costs an LP solve, and on a large model fifty of those is the whole
+/// budget. A third leaves the bound most of what cutting was going to give it while
+/// guaranteeing the search two thirds of the run to spend it in.
+const ROOT_CUT_SHARE: f64 = 0.33;
 
 /// What is left of a time limit that started at `started`, or `None` for no limit.
 fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
