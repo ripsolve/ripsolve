@@ -943,6 +943,16 @@ impl Conflicts {
         count
     }
 
+    /// The literals excluded by `node`.
+    pub fn neighbours(&self, node: u32) -> &[u32] {
+        &self.neighbours[node as usize]
+    }
+
+    /// How many literals the graph is over, twice the column count.
+    pub fn nodes(&self) -> usize {
+        self.neighbours.len()
+    }
+
     /// How many conflicting pairs were found.
     pub fn edges(&self) -> usize {
         self.neighbours.iter().map(Vec::len).sum::<usize>() / 2
@@ -1520,6 +1530,51 @@ mod tests {
             separate_mir(&shifted, &relaxed.x, 32).is_empty(),
             "cut derived from a row containing a shifted column"
         );
+    }
+
+    /// Every conflict has to hold at every feasible point, checked by enumeration
+    /// rather than by following the argument that produced it.
+    ///
+    /// The chain here is what chasing the implications would derive and this does not:
+    /// x0 excludes x1, x2 needs x1, x3 needs x2, so x0 excludes x2 and x3 while no row
+    /// says as much. That closure was implemented and reverted, having taken `neos18`'s
+    /// root bound from 9.250 to 8.778 by crowding better cuts out of the round. What is
+    /// pinned here is that whatever the rows do yield is sound.
+    #[test]
+    fn every_derived_conflict_holds_at_every_feasible_point() {
+        // An implication chain the rows never state end to end: x0 excludes x1,
+        // x2 needs x1, x3 needs x2. So x0 excludes x2 and x3 as well, and neither
+        // exclusion appears in any row.
+        let p = problem(
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[
+                (&[1.0, 1.0, 0.0, 0.0], RowSense::Le, 1.0),
+                (&[0.0, -1.0, 1.0, 0.0], RowSense::Le, 0.0),
+                (&[0.0, 0.0, -1.0, 1.0], RowSense::Le, 0.0),
+            ],
+        );
+        let conflicts = Conflicts::of(&p);
+        let points = feasible_points(&p);
+        assert!(!points.is_empty());
+
+        let holds = |point: &[f64], lit: u32| {
+            let j = lit as usize / 2;
+            if lit.is_multiple_of(2) { point[j] > 0.5 } else { point[j] < 0.5 }
+        };
+        let mut derived = 0usize;
+        for node in 0..conflicts.nodes() as u32 {
+            for &other in conflicts.neighbours(node) {
+                derived += 1;
+                for point in &points {
+                    assert!(
+                        !(holds(point, node) && holds(point, other)),
+                        "literals {node} and {other} are called exclusive, \
+                         but {point:?} satisfies both"
+                    );
+                }
+            }
+        }
+        assert!(derived > 0, "no conflicts were found at all");
     }
 
     /// A clique cut says at most one of a set may be taken, so it is wrong the moment
