@@ -999,6 +999,55 @@ is wrong. Twenty instances need the root to finish before anything above it can 
 all, eight need feasibility, five need the bound. That ordering is what the numbers
 support, and it is worth re-deriving before the next build rather than inheriting.
 
+### What the root actually spends its time on
+
+The twenty instances that reach one to three nodes were assumed to be losing to the
+relaxation, and the assumption is wrong for most of them. Timing the phases apart, with
+`relax` for the relaxation alone and `--cut-rounds 0` for the root without separation,
+splits them cleanly.
+
+Seven are genuinely relaxation bound: `air04`, `bley_xl1`, `cod105`, `neos-1324574`,
+`neos-3226448-wkra`, `supportcase4` and `tanglegram6` do not finish their relaxation in
+120 seconds. Nothing above the LP reaches them, which is the same wall `ex9` and `ex10`
+sit behind.
+
+The other thirteen solve their relaxation quickly and then spend the root on heuristics
+that find nothing:
+
+```text
+                relax it   pre-cut root it   heuristics   incumbents
+neos-787933         2163             26179          92%            0
+mine-166-5          2278             16914          87%            0
+ab71-20-100         4366             30457          86%            0
+neos-957143         5366             29688          82%            0
+mitre               1825              7596          76%            0
+```
+
+Across the group 71% of pre-cut root iterations go to the chain of rounding, diving and
+pumping, and on all thirteen it returns nothing. Each solve inside the chain is bounded
+and the sequence is not, so on a model whose relaxation is cheap it runs a very long way.
+
+Two separate hypotheses died on the way here, both from reading rather than measuring.
+Gomory separation looked like the cost, being a BTRAN and a pass over every column per
+candidate row, on the order of 1e11 operations a round for `bley_xl1`. Timing each
+separator showed the cut loop never runs at all on those models: it breaks the moment
+the root LP is not optimal. The relaxation then looked like the cost, and it is, for
+seven of twenty and not the rest.
+
+Bounding the chain was tried twice and reverted both times. As a share of the time limit
+it does not bind where it needs to: the models whose chain runs longest are the ones
+whose relaxation is cheap, so at a 60 second limit a share of 0.43 left `ab71-20-100`
+byte identical at 30457 iterations. Measured against the relaxation's own cost instead,
+at twice what the relaxation took, it binds the same way at every time limit, 30457
+iterations down to 13700. It converts nothing: no instance newly solved of the 33, no
+incumbent gained or lost, `cap6000` 1.44 times slower, and one unreproducible run
+reporting `supportcase14` infeasible where it is optimal. A change that buys nothing and
+carries an anomaly nobody can explain is not worth its constant.
+
+What the split does say is that the thirteen have root time to reclaim and the seven do
+not, and that reclaiming it is worth nothing until something exists that can use it.
+Heuristics that find nothing and cuts that move no bound are the same problem seen twice.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
