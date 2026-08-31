@@ -858,11 +858,80 @@ fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) ->
 pub struct Conflicts {
     /// For each literal, the literals it excludes, sorted.
     neighbours: Vec<Vec<u32>>,
+    /// Sets of literals excluding one another pairwise, held whole rather than
+    /// expanded into edges. A set partitioning row of six thousand columns is one
+    /// entry here and eighteen million entries in `neighbours`.
+    cliques: Vec<Vec<u32>>,
+    /// For each literal, which of `cliques` it belongs to, sorted.
+    membership: Vec<Vec<u32>>,
 }
 
 /// The node standing for column `j` taking `value`.
 fn literal(j: usize, value: bool) -> u32 {
     (2 * j + usize::from(!value)) as u32
+}
+
+/// The longest set of literals a single row forbids from holding together.
+///
+/// Written `sum w_k l_k <= c` with every weight positive, which complementing the
+/// negative coefficients arranges, a row excludes any pair whose weights overshoot `c`.
+/// Sorting the weights downwards turns the pairs to check into a prefix: if the two
+/// smallest weights among the first `t` still overshoot, then so does every pair among
+/// those `t`, and those `t` literals are a clique.
+///
+/// Taking the longest such prefix is the whole of the extraction. It costs a sort where
+/// enumerating pairs costs the square, and that is the point. The rows worth reading
+/// here are the long ones: a set partitioning row spanning six thousand columns is one
+/// clique of six thousand literals, or eighteen million edges written out.
+///
+/// Stopping at the prefix leaves cliques on the table. A row can exclude further pairs
+/// that no prefix covers, and finding them means more passes over the weights. The
+/// prefix is taken alone because it is exactly what set packing and set partitioning
+/// rows need, and those are the rows this exists to read.
+fn clique_from_row(
+    problem: &Problem,
+    live: &[(usize, f64)],
+    bound: f64,
+    sign: f64,
+) -> Option<Vec<u32>> {
+    // Written `sum a_j x_j <= capacity`, negating a `>=` row to get there. The caller
+    // negates the bound along with the sign, so it arrives ready to use.
+    let mut capacity = bound;
+    let mut weights: Vec<(f64, u32)> = Vec::with_capacity(live.len());
+    for &(j, a) in live {
+        if !is_binary(problem, j) {
+            return None;
+        }
+        let a = sign * a;
+        // A column pinned to one end is a constant in the row, not a literal.
+        if problem.col_lb[j] == problem.col_ub[j] {
+            capacity -= a * problem.col_lb[j];
+            continue;
+        }
+        // Complementing, `x_j = 1 - not x_j`, turns a negative coefficient positive and
+        // moves its weight across to the capacity.
+        if a < 0.0 {
+            capacity -= a;
+            weights.push((-a, literal(j, false)));
+        } else {
+            weights.push((a, literal(j, true)));
+        }
+    }
+    if weights.len() < 2 {
+        return None;
+    }
+    weights.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // The two smallest weights of a prefix shrink as it grows, so the overshooting
+    // prefixes are themselves a prefix and the longest is found by walking out.
+    let mut held = 0usize;
+    for t in 2..=weights.len() {
+        if weights[t - 2].0 + weights[t - 1].0 > capacity + TOL {
+            held = t;
+        } else {
+            break;
+        }
+    }
+    (held >= 2).then(|| weights[..held].iter().map(|&(_, node)| node).collect())
 }
 
 impl Conflicts {
@@ -876,6 +945,8 @@ impl Conflicts {
     pub fn of(problem: &Problem) -> Self {
         let n = problem.n_cols();
         let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); 2 * n];
+        let mut cliques: Vec<Vec<u32>> = Vec::new();
+        let mut membership: Vec<Vec<u32>> = vec![Vec::new(); 2 * n];
         let csr = problem.matrix.to_csr();
         for i in 0..problem.n_rows() {
             let (cols, vals) = csr.column(i);
@@ -885,21 +956,48 @@ impl Conflicts {
                 .filter(|&(_, &a)| a != 0.0)
                 .map(|(&j, &a)| (j, a))
                 .collect();
-            if live.len() != 2 {
+            if live.len() < 2 {
                 continue;
             }
-            let [(p, a), (q, b)] = [live[0], live[1]];
-            if !is_binary(problem, p) || !is_binary(problem, q) || p == q {
-                continue;
-            }
-            for vp in [false, true] {
-                for vq in [false, true] {
-                    let activity = a * f64::from(vp) + b * f64::from(vq);
-                    if activity < problem.row_lb[i] - TOL || activity > problem.row_ub[i] + TOL {
-                        let (lp, lq) = (literal(p, vp), literal(q, vq));
-                        neighbours[lp as usize].push(lq);
-                        neighbours[lq as usize].push(lp);
+            if live.len() == 2 {
+                let [(p, a), (q, b)] = [live[0], live[1]];
+                if !is_binary(problem, p) || !is_binary(problem, q) || p == q {
+                    continue;
+                }
+                for vp in [false, true] {
+                    for vq in [false, true] {
+                        let activity = a * f64::from(vp) + b * f64::from(vq);
+                        if activity < problem.row_lb[i] - TOL || activity > problem.row_ub[i] + TOL
+                        {
+                            let (lp, lq) = (literal(p, vp), literal(q, vq));
+                            neighbours[lp as usize].push(lq);
+                            neighbours[lq as usize].push(lp);
+                        }
                     }
+                }
+                continue;
+            }
+            // A longer row is read from each side it is bounded on. An equality is
+            // bounded on both, which is the case worth having: a set partitioning row
+            // is where the conflicts of a binary model mostly live.
+            for &(sign, bound) in &[(1.0f64, problem.row_ub[i]), (-1.0f64, -problem.row_lb[i])] {
+                if !bound.is_finite() {
+                    continue;
+                }
+                let Some(clique) = clique_from_row(problem, &live, bound, sign) else {
+                    continue;
+                };
+                // A pair says no more than the row it came from, so it goes in as an
+                // edge; only a set of three or more is worth holding as a clique.
+                if clique.len() == 2 {
+                    neighbours[clique[0] as usize].push(clique[1]);
+                    neighbours[clique[1] as usize].push(clique[0]);
+                } else {
+                    let id = cliques.len() as u32;
+                    for &node in &clique {
+                        membership[node as usize].push(id);
+                    }
+                    cliques.push(clique);
                 }
             }
         }
@@ -907,16 +1005,58 @@ impl Conflicts {
             list.sort_unstable();
             list.dedup();
         }
-        Self { neighbours }
+        for list in &mut membership {
+            list.sort_unstable();
+            list.dedup();
+        }
+        Self {
+            neighbours,
+            cliques,
+            membership,
+        }
     }
 
     fn conflicts(&self, p: u32, q: u32) -> bool {
-        self.neighbours[p as usize].binary_search(&q).is_ok()
+        if self.neighbours[p as usize].binary_search(&q).is_ok() {
+            return true;
+        }
+        // Two literals of one clique exclude each other without an edge between them.
+        let (a, b) = (&self.membership[p as usize], &self.membership[q as usize]);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
+    /// Every literal excluded by `node`, from its edges and its cliques together.
+    pub fn adjacent(&self, node: u32) -> Vec<u32> {
+        let mut out = self.neighbours[node as usize].clone();
+        for &id in &self.membership[node as usize] {
+            out.extend(
+                self.cliques[id as usize]
+                    .iter()
+                    .copied()
+                    .filter(|&other| other != node),
+            );
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Does `node` exclude anything, without building the list to find out?
+    pub fn has_conflicts(&self, node: u32) -> bool {
+        !self.neighbours[node as usize].is_empty() || !self.membership[node as usize].is_empty()
     }
 
     /// Are there any conflicts at all? Building cliques is pointless otherwise.
     pub fn is_empty(&self) -> bool {
-        self.neighbours.iter().all(Vec::is_empty)
+        self.cliques.is_empty() && self.neighbours.iter().all(Vec::is_empty)
     }
 
     /// How many triangles the graph holds, capped so a dense one cannot run away.
@@ -925,6 +1065,15 @@ impl Conflicts {
     /// row already in the model, which the relaxation therefore already respects.
     pub fn triangles(&self) -> usize {
         let mut count = 0usize;
+        // A clique of `k` holds every one of its triples, and counting them by
+        // enumeration is exactly the cost holding it whole was meant to avoid.
+        for clique in &self.cliques {
+            let k = clique.len();
+            count = count.saturating_add(k * (k - 1) * (k - 2) / 6);
+            if count >= 100_000 {
+                return count;
+            }
+        }
         for (a, list) in self.neighbours.iter().enumerate() {
             for (i, &b) in list.iter().enumerate() {
                 if (b as usize) < a {
@@ -955,7 +1104,20 @@ impl Conflicts {
 
     /// How many conflicting pairs were found.
     pub fn edges(&self) -> usize {
-        self.neighbours.iter().map(Vec::len).sum::<usize>() / 2
+        let pairs: usize = self
+            .cliques
+            .iter()
+            .map(|c| c.len() * (c.len() - 1) / 2)
+            .sum();
+        pairs + self.neighbours.iter().map(Vec::len).sum::<usize>() / 2
+    }
+
+    /// How many cliques were read whole, and the longest of them.
+    pub fn clique_shape(&self) -> (usize, usize) {
+        (
+            self.cliques.len(),
+            self.cliques.iter().map(Vec::len).max().unwrap_or(0),
+        )
     }
 }
 
@@ -998,17 +1160,17 @@ pub fn separate_cliques(
     };
 
     // Only literals carrying weight can put a clique over one.
-    let mut seeds: Vec<u32> = (0..conflicts.neighbours.len() as u32)
+    let mut seeds: Vec<u32> = (0..conflicts.nodes() as u32)
         .filter(|&node| {
             is_binary(problem, node as usize / 2)
                 && value(node) > TOL
-                && !conflicts.neighbours[node as usize].is_empty()
+                && conflicts.has_conflicts(node)
         })
         .collect();
     seeds.sort_by(|&a, &b| value(b).total_cmp(&value(a)));
 
     let mut found: Vec<Cut> = Vec::new();
-    let mut used = vec![false; conflicts.neighbours.len()];
+    let mut used = vec![false; conflicts.nodes()];
     for &seed in &seeds {
         if used[seed as usize] || found.len() >= limit {
             continue;
@@ -1017,9 +1179,9 @@ pub fn separate_cliques(
         let mut total = value(seed);
         // Anything joining must be excluded by every member, so only the seed's own
         // conflicts are ever candidates.
-        let mut candidates: Vec<u32> = conflicts.neighbours[seed as usize]
-            .iter()
-            .copied()
+        let mut candidates: Vec<u32> = conflicts
+            .adjacent(seed)
+            .into_iter()
             .filter(|&node| value(node) > TOL)
             .collect();
         candidates.sort_by(|&a, &b| value(b).total_cmp(&value(a)));
@@ -1282,6 +1444,89 @@ mod tests {
     }
 
     /// Every binary point the model admits, by exhaustive enumeration.
+    /// Every clique read out of a row must hold at every feasible point: no two of its
+    /// literals may be true together. Checked by enumeration over the whole cube,
+    /// because a clique that is wrong by one pair silently produces a wrong optimum,
+    /// which is how the capacity of a negated row got its sign flipped twice.
+    fn assert_cliques_hold(p: &Problem, label: &str) {
+        let conflicts = Conflicts::of(p);
+        let points = feasible_points(p);
+        assert!(!points.is_empty(), "{label}: nothing feasible to check against");
+        let holds = |x: &[f64], node: u32| -> bool {
+            let j = node as usize / 2;
+            if node.is_multiple_of(2) { x[j] > 0.5 } else { x[j] < 0.5 }
+        };
+        for id in 0..conflicts.cliques.len() {
+            let clique = &conflicts.cliques[id];
+            for x in &points {
+                let true_count = clique.iter().filter(|&&node| holds(x, node)).count();
+                assert!(
+                    true_count <= 1,
+                    "{label}: clique {clique:?} has {true_count} literals true at {x:?}"
+                );
+            }
+        }
+    }
+
+    /// A set partitioning row is one clique spanning the whole row, and reading it is
+    /// the whole reason long rows are looked at: `air04` is 823 such rows and yielded a
+    /// conflict graph of four edges while only two-column rows were read.
+    #[test]
+    fn a_partitioning_row_is_read_as_one_clique() {
+        let p = problem(
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[(&[1.0, 1.0, 1.0, 1.0], RowSense::Eq, 1.0)],
+        );
+        let conflicts = Conflicts::of(&p);
+        // The `<= 1` side is a clique of all four columns. The `>= 1` side is not: three
+        // of the four may be zero together, so it excludes no pair and yields nothing.
+        assert_eq!(
+            conflicts.clique_shape(),
+            (1, 4),
+            "the row is a clique of all four columns"
+        );
+        assert_cliques_hold(&p, "partitioning");
+    }
+
+    /// The same reading applies to a packing row, and to a knapsack where only the
+    /// heaviest columns exclude one another rather than all of them.
+    #[test]
+    fn a_knapsack_row_yields_only_its_overshooting_prefix() {
+        // Any two of the first three overshoot 10; the last pairs with none of them.
+        let p = problem(
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[(&[6.0, 6.0, 6.0, 1.0], RowSense::Le, 10.0)],
+        );
+        let conflicts = Conflicts::of(&p);
+        assert_eq!(conflicts.clique_shape(), (1, 3), "only the heavy three conflict");
+        assert_cliques_hold(&p, "knapsack");
+    }
+
+    /// A row that excludes nothing must yield nothing. The negated direction of a
+    /// loosely bounded row is where a sign error shows up as an invented exclusion.
+    #[test]
+    fn a_slack_row_yields_no_clique() {
+        let p = problem(
+            &[-1.0, -1.0, -1.0],
+            &[(&[1.0, 1.0, 1.0], RowSense::Ge, -5.0)],
+        );
+        assert!(
+            Conflicts::of(&p).is_empty(),
+            "a row satisfied everywhere cannot exclude a pair"
+        );
+    }
+
+    /// Negative coefficients are complemented rather than skipped, so an implication
+    /// spread over a long row is read the same way a two-column row's is.
+    #[test]
+    fn a_long_row_with_negative_coefficients_is_complemented() {
+        let p = problem(
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[(&[1.0, 1.0, 1.0, -1.0], RowSense::Le, 0.0)],
+        );
+        assert_cliques_hold(&p, "complemented");
+    }
+
     fn feasible_points(p: &Problem) -> Vec<Vec<f64>> {
         let n = p.n_cols();
         assert!(n <= 18);

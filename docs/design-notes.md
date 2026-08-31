@@ -915,6 +915,50 @@ ex9 and ex10 as MIPs in zero simplex iterations, its presolve collapsing the mod
 before any LP is attempted. Matching it here is a presolve problem wearing an LP
 problem's clothes, and the presolve it would take is well beyond what probing reached.
 
+### Reading conflicts out of long rows
+
+The conflict graph was built from two-column rows alone, and the cost of that was not
+visible until it was measured. On `air04`, 823 set partitioning rows over 8904 columns,
+it held four edges and no triangle at all. A clique needs three literals, so the clique
+separator had nothing to work with and emitted nothing. The same held on `air05`,
+`cod105`, `mitre`, `chromaticindex32-8`, `neos-913984` and `graph20-20-1rand`: an empty
+graph, a shipped separator, and no cuts from it on any of them.
+
+A row `sum x_j = 1` is the richest conflict a binary model has, every pair in it
+excluded. Skipping it was a deliberate guard against the quadratic blowup of writing
+those pairs out, one row here spanning six thousand columns, and the guard was aimed at
+the right hazard with the wrong remedy. Holding the clique whole rather than as edges
+costs the row's length instead of its square, and reading a row for its longest
+overshooting prefix costs a sort.
+
+The graph fills as expected: `air04` from 4 edges to 4560125 across 821 cliques, `air05`
+to 4673004, `cod105` to 1576960, `mitre` to 144774.
+
+What that bought is much less than the numbers suggest, and the reason is worth keeping.
+On `air04`, `cod105` and `chromaticindex32-8` the filled graph still yields **no cuts at
+all**. A set partitioning row is satisfied exactly by the relaxation, `sum x_j = 1`, so
+a clique drawn inside one row is never violated. Only a clique spanning several rows can
+cut, and those are rare. The empty graph was never why those instances fail, which
+retires the theory that filling it would close them.
+
+What it did buy, on the pure binary set at one thread: `eil33-2` from not finishing in
+120 seconds to 92, the root bound on `ab71-20-100` from unmoved by its 25 cuts to 1.5%
+tighter with 339, and `air05` from no cuts to a root bound of 25877.6 -> 25957.1. Across
+the 33 instances some open source solver closes and this one does not, it converts none
+of them. Across the 23 it already closes, nothing regresses.
+
+One thing tried alongside it and reverted. Rounds that add cuts without moving the bound
+look like pure waste, and on `acc-tight4`, whose objective is constant so that no cut can
+ever tighten it, they are: 255 cuts and three times the root time to move a bound from
+zero to zero. Stopping after three flat rounds fixes that and costs more elsewhere,
+`decomp1` from 20.9 seconds to 31.9 and `decomp2` from 32.4 to 58.5. The bound does not
+climb steadily, it jumps, and a run of flat rounds is not evidence the next one is flat.
+
+A caution for anything built on this graph next. The extraction takes each row's longest
+overshooting prefix and stops, which is exactly right for set packing and partitioning
+rows and leaves cliques behind on general knapsack rows. It also refuses any row holding
+a non-binary column outright, where the binaries in such a row can still conflict.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
