@@ -1048,6 +1048,53 @@ What the split does say is that the thirteen have root time to reclaim and the s
 not, and that reclaiming it is worth nothing until something exists that can use it.
 Heuristics that find nothing and cuts that move no bound are the same problem seen twice.
 
+### Fixing with propagation, for the models diving cannot reach
+
+Thirteen of the instances this solver loses on solve their relaxation quickly and then
+spend the root on heuristics that find nothing, 71% of the pre-cut root iterations and no
+incumbent on any of them. What they have in common is a sparse feasible set expressed as
+set partitioning rows, and what diving does with those is pay an LP solve to be told
+about one more fractional vertex.
+
+The alternative is to stop asking the relaxation. A fixing propagates two ways to a
+common fixed point. Through the conflict graph, a literal that holds excludes every
+literal it conflicts with, and excluding `x_k = 1` is fixing `x_k = 0`; this is where a
+partitioning row pays, since fixing one of its columns to one settles every other column
+in the row at once without an LP and without looking at the row again. Through row
+activities, a row whose remaining slack cannot absorb a coefficient forces that column
+to the end that fits, which catches the rows that exclude no pair but still leave one
+value open once enough of their columns are pinned.
+
+This is what the long-row clique extraction was actually for. Reading conflicts out of
+partitioning rows bought two root bounds and no solves as a cut source; as a propagator
+it is the whole mechanism.
+
+The relaxation still picks the order, most nearly decided first, and the value to try.
+What it does not do is get asked again after every fixing.
+
+Safety here is structural rather than argued. Propagation may be wrong about where the
+feasible points are, and cannot be wrong about what it returns, because the completed
+assignment is checked against the model before it is handed back. A heuristic that
+returns an infeasible point does not fail loudly, it installs a bogus incumbent and the
+search prunes the real optimum away.
+
+Measured on the pure binary set, four instances that had never found a feasible point now
+find one: `ab71-20-100`, `neos-787933`, `neos-953928` and `neos-957143`, each confirmed
+at one thread where the result is reproducible. None of them closes. Nothing regresses
+among the 23 already closed.
+
+It runs last in the chain despite being the cheapest link in it. Ordered first, ahead of
+diving, it took `cap6000` from 500 nodes to 1500: it found a point, short circuited the
+chain, and left the search a weaker incumbent to prune with than diving would have given
+it. Cheapest first is the wrong rule for a heuristic that is cheap and whose points are
+poor. Where the chain above it works there is nothing here worth having, and where that
+chain fails this is the whole of what there is.
+
+A caution on reading its results. The two instances that appeared to lose an incumbent
+when this was measured at 16 threads, `mine-166-5` and `neos-820879`, find none in either
+version at one thread. Incumbent counts on the parallel search are not stable enough to
+read a regression from.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

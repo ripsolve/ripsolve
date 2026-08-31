@@ -26,8 +26,10 @@
 //! hitting infeasibility. It is a genuinely different mechanism, alternating
 //! projection and rounding, rather than a refinement of this one.
 
+use crate::cuts::Conflicts;
 use crate::lp::{BasisState, Lp, LpStatus};
 use crate::model::Problem;
+use crate::sparse::SparseMatrix;
 
 /// When to try a heuristic again, based on whether the last attempts worked.
 ///
@@ -626,6 +628,83 @@ mod tests {
         );
     }
 
+    /// The property that makes this heuristic safe to add: propagation may be wrong
+    /// about where the feasible points are, and cannot be wrong about what it returns,
+    /// because the completed assignment is checked before it is handed back.
+    #[test]
+    fn fix_and_propagate_never_returns_an_infeasible_point() {
+        for seed in 0..40u64 {
+            for kind in [Kind::Covering, Kind::Signed, Kind::Knapsack] {
+                let p = instance(kind, 30, 25, seed);
+                let relaxed = Lp::relaxation(&p).solve();
+                if relaxed.status != LpStatus::Optimal {
+                    continue;
+                }
+                let conflicts = Conflicts::of(&p);
+                if let Some(found) =
+                    fix_and_propagate(&p, &conflicts, &relaxed.x, &Limits::default())
+                {
+                    assert_valid(&p, &found, &format!("{kind:?} seed {seed}"));
+                }
+            }
+        }
+    }
+
+    /// Set partitioning is the structure this exists for: one fixing to one settles
+    /// every other column of the row, so the assignment completes without ever asking
+    /// the relaxation a second question.
+    #[test]
+    fn fix_and_propagate_completes_a_partitioning_model() {
+        // Three disjoint rows, each demanding exactly one of its three columns.
+        let mut lp = String::from("Minimize
+ obj: x1 + 2 x2 + 3 x3 + x4 + 2 x5 + 3 x6
+");
+        lp.push_str("Subject To
+");
+        lp.push_str(" r1: x1 + x2 + x3 = 1
+");
+        lp.push_str(" r2: x4 + x5 + x6 = 1
+");
+        lp.push_str("Binary
+ x1
+ x2
+ x3
+ x4
+ x5
+ x6
+End
+");
+        let p = Problem::from_lp(&LpProblem::parse(&lp).unwrap()).unwrap();
+        let relaxed = Lp::relaxation(&p).solve();
+        let conflicts = Conflicts::of(&p);
+        let found = fix_and_propagate(&p, &conflicts, &relaxed.x, &Limits::default())
+            .expect("a partitioning model this small must complete");
+        assert_valid(&p, &found, "partitioning");
+    }
+
+    /// A model with no feasible point must produce none, rather than a point that
+    /// propagation merely failed to refute.
+    #[test]
+    fn fix_and_propagate_finds_nothing_when_nothing_is_feasible() {
+        let lp = "Minimize
+ obj: x1 + x2
+Subject To
+ r1: x1 + x2 >= 2
+                   r2: x1 + x2 <= 1
+Binary
+ x1
+ x2
+End
+";
+        let p = Problem::from_lp(&LpProblem::parse(lp).unwrap()).unwrap();
+        let conflicts = Conflicts::of(&p);
+        let x = vec![0.5, 0.5];
+        assert!(
+            fix_and_propagate(&p, &conflicts, &x, &Limits::default()).is_none(),
+            "an infeasible model yielded a point"
+        );
+    }
+
     #[test]
     fn rounding_accepts_an_already_integral_relaxation() {
         let p = instance(Kind::Covering, 25, 30, 1);
@@ -784,4 +863,276 @@ mod schedule_tests {
         // Capped at base * 64, so an attempt is still due a bounded distance later.
         assert!(s.due(node + 10 * 64), "interval grew past its cap");
     }
+}
+
+/// How many columns a propagation sweep may force before it gives up.
+///
+/// Each forced column re-queues the rows it appears in, so a sweep is bounded by the
+/// model rather than by a count, and the guard is against a cycle rather than against
+/// depth.
+const MAX_PROPAGATIONS: usize = 1_000_000;
+
+/// How many times a fixing may be found infeasible and retried the other way.
+///
+/// A conflict says the last fixing was wrong, and flipping it is the cheapest repair
+/// that keeps the work already done. Repeated conflicts mean the trouble is further
+/// back than the last decision, which this does not chase.
+const MAX_CONFLICTS: usize = 64;
+
+/// A partial assignment of the binary columns, with bounds tightened as it grows.
+struct Partial {
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+}
+
+impl Partial {
+    fn new(problem: &Problem) -> Self {
+        Self {
+            lb: problem.col_lb.clone(),
+            ub: problem.col_ub.clone(),
+        }
+    }
+
+    fn fixed(&self, j: usize) -> bool {
+        self.lb[j] >= self.ub[j] - 1e-9
+    }
+
+    /// Pin `j` to `value`, reporting false if that contradicts what is already known.
+    fn fix(&mut self, j: usize, value: f64) -> bool {
+        if value < self.lb[j] - 1e-9 || value > self.ub[j] + 1e-9 {
+            return false;
+        }
+        self.lb[j] = value;
+        self.ub[j] = value;
+        true
+    }
+}
+
+/// Force everything that follows from the columns already fixed.
+///
+/// Two inferences run to a common fixed point. The conflict graph gives the logical
+/// one: a literal that holds excludes every literal it conflicts with, and excluding
+/// `x_k = 1` is fixing `x_k = 0`. This is where a set partitioning row pays, since
+/// fixing one of its columns to one forces every other column in the row to zero at
+/// once, without an LP solve and without looking at the row again.
+///
+/// Row activities give the arithmetic one: a row whose remaining slack cannot absorb a
+/// column's coefficient forces that column to the end that fits. This catches what the
+/// conflict graph does not, the rows that exclude nothing pairwise but still leave only
+/// one value open once enough of their columns are pinned.
+///
+/// Returns false when the two together prove the partial assignment cannot be completed.
+fn propagate_fixings(
+    problem: &Problem,
+    conflicts: &Conflicts,
+    csr: &SparseMatrix,
+    rows_of_col: &[Vec<usize>],
+    partial: &mut Partial,
+    queue: &mut Vec<usize>,
+    tolerance: f64,
+) -> bool {
+    let mut steps = 0usize;
+    while let Some(j) = queue.pop() {
+        steps += 1;
+        if steps > MAX_PROPAGATIONS {
+            return true;
+        }
+        if !partial.fixed(j) {
+            continue;
+        }
+        // The literal this column now asserts, and everything it excludes.
+        if is_binary_column(problem, j) {
+            let node = if partial.lb[j] > 0.5 { 2 * j } else { 2 * j + 1 };
+            for excluded in conflicts.adjacent(node as u32) {
+                let k = excluded as usize / 2;
+                // Excluding `x_k = 1` means fixing zero, and excluding `x_k = 0` one.
+                let forced = if excluded.is_multiple_of(2) { 0.0 } else { 1.0 };
+                if partial.fixed(k) {
+                    if (partial.lb[k] - forced).abs() > 1e-9 {
+                        return false;
+                    }
+                    continue;
+                }
+                if !partial.fix(k, forced) {
+                    return false;
+                }
+                queue.push(k);
+            }
+        }
+        // Rows holding this column may now force others.
+        for &i in &rows_of_col[j] {
+            let (cols, vals) = csr.column(i);
+            let mut min = 0.0f64;
+            let mut max = 0.0f64;
+            for (&k, &a) in cols.iter().zip(vals) {
+                let (lo, hi) = (a * partial.lb[k], a * partial.ub[k]);
+                min += lo.min(hi);
+                max += lo.max(hi);
+            }
+            if min > problem.row_ub[i] + tolerance || max < problem.row_lb[i] - tolerance {
+                return false;
+            }
+            for (&k, &a) in cols.iter().zip(vals) {
+                if partial.fixed(k) || a == 0.0 {
+                    continue;
+                }
+                // What this row leaves open for `k` once every other column is at its
+                // worst, which for a binary is a choice between two values.
+                let (lo, hi) = (a * partial.lb[k], a * partial.ub[k]);
+                let rest_min = min - lo.min(hi);
+                let rest_max = max - lo.max(hi);
+                let mut forced: Option<f64> = None;
+                for value in [0.0f64, 1.0] {
+                    if value < partial.lb[k] - 1e-9 || value > partial.ub[k] + 1e-9 {
+                        continue;
+                    }
+                    let with = a * value;
+                    let feasible = rest_min + with <= problem.row_ub[i] + tolerance
+                        && rest_max + with >= problem.row_lb[i] - tolerance;
+                    if feasible {
+                        // Two values fit, so the row forces nothing here.
+                        if forced.is_some() {
+                            forced = None;
+                            break;
+                        }
+                        forced = Some(value);
+                    }
+                }
+                if let Some(value) = forced {
+                    if !partial.fix(k, value) {
+                        return false;
+                    }
+                    queue.push(k);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Is this column a binary, including one already pinned to an end?
+fn is_binary_column(problem: &Problem, j: usize) -> bool {
+    problem.is_integer(j) && problem.col_lb[j] >= 0.0 && problem.col_ub[j] <= 1.0
+}
+
+/// Fix the binary columns one at a time, forcing everything each choice implies.
+///
+/// Diving asks the relaxation what to do next and pays an LP solve for the answer. On a
+/// model whose feasible set is sparse the answer is usually another fractional vertex,
+/// and the chain of solves ends without a point: across the pure binary instances this
+/// solver loses on, the whole heuristic chain takes 71% of the root's iterations and
+/// returns nothing on every one of them.
+///
+/// This asks the model instead. A fixing propagates through the conflict graph and the
+/// row activities, and on set partitioning structure one choice settles a whole row at
+/// once. Propagation is logical rather than numerical, so a step costs a sweep over the
+/// rows the fixed columns touch rather than a factorization.
+///
+/// The relaxation still chooses the order and the values, being the best guess available
+/// as to where the feasible points are. What it does not do is get asked again after
+/// every fixing.
+pub fn fix_and_propagate(
+    problem: &Problem,
+    conflicts: &Conflicts,
+    x: &[f64],
+    limits: &Limits,
+) -> Option<Incumbent> {
+    let n = problem.n_cols();
+    let csr = problem.matrix.to_csr();
+    let mut rows_of_col: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..problem.n_rows() {
+        let (cols, _) = csr.column(i);
+        for &j in cols {
+            rows_of_col[j].push(i);
+        }
+    }
+
+    let mut partial = Partial::new(problem);
+    let mut queue: Vec<usize> = Vec::new();
+    // Columns the model already pins are part of the assignment from the start.
+    for j in 0..n {
+        if partial.fixed(j) {
+            queue.push(j);
+        }
+    }
+    if !propagate_fixings(
+        problem,
+        conflicts,
+        &csr,
+        &rows_of_col,
+        &mut partial,
+        &mut queue,
+        limits.feasibility_tolerance,
+    ) {
+        return None;
+    }
+
+    // Most nearly decided first: a column the relaxation has already pushed to an end
+    // is the one it is most confident about, and fixing it forces the most for the
+    // least risk of being wrong.
+    let mut order: Vec<usize> = (0..n)
+        .filter(|&j| is_binary_column(problem, j) && !partial.fixed(j))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let (da, db) = ((x[a] - 0.5).abs(), (x[b] - 0.5).abs());
+        db.total_cmp(&da)
+    });
+
+    let mut conflicts_seen = 0usize;
+    for &j in &order {
+        if partial.fixed(j) {
+            continue;
+        }
+        let prefer = if x[j] > 0.5 { 1.0 } else { 0.0 };
+        let mut settled = false;
+        for value in [prefer, 1.0 - prefer] {
+            let mut trial = Partial {
+                lb: partial.lb.clone(),
+                ub: partial.ub.clone(),
+            };
+            if !trial.fix(j, value) {
+                continue;
+            }
+            queue.clear();
+            queue.push(j);
+            if propagate_fixings(
+                problem,
+                conflicts,
+                &csr,
+                &rows_of_col,
+                &mut trial,
+                &mut queue,
+                limits.feasibility_tolerance,
+            ) {
+                partial = trial;
+                settled = true;
+                break;
+            }
+            // The preferred value is refuted; the other one is the whole of the repair
+            // this attempts, and counting the refutations bounds how long it may go on
+            // being wrong.
+            conflicts_seen += 1;
+            if conflicts_seen > MAX_CONFLICTS {
+                return None;
+            }
+        }
+        if !settled {
+            return None;
+        }
+    }
+
+    // Every binary is decided. Continuous columns stay where the relaxation left them
+    // when that is still within their bounds, which polish may improve on afterwards.
+    let mut point = vec![0.0f64; n];
+    for j in 0..n {
+        point[j] = if partial.fixed(j) {
+            partial.lb[j]
+        } else {
+            x[j].clamp(partial.lb[j], partial.ub[j])
+        };
+    }
+    is_feasible(problem, &point, limits.feasibility_tolerance).then(|| Incumbent {
+        objective: objective_of(problem, &point),
+        x: point,
+    })
 }

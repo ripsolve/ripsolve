@@ -1213,9 +1213,9 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     // An incumbent before the first branch is worth more than one found later: the
     // search cannot prune anything until it holds one.
     if options.heuristic_frequency > 0 && root.status == LpStatus::Optimal {
-        // Cheapest first. Rounding costs no LP at all; diving costs a short chain of
-        // them; the pump costs the most but is the only one that reliably finds
-        // anything on models whose feasible set is sparse.
+        // Rounding costs no LP at all, diving a short chain of them, the pump the
+        // most. Fixing with propagation costs no LP either and still comes last: it is
+        // ordered by what its points are worth rather than by what they cost.
         let found = heuristic::round(problem, &root.x, &options.heuristic_limits)
             .or_else(|| {
                 heuristic::dive(
@@ -1236,6 +1236,22 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     &root.x,
                     &options.heuristic_limits,
                     &mut iterations,
+                )
+            })
+            .or_else(|| {
+                // Last rather than first despite being the cheapest of them. It finds
+                // points the others cannot, and finds worse ones than they do where
+                // both succeed: put ahead of diving it took `cap6000` from 500 nodes to
+                // 1500, having installed a weaker first incumbent and left the search
+                // less to prune with. Where the chain above it works there is nothing
+                // here worth having, and where it does not this is the whole of what
+                // there is.
+                let conflicts = cuts::Conflicts::of(problem);
+                heuristic::fix_and_propagate(
+                    problem,
+                    &conflicts,
+                    &root.x,
+                    &options.heuristic_limits,
                 )
             });
         // Whatever produced the point, its continuous columns are still sitting where
