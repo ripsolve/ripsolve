@@ -875,6 +875,46 @@ at all. `ex9` and `ex10` say the LP needs to be quicker on large models before a
 built on top of it can matter. Only the `acc-tight` family is the primal problem that all
 four attempts above were aimed at.
 
+### What stops ex9 and ex10, and why nothing above the LP can help them
+
+These two reach one node in a minute whether cutting is on or off, and the reason is
+that their root relaxation never finishes. It does not finish in 900 seconds either,
+against 82s for a reference solver on ex9 and 238s on ex10 with its presolve turned off.
+
+Tracing the solve says where it goes. Neither model gets out of phase 1:
+
+```text
+iter 0      phase1 true  worst 1.0000e0  stalled 0
+iter 20000  phase1 true  worst 1.0000e0  stalled 8871
+```
+
+The worst bound violation does not move from 1.0 across twenty thousand iterations, and
+8871 of them in an unbroken run take a step of length zero. This is the phase-1
+degeneracy recorded above, in its plainest form: a crowd of bases describing one point,
+with every step between them going nowhere.
+
+Two things were tried against it and neither worked. Entering through the dual method,
+which has no phase 1 to get stuck in, does not finish ex9 in 400 seconds either. Bound
+perturbation, triggered on a degenerate run of 2000 where healthy relaxations peak at
+296, fires where it should and then the loosened solve does not finish either.
+
+Worth noting against the earlier perturbation experiment, which took `neos-850681` from
+not finishing to 11 seconds: that one perturbed the model and solved it cold, while this
+one perturbs and warm starts from the stalled basis. The difference has not been chased
+and may be the whole of it.
+
+The conclusion that does hold is about ordering. Anything built above the relaxation,
+cuts, heuristics, presolve reductions, branching, can only act on instances whose
+relaxation is solved, and for this pair it never is. That is what made the probing and
+compaction work on ex9 pointless in advance: a model 22% smaller still has to get
+through phase 1, and 22% off a solve that does not finish is a solve that does not
+finish.
+
+Also worth recording: a reference solver never solves this relaxation either. It closes
+ex9 and ex10 as MIPs in zero simplex iterations, its presolve collapsing the models
+before any LP is attempted. Matching it here is a presolve problem wearing an LP
+problem's clothes, and the presolve it would take is well beyond what probing reached.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
