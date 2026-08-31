@@ -959,6 +959,46 @@ overshooting prefix and stops, which is exactly right for set packing and partit
 rows and leaves cliques behind on general knapsack rows. It also refuses any row holding
 a non-binary column outright, where the binaries in such a row can still conflict.
 
+### Where the binary losses actually are
+
+Two numbers reframe the problem. Of the 140 pure binary instances, this solver closes 24
+against 46 for the strongest open source solver. But of the 116 it misses, **83 are
+missed by every open source solver too**. The set that separates this solver from them
+is 33 instances, not 116, and passing the best of them means converting 23 of those 33.
+
+Measured across those 116 at 30 seconds and 16 threads, 86% finish with **no incumbent
+at all**, and 85% of the addressable 33 do. Read alone that says feasibility is the
+blocker and heuristics are the answer. Read with the node counts it says something else,
+because the instances with no incumbent divide into two groups that need opposite work.
+
+Twenty of the addressable 33 reach one to three nodes, and timing the root alone shows
+why: every one of them spends the entire 30 second budget there and never gets out.
+
+```text
+air04         30.1s root,  38313 simplex iterations, 1 node
+supportcase4  30.0s root,  20166 simplex iterations, 1 node
+tanglegram6   30.1s root,   1324 simplex iterations, 1 node
+bley_xl1      31.4s root,   1863 simplex iterations, 1 node
+```
+
+No heuristic can help these. A diving or pumping heuristic needs LP solves, and there is
+no budget left to give it. The blocker is root throughput, the relaxation and the
+separation on top of it, and it is the largest group by some way.
+
+Eight more search thousands of nodes and still find nothing: `acc-tight2` at 43 nodes,
+`air05` at 289, `mine-166-5` at 317, `neos-820879` at 3408, `disctom` at 3141, `mitre`
+at 6371, `neos-3045796-mogo` at 6752, `graph20-20-1rand` at 133. These are the genuine
+feasibility failures, the ones where rounding, diving and the pump all run and all come
+back empty, and they are where fix and propagate would earn its place.
+
+The remaining five find an incumbent and lose on the bound: `chromaticindex32-8`,
+`n2seq36f`, `neos-1516309`, `neos-1599274`, `neos18`.
+
+So the ordering that suggested itself from the incumbent count alone, heuristics first,
+is wrong. Twenty instances need the root to finish before anything above it can run at
+all, eight need feasibility, five need the bound. That ordering is what the numbers
+support, and it is worth re-deriving before the next build rather than inheriting.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
