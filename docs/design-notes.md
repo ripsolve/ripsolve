@@ -1255,11 +1255,42 @@ and no budget was found that keeps the reduction without paying for it somewhere
   instances come back to par and `air03` goes to 27 seconds instead, with the reduction
   down again.
 
-What is missing is a way to tell, before probing, which models it will pay on. The ones
-it pays on are exactly the ones that do not otherwise solve, so the reduction and the
-regression are not in tension by accident. Probing every column of every model is the
-wrong shape: it wants a candidate order, most-constrained first, and a stopping rule
-that reads the model rather than the clock.
+What is missing is a way to tell, before probing, which models it will pay on. Ordering
+the candidates was tried next and found the answer without being able to use it.
+
+The cost of a probe is set by how far its consequences reach, and reach is the size of
+the cliques the column sits in. That separates the two groups cleanly, and it is a
+property of the model rather than of the clock:
+
+```text
+   pays                        ruins
+   mitre       28 literals     air03     3861
+   ex9        196              eil33-2   2568
+   air04      368              irp       6146
+   decomp2     16              nw04     42032
+```
+
+Which makes "most constrained first" exactly backwards. The widest columns are where the
+refutations are and also the ones that cannot be afforded; ordering by reach and taking
+the widest first probes the most expensive columns in the model before any others.
+
+Skipping the columns above a reach of a thousand and taking the rest widest first
+restores most of the reduction, `mitre` to its full 3677 and `air04` to 787, and still
+costs `air03` 3.7 times its solve, because the cap gates the column probing starts from
+and not the ones its propagation walks into. Counting each literal visited as a unit of
+work rather than each column fixed, which is the honest way to bound it, moves the cost
+somewhere else again: `mod010` from 0.63 seconds to 11.
+
+Six budgets were tried. Every one of them trades the reduction against the cost, and the
+coupling is not incidental: probing pays on models whose conflicts are dense, and dense
+conflicts are what make it expensive. Something has to break that coupling before this
+is worth having, and a budget is not it.
+
+One thing found on the way is worth keeping in mind whatever happens to probing: reading
+a literal's exclusions through `neighbours` alone reports zero for every column of a set
+partitioning model, whose conflicts are all held as cliques. Any future caller wanting a
+column's true degree has to count clique membership too, or it will conclude that the
+most constrained columns in the set are the least.
 
 The measurement stands whatever happens to the code: the reduction is available, it
 matches a reference solver on one instance and gets most of the way on two more, and it
