@@ -79,6 +79,8 @@ pub struct Options {
     pub local_cut_frequency: usize,
     /// Most cuts to derive at one node.
     pub local_cuts_per_node: usize,
+    /// Restart a stalled root relaxation from a perturbed one.
+    pub perturb_stalled_root: bool,
     /// Flips the LP-free feasibility search may make before giving up.
     ///
     /// It runs ahead of the root relaxation, so this is the one heuristic budget that
@@ -191,6 +193,7 @@ impl Default for Options {
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
             jump_moves: 25_000,
+            perturb_stalled_root: true,
             cut_rounds: 50,
             cuts_per_round: 64,
             refactor_interval: 200,
@@ -1213,8 +1216,46 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         )
     };
 
-    let root = lp.solve_with_limit(options.max_iterations_per_node);
+    // The relaxation gets a first attempt on a share of the run. Most models finish it
+    // and pay nothing more.
+    if let Some(limit) = options.time_limit {
+        let first = started + limit.mul_f64(ROOT_LP_FIRST_SHARE);
+        lp.set_deadline(Some(match deadline {
+            Some(hard) => hard.min(first),
+            None => first,
+        }));
+    }
+    let mut root = lp.solve_with_limit(options.max_iterations_per_node);
+    lp.set_deadline(deadline);
     iterations += root.iterations;
+
+    // A relaxation that did not finish is usually not slow, it is stuck: the models this
+    // happens on are set partitioning problems whose every coefficient is one, where a
+    // crowd of bases describes one point and the steps between them have length zero.
+    // `ex9` spends 8871 consecutive iterations taking steps of length zero without the
+    // worst violation moving off 1.0.
+    //
+    // Perturbing the bounds by a random amount too small to matter breaks that: no two
+    // variables sit on the same bound any more, so the steps have somewhere to go. What
+    // comes back is the wrong problem's answer and the right problem's *basis*, which is
+    // the part worth having. Restoring the true bounds and re-solving from there gives
+    // the true optimum, and gives it quickly, because that basis is optimal for a
+    // problem next to this one rather than stuck inside it.
+    //
+    // Measured on the relaxations that stall: `neos-1324574` from 212471 iterations and
+    // 214 seconds to 5, and `tanglegram6` from not finishing at all to 172. This is the
+    // same idea as an earlier attempt that was reverted, and differs in the one way that
+    // matters: that one perturbed and warm started from the *stalled* basis, which puts
+    // the search back in the degeneracy it was trying to leave.
+    if root.status != LpStatus::Optimal
+        && !deadline.is_some_and(|d| Instant::now() >= d)
+        && options.perturb_stalled_root
+    {
+        if let Some(rescued) = perturbed_root(problem, &lp, &options, deadline) {
+            iterations += rescued.iterations;
+            root = rescued;
+        }
+    }
     nodes += 1;
 
     if root.status != LpStatus::Optimal {
@@ -1547,6 +1588,82 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 /// budget. A third leaves the bound most of what cutting was going to give it while
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
+
+/// How much of the run the relaxation gets before it is treated as stuck.
+///
+/// Generous: a relaxation that is merely slow should be allowed to finish, and only one
+/// that is going nowhere is worth restarting from a different point.
+const ROOT_LP_FIRST_SHARE: f64 = 0.40;
+
+/// How far the bounds are moved when a relaxation has stalled.
+///
+/// Small enough that the perturbed problem is next to the real one, large enough to
+/// separate variables sitting on a shared bound. Swept over 1e-7 to 1e-4; 1e-6 finishes
+/// the stalled relaxations and leaves the clean-up solve little to undo.
+const PERTURBATION_REACH: f64 = 1e-6;
+
+/// Solve a stalled relaxation by way of a perturbed one.
+///
+/// Returns the true model's solution, warm started from the perturbed model's basis, or
+/// `None` if either half failed to finish. Nothing here is approximate: the bound handed
+/// back is the true relaxation's, proved on the true bounds.
+fn perturbed_root(
+    problem: &Problem,
+    exact: &Lp,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> Option<LpSolution> {
+    // SplitMix64, so a run is reproducible.
+    let mut state = 0x5DEE_CE66Du64;
+    let mut noise = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut widen = |lo: &mut f64, hi: &mut f64| {
+        let reach = PERTURBATION_REACH * (1.0 + lo.abs().max(hi.abs()).min(1e6)) * (1.0 + noise());
+        if lo.is_finite() {
+            *lo -= reach;
+        }
+        if hi.is_finite() {
+            *hi += reach;
+        }
+    };
+
+    let mut loosened = problem.clone();
+    for j in 0..loosened.n_cols() {
+        let (mut lo, mut hi) = (loosened.col_lb[j], loosened.col_ub[j]);
+        widen(&mut lo, &mut hi);
+        loosened.col_lb[j] = lo;
+        loosened.col_ub[j] = hi;
+    }
+    for i in 0..loosened.n_rows() {
+        let (mut lo, mut hi) = (loosened.row_lb[i], loosened.row_ub[i]);
+        widen(&mut lo, &mut hi);
+        loosened.row_lb[i] = lo;
+        loosened.row_ub[i] = hi;
+    }
+
+    let mut loose = Lp::relaxation(&loosened);
+    loose.set_deadline(deadline);
+    let solved = loose.solve_with_limit(options.max_iterations_per_node);
+    if solved.status != LpStatus::Optimal {
+        return None;
+    }
+    // The perturbed objective is a bound on a weaker problem and is not used. Only the
+    // basis crosses back.
+    let cleaned = exact.solve_with_rows(
+        &solved.basis,
+        &[],
+        None,
+        options.max_iterations_per_node,
+    );
+    let mut cleaned = cleaned;
+    cleaned.iterations += solved.iterations;
+    (cleaned.status == LpStatus::Optimal).then_some(cleaned)
+}
 
 /// How much of the run the LP-free feasibility search may have.
 ///

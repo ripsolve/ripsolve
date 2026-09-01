@@ -1163,6 +1163,61 @@ is not what this did: its neighbourhoods come from several constructions, and th
 here fixes columns where the incumbent agrees with the relaxation, which is undefined on
 precisely the instances that most need it, the ones whose relaxation never finishes.
 
+### Restarting a stalled relaxation from a perturbed one
+
+Seven of the instances this solver loses never finish their root relaxation, and nothing
+built above the LP can reach them: three separate neighbourhood searches were written
+for that group over one sitting and every one of them failed for the same reason, that
+it asks the relaxation a question and there is no relaxation to ask.
+
+Those models are not slow so much as stuck. Their matrices are all ones, set
+partitioning and set covering, where a crowd of bases describes one point and every step
+between them has length zero. `ex9` spends 8871 consecutive iterations taking steps of
+length zero without its worst violation moving off 1.0.
+
+Moving every bound by a random amount too small to matter breaks the tie. No two
+variables sit on the same bound any more, so the steps have somewhere to go.
+
+The part that took two attempts to understand is what the perturbed solve is *for*. Its
+objective is worthless: it is a valid bound on a weaker problem and can be far from the
+real one, `neos-1324574` reporting -0.0001 where the truth is 4.5, and `tanglegram6`
+reporting a number that scales linearly with the size of the perturbation. What is worth
+having is the **basis**. A basis optimal for a problem next to this one is a warm start
+this one can use, and re-solving the true model from there recovers the true optimum
+almost immediately.
+
+```text
+                    plain                     perturbed, then cleaned
+neos-1324574    212471 iterations, 214.2s     419 + 4244 iterations, 5.2s
+tanglegram6     does not finish               10754 iterations, 172.3s
+```
+
+Both cleaned solves return the true optimum, 4.5 and 0.0, proved on the true bounds.
+
+An earlier attempt at this was measured, reverted, and recorded as a failure. It differs
+in one respect: it perturbed and warm started from the **stalled** basis, which puts the
+search back inside the degeneracy it was trying to leave. The note left behind at the
+time said the difference was unexplained and might be the whole of it. It was the whole
+of it.
+
+In the solver it is asked for only when the relaxation has failed on its first attempt,
+so models that finish theirs pay nothing, and the regression set is unchanged to within
+noise across all 23. It converts no instance at a minute. What it does is take
+`neos-1324574` from one node and an incumbent of 36 to nine nodes and an incumbent of 14,
+which is the difference between a search that cannot start and one that can.
+
+### Scaling, which does not answer this
+
+Row equilibration was written for the same group and does not fit it. Five of the seven
+have matrices of all ones: `air04`, `cod105`, `neos-1324574`, `neos-3226448-wkra`,
+`tanglegram6`, along with `ex9`. There is nothing to scale, and `air04` bears that out,
+95784 iterations before and 94302 after.
+
+Where coefficients do vary it buys throughput and no solves: `supportcase4` 13% more LP
+iterations in the same budget, `mitre` 6%, and `bley_xl1` unchanged and still unsolved
+despite spanning 0.5 to 1e8. Held back rather than kept, since what it treats is
+conditioning and what stops these models is degeneracy.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
