@@ -71,12 +71,20 @@ fn main() {
             true
         };
 
+        // Sampled on large models: a probe costs a pass over the rows, so probing every
+        // column of a model with half a million nonzeros is not a measurement, it is the
+        // thing being measured.
+        let sample: usize = std::env::var("PROBE_SAMPLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        let candidates: Vec<usize> = (0..n)
+            .filter(|&j| binary(j) && problem.col_lb[j] < problem.col_ub[j])
+            .collect();
+        let stride = (candidates.len() / sample.max(1)).max(1);
         let mut fixable = 0usize;
         let mut free = 0usize;
-        for j in 0..n {
-            if !binary(j) || problem.col_lb[j] >= problem.col_ub[j] {
-                continue;
-            }
+        for &j in candidates.iter().step_by(stride) {
             free += 1;
             let up = probe(j, 1.0);
             let down = probe(j, 0.0);
@@ -84,6 +92,10 @@ fn main() {
                 fixable += 1;
             }
         }
-        println!("{name:<20} {free:>7} free binaries, probing fixes {fixable:>7}");
+        println!(
+            "{name:<20} probed {free:>6} of {:>6} free binaries, fixable {fixable:>6} ({:.0}%)",
+            candidates.len(),
+            100.0 * fixable as f64 / free.max(1) as f64
+        );
     }
 }

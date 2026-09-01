@@ -1218,6 +1218,53 @@ iterations in the same budget, `mitre` 6%, and `bley_xl1` unchanged and still un
 despite spanning 0.5 to 1e8. Held back rather than kept, since what it treats is
 conditioning and what stops these models is degeneracy.
 
+### Probing, which reduces the models and cannot be afforded
+
+Presolve here fixes columns by reasoning forwards from the bounds it has. Probing
+reasons backwards: suppose a column takes a value, work out what follows, and if that
+ends in a contradiction the value is refuted and the column is fixed to the other one.
+Nothing is guessed, and a value refuted this way appears in no feasible solution.
+
+Reasoning it with the search's own propagator, conflict graph and row activities
+together rather than activities alone, is what makes it strong here. The conflicts of
+these models live in long set partitioning rows that pairwise reasoning never sees, and
+`ex9` carries 1.9 million of them.
+
+```text
+                 presolve alone    with probing     a reference solver
+ex9              1844 columns      6907 of 10404    all of them
+mitre               0              3677 of 10724    4693
+air04               0              1375 of  8904    1400
+```
+
+On `air04` that is the reference solver's own reduction, matched. It also solves `mitre`,
+which nothing else here has.
+
+It is reverted anyway, because a probe costs a propagation sweep per column per value
+and no budget was found that keeps the reduction without paying for it somewhere worse:
+
+- Unbounded, presolve runs past the caller's entire time limit. `air03` solves in 1.2
+  seconds and was still probing at 200; five instances of the regression set were lost
+  outright.
+- Bounded by a share of the time limit, the reduction collapses, `ex9` to 1920 columns
+  and `air04` to 114, while a 0.14 second instance still pays six seconds. A share of
+  the limit prices work against how long the caller happens to be willing to wait, which
+  is unrelated to what the work is worth. This is the third time that mistake appears in
+  these notes.
+- Bounded by a run of unproductive probes, which is the right shape of budget, three
+  instances come back to par and `air03` goes to 27 seconds instead, with the reduction
+  down again.
+
+What is missing is a way to tell, before probing, which models it will pay on. The ones
+it pays on are exactly the ones that do not otherwise solve, so the reduction and the
+regression are not in tension by accident. Probing every column of every model is the
+wrong shape: it wants a candidate order, most-constrained first, and a stopping rule
+that reads the model rather than the clock.
+
+The measurement stands whatever happens to the code: the reduction is available, it
+matches a reference solver on one instance and gets most of the way on two more, and it
+is the only thing tried here that closes `mitre`.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
