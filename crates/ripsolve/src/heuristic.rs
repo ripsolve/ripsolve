@@ -628,6 +628,60 @@ mod tests {
         );
     }
 
+    /// The same guarantee the propagating heuristic carries, for the same reason: a
+    /// weighted local search has no notion of validity, so what it returns is checked
+    /// against the model before it counts as anything.
+    #[test]
+    fn feasibility_jump_never_returns_an_infeasible_point() {
+        for seed in 0..40u64 {
+            for kind in [Kind::Covering, Kind::Signed, Kind::Knapsack] {
+                let p = instance(kind, 30, 25, seed);
+                let relaxed = Lp::relaxation(&p).solve();
+                if relaxed.status != LpStatus::Optimal {
+                    continue;
+                }
+                if let Some(found) =
+                    feasibility_jump(&p, &relaxed.x, &Limits::default(), 20_000, None)
+                {
+                    assert_valid(&p, &found, &format!("jump {kind:?} seed {seed}"));
+                }
+            }
+        }
+    }
+
+    /// The point of it: a feasible point with no LP solved at all. Covering instances
+    /// have one trivially, so the check that matters is that it is reached from a
+    /// starting assignment that is itself infeasible.
+    #[test]
+    fn feasibility_jump_repairs_an_infeasible_start() {
+        let p = instance(Kind::Covering, 40, 30, 7);
+        // Everything off, which violates every covering row at once.
+        let start = vec![0.0; p.n_cols()];
+        assert!(
+            !is_feasible(&p, &start, 1e-6),
+            "the starting point was supposed to be infeasible"
+        );
+        let found = feasibility_jump(&p, &start, &Limits::default(), 200_000, None)
+            .expect("covering rows are always satisfiable by switching enough on");
+        assert_valid(&p, &found, "jump repair");
+    }
+
+    /// Weight bumping is what distinguishes this from a rounding pass: without it the
+    /// search stops at the first assignment no single flip improves. This model has
+    /// exactly that shape, one flip away from feasible in a direction that looks
+    /// neutral until the violated row is made expensive.
+    #[test]
+    fn feasibility_jump_escapes_a_local_minimum() {
+        let lp = "Minimize\n obj: x1 + x2 + x3\nSubject To\n \
+                  r1: x1 + x2 >= 1\n r2: x2 + x3 >= 1\n r3: x1 + x3 >= 1\n\
+                  Binary\n x1\n x2\n x3\nEnd\n";
+        let p = Problem::from_lp(&LpProblem::parse(lp).unwrap()).unwrap();
+        let start = vec![0.0; p.n_cols()];
+        let found = feasibility_jump(&p, &start, &Limits::default(), 100_000, None)
+            .expect("two of the three switched on satisfies every row");
+        assert_valid(&p, &found, "jump local minimum");
+    }
+
     /// The property that makes this heuristic safe to add: propagation may be wrong
     /// about where the feasible points are, and cannot be wrong about what it returns,
     /// because the completed assignment is checked before it is handed back.
@@ -1134,5 +1188,289 @@ pub fn fix_and_propagate(
     is_feasible(problem, &point, limits.feasibility_tolerance).then(|| Incumbent {
         objective: objective_of(problem, &point),
         x: point,
+    })
+}
+
+/// How much a violated row's weight grows when the search has nowhere left to go.
+const JUMP_WEIGHT_BUMP: f64 = 1.0;
+
+/// Moves without reducing the least violation seen before the search is abandoned.
+///
+/// Generous rather than tight, because weight bumping is meant to make things worse for
+/// a while: a run climbing out of a local minimum raises violation deliberately and the
+/// cutoff must not mistake that for failure. What it catches is the other case, a run
+/// that has settled and will not move again however long it is left.
+const JUMP_STALL: usize = 30_000;
+
+/// How far the candidate queue may outgrow the columns before it is rebuilt.
+const STALE_FACTOR: usize = 8;
+
+/// A row's distance from being satisfied.
+fn row_violation(activity: f64, lb: f64, ub: f64) -> f64 {
+    let below = if activity < lb { lb - activity } else { 0.0 };
+    let above = if activity > ub { activity - ub } else { 0.0 };
+    below + above
+}
+
+/// A column and the gain from flipping it, ordered so the best is popped first.
+#[derive(PartialEq)]
+struct Candidate {
+    gain: f64,
+    column: usize,
+}
+
+impl Eq for Candidate {}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.gain
+            .total_cmp(&other.gain)
+            .then_with(|| other.column.cmp(&self.column))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Search for a feasible point without solving a single LP.
+///
+/// Every heuristic above this one is a way of asking the relaxation where to look, and
+/// on a model whose feasible set is sparse the relaxation does not know. Across the pure
+/// binary instances this solver loses on, the whole LP-driven chain takes 71% of the
+/// root's iterations and returns nothing, and on seven of them the relaxation does not
+/// even finish, so nothing downstream of it ever runs at all.
+///
+/// This asks the constraints instead. Each row carries a weight, the objective being the
+/// weighted sum of how far the rows are from satisfied, and each step flips whichever
+/// column reduces that sum the most. Reaching a point where no single flip improves
+/// anything is not the end: the weights of the rows still violated go up, which reshapes
+/// the surface until a flip helps again. That is what carries it out of the local minima
+/// that stop a rounding heuristic dead.
+///
+/// The published form of this is Luteberget and Sandvik's Feasibility Jump. What is here
+/// is its feasibility half: no objective term, because the measured blocker is finding
+/// any feasible point at all rather than finding a good one, and because whatever this
+/// returns is handed to polish and to the improvement search afterwards.
+///
+/// Binary columns only. General integers would need a jump to the best value in their
+/// range rather than a flip, and the models this is aimed at do not have any. Continuous
+/// columns stay where they were put and contribute a constant to every row they are in.
+pub fn feasibility_jump(
+    problem: &Problem,
+    start: &[f64],
+    limits: &Limits,
+    max_moves: usize,
+    deadline: Option<std::time::Instant>,
+) -> Option<Incumbent> {
+    // Checked on a stride: the clock is far more expensive than a flip, and a stride
+    // this size is well under a second's worth of work on the largest model here.
+    const CLOCK_STRIDE: usize = 512;
+    let n = problem.n_cols();
+    let m = problem.n_rows();
+    // A general integer column has no flip, and standing in for one badly is worse than
+    // declining the model.
+    if (0..n).any(|j| problem.is_integer(j) && !is_binary_column(problem, j)) {
+        return None;
+    }
+    // The matrix is held by column, so a column's rows and coefficients are already
+    // adjacent; only the row-wise view has to be built.
+    let csr = problem.matrix.to_csr();
+
+    // Start from the relaxation, rounded, which is a better guess than either bound.
+    let mut assign: Vec<f64> = (0..n)
+        .map(|j| {
+            if is_binary_column(problem, j) {
+                let rounded: f64 = if start[j] > 0.5 { 1.0 } else { 0.0 };
+                rounded.clamp(problem.col_lb[j], problem.col_ub[j])
+            } else {
+                start[j].clamp(problem.col_lb[j], problem.col_ub[j])
+            }
+        })
+        .collect();
+
+    let mut activity = vec![0.0f64; m];
+    for i in 0..m {
+        let (cols, vals) = csr.column(i);
+        activity[i] = cols.iter().zip(vals).map(|(&j, &a)| a * assign[j]).sum();
+    }
+    let mut weight = vec![1.0f64; m];
+    let mut violation: Vec<f64> = (0..m)
+        .map(|i| row_violation(activity[i], problem.row_lb[i], problem.row_ub[i]))
+        .collect();
+
+    let tolerance = limits.feasibility_tolerance;
+    let movable: Vec<usize> = (0..n)
+        .filter(|&j| is_binary_column(problem, j) && problem.col_lb[j] < problem.col_ub[j])
+        .collect();
+    if movable.is_empty() {
+        return None;
+    }
+
+    // What flipping `j` would do to the weighted violation, positive being an
+    // improvement.
+    let gain_of = |j: usize,
+                   assign: &[f64],
+                   activity: &[f64],
+                   violation: &[f64],
+                   weight: &[f64]|
+     -> f64 {
+        let step = 1.0 - 2.0 * assign[j];
+        let (rows, vals) = problem.matrix.column(j);
+        let mut gain = 0.0;
+        for (&i, &a) in rows.iter().zip(vals) {
+            let moved = activity[i] + a * step;
+            let after = row_violation(moved, problem.row_lb[i], problem.row_ub[i]);
+            gain += weight[i] * (violation[i] - after);
+        }
+        gain
+    };
+
+    let mut gain: Vec<f64> = vec![0.0; n];
+    let mut heap: std::collections::BinaryHeap<Candidate> = std::collections::BinaryHeap::new();
+    for &j in &movable {
+        gain[j] = gain_of(j, &assign, &activity, &violation, &weight);
+        heap.push(Candidate {
+            gain: gain[j],
+            column: j,
+        });
+    }
+
+    let mut total: f64 = violation.iter().sum();
+    // The least violation seen, and how long since it last fell. Where this heuristic
+    // works it works quickly, closing out in about a second on every instance it wins;
+    // where it does not, it flips until its budget runs out and returns nothing. The
+    // difference is visible while it runs, so it is worth watching rather than waiting
+    // out: a run that has stopped reducing violation at all is not about to start.
+    let mut best = total;
+    let mut since_improved = 0usize;
+    let mut moves = 0usize;
+    while moves < max_moves {
+        if total <= tolerance {
+            break;
+        }
+        // A move budget alone does not bound the time this takes: a flip costs the
+        // columns of the rows it touches, which on a dense model is thousands of them.
+        // Without this `mitre` spends 34 seconds here against a limit of 20 and never
+        // reaches the relaxation at all.
+        if moves.is_multiple_of(CLOCK_STRIDE)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            break;
+        }
+        if total < best - 1e-9 {
+            best = total;
+            since_improved = 0;
+        } else {
+            since_improved += 1;
+            if since_improved > JUMP_STALL {
+                break;
+            }
+        }
+        // Entries are superseded rather than removed, so the queue grows by every column
+        // a flip touches and fills with readings that no longer hold. Left alone it
+        // becomes most of the running time: each step then pops through the accumulated
+        // staleness to reach anything current, which took `f2gap201600` from 0.7 seconds
+        // to nearly seven. Rebuilding from the live scores once it outgrows the columns
+        // several times over keeps that bounded.
+        if heap.len() > STALE_FACTOR * movable.len() {
+            heap.clear();
+            for &k in &movable {
+                if gain[k] > 1e-12 {
+                    heap.push(Candidate {
+                        gain: gain[k],
+                        column: k,
+                    });
+                }
+            }
+        }
+        // The best flip available, discarding heap entries a later update has stale.
+        let mut chosen: Option<usize> = None;
+        while let Some(candidate) = heap.pop() {
+            if (candidate.gain - gain[candidate.column]).abs() > 1e-12 {
+                continue;
+            }
+            if candidate.gain > 1e-12 {
+                chosen = Some(candidate.column);
+            } else {
+                // Nothing improves: put it back for the next pass, which will see the
+                // reweighted surface rather than this one.
+                heap.push(candidate);
+            }
+            break;
+        }
+
+        let Some(j) = chosen else {
+            // A local minimum. Every row still violated becomes more expensive to leave
+            // violated, which is what lets the next step move somewhere this one could
+            // not.
+            let mut touched: Vec<usize> = Vec::new();
+            for i in 0..m {
+                if violation[i] > tolerance {
+                    weight[i] += JUMP_WEIGHT_BUMP;
+                    let (cols, _) = csr.column(i);
+                    touched.extend_from_slice(cols);
+                }
+            }
+            if touched.is_empty() {
+                break;
+            }
+            touched.sort_unstable();
+            touched.dedup();
+            for &k in &touched {
+                if problem.col_lb[k] >= problem.col_ub[k] || !is_binary_column(problem, k) {
+                    continue;
+                }
+                gain[k] = gain_of(k, &assign, &activity, &violation, &weight);
+                heap.push(Candidate {
+                    gain: gain[k],
+                    column: k,
+                });
+            }
+            moves += 1;
+            continue;
+        };
+
+        // Apply the flip and repair everything it touched.
+        let step = 1.0 - 2.0 * assign[j];
+        assign[j] += step;
+        let mut touched: Vec<usize> = Vec::new();
+        let (rows, vals) = problem.matrix.column(j);
+        for (&i, &a) in rows.iter().zip(vals) {
+            activity[i] += a * step;
+            let after = row_violation(activity[i], problem.row_lb[i], problem.row_ub[i]);
+            total += after - violation[i];
+            violation[i] = after;
+            let (cols, _) = csr.column(i);
+            touched.extend_from_slice(cols);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for &k in &touched {
+            if problem.col_lb[k] >= problem.col_ub[k] || !is_binary_column(problem, k) {
+                continue;
+            }
+            gain[k] = gain_of(k, &assign, &activity, &violation, &weight);
+            heap.push(Candidate {
+                gain: gain[k],
+                column: k,
+            });
+        }
+        moves += 1;
+    }
+
+    let found = is_feasible(problem, &assign, tolerance);
+    if std::env::var("RIPSOLVE_JUMP_TRACE").is_ok() {
+        eprintln!(
+            "JUMP moves={moves} cols={} nnz={} violation={total:.6} found={found}",
+            problem.n_cols(),
+            problem.matrix.nnz(),
+        );
+    }
+    found.then(|| Incumbent {
+        objective: objective_of(problem, &assign),
+        x: assign,
     })
 }

@@ -75,13 +75,16 @@ enum Command {
         /// Worker threads; defaults to the machine's parallelism.
         #[arg(short, long)]
         threads: Option<usize>,
+        /// Flips the LP-free feasibility search may make. 0 disables it.
+        #[arg(long, default_value_t = 25_000)]
+        jump_moves: usize,
     },
     /// Solve a model's LP relaxation and report the bound.
     Relax {
         /// Model file, `.lp` or `.mps`.
         path: PathBuf,
         /// Maximum simplex iterations.
-        #[arg(long, default_value_t = 200_000)]
+        #[arg(long, default_value_t = 25_000)]
         max_iterations: usize,
     },
     /// Write a reproducible random instance in LP format.
@@ -148,6 +151,7 @@ fn main() -> Result<()> {
             cuts_per_round,
             local_cut_frequency,
             threads,
+            jump_moves,
         } => {
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -163,6 +167,7 @@ fn main() -> Result<()> {
                 cut_rounds,
                 cuts_per_round,
                 local_cut_frequency,
+                jump_moves,
                 ..Options::default()
             };
             let started = std::time::Instant::now();

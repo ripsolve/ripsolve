@@ -79,6 +79,13 @@ pub struct Options {
     pub local_cut_frequency: usize,
     /// Most cuts to derive at one node.
     pub local_cuts_per_node: usize,
+    /// Flips the LP-free feasibility search may make before giving up.
+    ///
+    /// It runs ahead of the root relaxation, so this is the one heuristic budget that
+    /// is spent whether or not the relaxation is ever solved, and the models where that
+    /// matters most are the large ones. Two hundred thousand is a few seconds on the
+    /// largest instance in the pure binary set and well under a second on most.
+    pub jump_moves: usize,
     /// Rounds of cut separation at the root. Zero disables cuts.
     ///
     /// This defaulted to zero for a long time, on the strength of eleven generated
@@ -183,6 +190,7 @@ impl Default for Options {
             presolve: true,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
+            jump_moves: 25_000,
             cut_rounds: 50,
             cuts_per_round: 64,
             refactor_interval: 200,
@@ -1158,6 +1166,53 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut incumbent = f64::INFINITY;
     let mut incumbent_x: Option<Vec<f64>> = None;
 
+    // Run only where it is needed, which is the two places nothing else reaches: when
+    // the relaxation does not finish, and when it does and every heuristic built on it
+    // comes back empty.
+    //
+    // Not before the relaxation unconditionally, which is what it did first. The models
+    // it cannot crack take the whole budget it is given and return nothing, and most
+    // models are ones it is never needed on: paying for it up front took `f2gap401600`
+    // from 0.27 seconds to 11.5 and `mod010` from 0.78 to 12.9, on instances whose own
+    // heuristics find a point in under a second. Asked only after those have failed, it
+    // costs nothing on either.
+    let jump = |from: Option<&[f64]>, elapsed_share: f64| -> Option<heuristic::Incumbent> {
+        if options.heuristic_frequency == 0 {
+            return None;
+        }
+        let start: Vec<f64> = (0..problem.n_cols())
+            .map(|j| match from {
+                Some(x) => x[j].clamp(problem.col_lb[j], problem.col_ub[j]),
+                // No relaxation to round, so start from whichever bound is nearer zero
+                // and let the weights do the rest.
+                None if problem.col_lb[j] > 0.0 => problem.col_lb[j],
+                None => 0.0f64.clamp(problem.col_lb[j], problem.col_ub[j]),
+            })
+            .collect();
+        // From now rather than from the start of the run. This is asked for late, after
+        // the relaxation and the cutting and the whole chain above it have had their
+        // turn, and a budget measured from the beginning of a minute has already been
+        // spent by the time it is reached: every instance this heuristic wins came back
+        // empty when the deadline was anchored that way, having been given no time at
+        // all rather than too little.
+        let jump_deadline = options
+            .time_limit
+            .map(|limit| Instant::now() + limit.mul_f64(elapsed_share))
+            .or(deadline);
+        // Never past the run's own end.
+        let jump_deadline = match (jump_deadline, deadline) {
+            (Some(own), Some(hard)) => Some(own.min(hard)),
+            (own, hard) => own.or(hard),
+        };
+        heuristic::feasibility_jump(
+            problem,
+            &start,
+            &options.heuristic_limits,
+            options.jump_moves,
+            jump_deadline,
+        )
+    };
+
     let root = lp.solve_with_limit(options.max_iterations_per_node);
     iterations += root.iterations;
     nodes += 1;
@@ -1171,7 +1226,25 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             _ if deadline.is_some_and(|d| Instant::now() >= d) => Status::TimeLimit,
             _ => Status::NodeLimit,
         };
-        return Solution::without_solution(status, nodes, iterations, presolve_stats);
+        // A point found before the relaxation survives the relaxation failing. It is
+        // not proven optimal and never claims to be, but reporting nothing when
+        // something feasible is in hand throws away the only result there was.
+        let rescued = if status == Status::Infeasible {
+            None
+        } else {
+            jump(None, JUMP_SHARE)
+        };
+        return match rescued {
+            Some(found) if status != Status::Infeasible => {
+                let mut solution =
+                    Solution::without_solution(status, nodes, iterations, presolve_stats);
+                solution.objective = Some(problem.objective_value(found.objective));
+                solution.x = found.x;
+                solution.heuristic_solutions = 1;
+                solution
+            }
+            _ => Solution::without_solution(status, nodes, iterations, presolve_stats),
+        };
     }
 
     let first_bound = root.objective;
@@ -1253,6 +1326,32 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     &root.x,
                     &options.heuristic_limits,
                 )
+            })
+            // The point found before the relaxation, for the same reason and with the
+            // same evidence: installed ahead of the chain rather than behind it, it
+            // took `eil33-2` from solved in 96 seconds to unsolved in 150, having been
+            // good enough that nothing above replaced it and worse than what the chain
+            // would have reached on its own. Every instance it wins is one where
+            // everything above returns nothing, so nothing is given up by asking it
+            // last.
+            // The point found before the relaxation, kept only when the relaxation
+            // agrees it is a good one. Where this heuristic wins it wins outright, its
+            // point landing on the optimum with the bound already there to prove it:
+            // `acc-tight2`, `disctom` and `neos-913984` all close in two nodes from a
+            // point at zero gap. Where its point is poor it is worse than none, having
+            // been installed early enough to steer the search and too loose to prune
+            // with: `eil33-2` at 37% off the bound went from solved in 96 seconds to
+            // unsolved in 150. The threshold sits far from both.
+            .or_else(|| {
+                // From the bounds rather than from the relaxation, which is measured
+                // rather than assumed: rounding the relaxation looks like the better
+                // start and is not, losing `acc-tight2`, `disctom` and `neos-913984`
+                // outright. The weights are what find the point, and where they start
+                // from decides which local minimum they have to climb out of first.
+                jump(None, JUMP_SHARE).filter(|found| {
+                    let scale = found.objective.abs().max(1.0);
+                    found.objective - root.objective <= JUMP_QUALITY * scale
+                })
             });
         // Whatever produced the point, its continuous columns are still sitting where
         // the relaxation left them. Re-optimizing them is one LP and is often worth
@@ -1278,6 +1377,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             incumbent_x = Some(found.x);
             heuristic_solutions += 1;
         }
+
     }
 
     // Consider the root itself first, so an integral relaxation is picked up without
@@ -1448,6 +1548,26 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
 
+/// How much of the run the LP-free feasibility search may have.
+///
+/// It runs before the relaxation, so whatever it takes is taken from everything else.
+/// A share of the limit is the wrong yardstick and this is deliberately a small one.
+/// The models this cracks it cracks in about a second: `acc-tight2`, `disctom` and
+/// `neos-913984` each cost under a second and a half of jumping to close outright. The
+/// models it cannot crack will take whatever they are given, and at a tenth of a two
+/// minute limit that came to twelve seconds spent on instances that solve in under one,
+/// taking `f2gap401600` from 0.27 seconds to 11.5. The stall cutoff inside the search
+/// is what actually bounds it; this is the backstop.
+const JUMP_SHARE: f64 = 0.05;
+
+/// How far from the root bound a jumped point may sit and still be worth installing.
+///
+/// Measured rather than chosen: the three instances this heuristic closes arrive at a
+/// gap of zero, and the one it cost arrives at 37%. Anything in between is untested, so
+/// this is set near the winners rather than midway.
+const JUMP_QUALITY: f64 = 0.10;
+
+
 /// What is left of a time limit that started at `started`, or `None` for no limit.
 fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
     limit.map(|limit| limit.saturating_sub(started.elapsed()))
@@ -1504,6 +1624,12 @@ fn improve(
             improvement_frequency: 0,
             max_nodes: options.improvement_nodes,
             threads: 1,
+            // The sub-search starts from an incumbent and is looking for a better point
+            // near it, which is not what a feasibility search is for. Inherited, it
+            // runs again on every neighbourhood: on `eil33-2` that came to 51 seconds
+            // of a 96 second solve, spent re-establishing feasibility that the
+            // neighbourhood already had.
+            jump_moves: 0,
             // What is left of the caller's budget, not a fresh copy of it. A time
             // limit is a duration and the sub-search starts its own clock, so passing
             // the original handed it the whole limit again: an improvement beginning

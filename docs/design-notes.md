@@ -1095,6 +1095,74 @@ when this was measured at 16 threads, `mine-166-5` and `neos-820879`, find none 
 version at one thread. Incumbent counts on the parallel search are not stable enough to
 read a regression from.
 
+### A feasibility search that does not use the relaxation
+
+Every heuristic here asks the relaxation where to look. On a model whose feasible set is
+sparse the relaxation does not know, and on seven of the instances this solver loses on
+the relaxation does not finish at all, so nothing built on it ever runs.
+
+Feasibility Jump, from Luteberget and Sandvik, asks the constraints instead. Every row
+carries a weight, the thing being minimized is the weighted sum of how far the rows are
+from satisfied, and each step flips whichever column reduces that sum the most. Arriving
+somewhere no single flip improves is not the end: the weights of the rows still violated
+go up, reshaping the surface until a flip helps again. What is here is its feasibility
+half, with no objective term, because the measured blocker is finding any point at all.
+
+It closes three instances outright, `acc-tight2`, `disctom` and `neos-913984`, each in a
+single node, and gives `cod105` the first feasible point it has ever had here. The
+reason those three close is worth keeping: the point it returns *is* the optimum, and the
+root bound already matches it, so the search only has to agree.
+
+That is also what decides when to keep its answer. Where this heuristic wins it wins
+outright, at a gap of zero; where its point is poor it is worse than none, installed
+early enough to steer the search and too loose to prune with. `eil33-2` at 37% off the
+bound went from solved in 96 seconds to unsolved in 150. So the point is kept only when
+the relaxation agrees it is a good one.
+
+Where it runs matters more than anything inside it, and this took four attempts to get
+right. Run before the relaxation unconditionally, which is what a reference solver's log
+appears to show, it is paid for on every model including the great majority that never
+need it: `f2gap401600` went from 0.27 seconds to 11.5 and `mod010` from 0.78 to 12.9,
+both of which find a point by themselves in under a second. It is now asked only in the
+two places nothing else reaches, when the relaxation fails and when it succeeds and every
+heuristic built on it comes back empty, and it costs those models nothing.
+
+Four bugs, each found by measurement rather than by reading:
+
+- A move budget does not bound time. A flip costs the columns of the rows it touches, so
+  `mitre` spent 34 seconds against a limit of 20 and never reached the relaxation.
+- Its deadline was anchored to the start of the run. Once it moved later in the pipeline
+  that budget was already spent, and every instance it wins came back empty, given no
+  time rather than too little.
+- The improvement search re-enters the solver and inherited the jump budget, re-running
+  the whole feasibility search on every neighbourhood: 51 seconds of a 96 second solve.
+- Its candidate queue superseded entries rather than removing them, so each step popped
+  through the accumulated staleness: 6.9 seconds on a model of 3200 nonzeros.
+
+A stall cutoff was tried and abandoned. Cutting off a run that has stopped reducing
+violation sounds right and is not: `acc-tight2` sits at a violation of 19 for thousands
+of flips before escaping to zero, which is exactly what the weights are for, and any
+cutoff tight enough to catch a hopeless run also catches that one.
+
+### Searching the neighbourhood at the root, which did not work
+
+The improvement search is reached once every few hundred nodes, and every instance this
+solver loses sits at one or two nodes when its time runs out, so it has never run on any
+of them. Moving it to the root, immediately after the first point, follows directly and
+is what a reference solver does: on `mitre` its first point is 140535 and the one its
+sub-search returns half a second later is 115155, which is optimal.
+
+Here it found nothing, on any instance, and cost `cap6000` 1.83 times its solve. Worse
+before it was guarded: asked to beat a point the bound already matched, it could not
+succeed and would not stop trying, and four rounds of that spent the budget `disctom` and
+`neos-913984` needed to prove the optimum they already held. Guarding it against that
+left a heuristic that costs and does not pay, so it is gone.
+
+The gap it was aimed at is real and remains. What the reference solver does at that point
+is not what this did: its neighbourhoods come from several constructions, and the one
+here fixes columns where the incumbent agrees with the relaxation, which is undefined on
+precisely the instances that most need it, the ones whose relaxation never finishes.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
