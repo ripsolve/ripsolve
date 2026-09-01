@@ -84,7 +84,11 @@ def main():
             "%s=%s/%ss" % (k, result[k]["status"][:3], result[k]["seconds"])
             for k in SOLVERS)), flush=True)
 
-    tally = {k: sum(1 for row in rows if row[4][k]["status"] == "optimal") for k in SOLVERS}
+    # Proving a model infeasible is a complete answer and counts as solved. Counting
+    # only "optimal" understated every solver here by the four infeasible instances in
+    # the set, which is enough to move a comparison between two of them.
+    closed = ("optimal", "infeasible")
+    tally = {k: sum(1 for row in rows if row[4][k]["status"] in closed) for k in SOLVERS}
     print("\nsolved: " + ", ".join(f"{k} {tally[k]}/{len(rows)}" for k in SOLVERS))
     (OUT / "binary_results.json").write_text(json.dumps(
         {"rows": [[n, r, c, nz, res] for n, r, c, nz, res in rows], "tally": tally,
