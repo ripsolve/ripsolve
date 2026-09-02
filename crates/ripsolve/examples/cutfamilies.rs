@@ -31,6 +31,24 @@ fn main() {
     }
     println!("root {:.6}", root.objective);
 
+    // Raw, before the violation filter, so a family that generates nothing can be told
+    // apart from one whose cuts are all discarded.
+    let raw = lp.gomory_cuts(&root.basis, 10_000);
+    let violations: Vec<f64> = raw
+        .iter()
+        .map(|(c, lb)| {
+            let activity: f64 = c.iter().map(|&(j, a)| a * root.x[j]).sum();
+            lb - activity
+        })
+        .collect();
+    let worst = violations.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    println!(
+        "gomory raw: {} cuts generated, best violation {:.3e}, {} above 1e-6",
+        raw.len(),
+        worst,
+        violations.iter().filter(|&&v| v > 1e-6).count()
+    );
+
     let conflicts = cuts::Conflicts::of(&problem);
     let families: Vec<(&str, Vec<Cut>)> = vec![
         ("cover", cuts::separate(&problem, &root.x, per_family)),

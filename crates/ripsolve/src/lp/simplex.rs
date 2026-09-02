@@ -1600,7 +1600,27 @@ impl<'a> Solver<'a> {
         // dense, a dense model's cuts are supposed to be dense, and the bound they
         // were worth went with them. The comparison that matters is against the
         // model's own rows.
-        const DENSITY_FACTOR: usize = 3;
+        //
+        // Relative and *generous*. At three times the average row this rejected almost
+        // every cut worth having, and did it silently: on `neos-1516309`, rows of 62
+        // columns in a model of 4500 allowed 186 terms and threw away 77 of the 80 GMI
+        // cuts the root produced, where the three survivors were worth 1300 of bound
+        // between them and the rest another 640. On `n2seq36f` it rejected every cut
+        // the root produced, the largest missing by eight terms out of 647, and the
+        // search then spent a minute against a bound that four thousand later cuts
+        // could not move either.
+        //
+        // Bounded above as well, because the two ends catch different models and
+        // neither bound alone survives both. Relative alone, at any factor loose enough
+        // to help, lets the allowance pass the column count on a model of 39 rows and
+        // 20315 columns, and `irp` stops closing at all. A share of the columns alone
+        // allows a cut seven hundred times denser than anything in a model whose rows
+        // average five columns of fourteen thousand, and `decomp2` goes from closing in
+        // 25 seconds to closing once in three attempts. Twenty-four times the average
+        // row, capped at a third of the columns, closes `neos-1516309` and
+        // `neos-1599274` and keeps both of those.
+        const DENSITY_FACTOR: usize = 24;
+        const DENSITY_SHARE: usize = 3;
         const MIN_SUPPORT: usize = 30;
         const TINY: f64 = 1e-11;
 
@@ -1742,7 +1762,8 @@ impl<'a> Solver<'a> {
                 .map(|&(_, v)| v.abs())
                 .fold(f64::INFINITY, f64::min);
             let average_row = lp.matrix.nnz() / lp.m.max(1);
-            let allowed = MIN_SUPPORT.max(DENSITY_FACTOR * average_row);
+            let allowed =
+                MIN_SUPPORT.max((DENSITY_FACTOR * average_row).min(lp.n_structural / DENSITY_SHARE));
             if largest / smallest > MAX_DYNAMISM || !rhs.is_finite() || coefficients.len() > allowed
             {
                 continue;
