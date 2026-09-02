@@ -1011,6 +1011,11 @@ Seven are genuinely relaxation bound: `air04`, `bley_xl1`, `cod105`, `neos-13245
 120 seconds. Nothing above the LP reaches them, which is the same wall `ex9` and `ex10`
 sit behind.
 
+**Read this with "The rescue that spent the whole run" below.** It was measured with
+`ripsolve relax`, which solves the relaxation and stops. The solver perturbs and tries
+again when the first attempt fails, and did so already when this was written, so what the
+seven are actually blocked on is that second attempt rather than the first.
+
 The other thirteen solve their relaxation quickly and then spend the root on heuristics
 that find nothing:
 
@@ -1205,6 +1210,210 @@ so models that finish theirs pay nothing, and the regression set is unchanged to
 noise across all 23. It converts no instance at a minute. What it does is take
 `neos-1324574` from one node and an incumbent of 36 to nine nodes and an incumbent of 14,
 which is the difference between a search that cannot start and one that can.
+
+### The rescue that spent the whole run, and the correction it forces
+
+"Seven are genuinely relaxation bound" above was measured with `ripsolve relax`, which
+solves the relaxation and nothing else. The solver does not do that. It solves the
+relaxation, and when that fails it perturbs the bounds and tries again, and the second
+attempt was written after the measurement that the seven come from. So the claim has been
+stale ever since, and reading it as "these seven never get a root" is reading a
+measurement of a code path the solver does not take.
+
+What it actually takes, traced on all eight models that need a rescue here:
+
+```text
+air04              first attempt IterationLimit at 24s, perturbed rescue ends at 60.0s
+bley_xl1           ...                                  ends at 60.2s
+cod105                                                  ends at 61.0s
+supportcase4                                            ends at 60.0s
+neos-3226448-wkra                                       ends at 60.0s
+ex9                                                     ends at 60.0s
+ex10                                                    ends at 60.0s
+tanglegram6                                             ends at 60.0s
+```
+
+The rescue is reached on every one of them and is handed the caller's entire remaining
+clock, because it is given the run's deadline and nothing else. Every one of them spends
+it and returns IterationLimit. This is the first lesson of the handoff made one level
+further down: not a share of the time limit this time, but no budget at all, which is the
+same mistake with the share set to one.
+
+The perturbed solve is the same model at the same size as the attempt it is repeating, so
+what that attempt spent is what it is worth spending again, and it is now bounded by
+exactly that. Nothing that works is anywhere near the bound: `neos-1324574` needs five
+iterations after the perturbation and `tanglegram6` 172, against first attempts of tens of
+thousands.
+
+### A second rescue, and why the dual method is safe here and not in general
+
+Bounding the first rescue makes room for a second. Phase 1 is where the primal method gets
+stuck, and the reason is structural rather than tunable: the phase-1 cost vector scores a
+basic variable by whether it currently *violates* a bound, so it is blind to the kink at
+one sitting exactly on one, and no ratio test — short, long or Harris — repairs a column
+choice made that way. The dual method has no phase 1 to be stuck in.
+
+That is why `dual-cold-start` was built, and it is not why it was shelved. It was shelved
+because the two methods end on *different* optimal vertices and everything downstream
+reads the root's vertex rather than its objective: Gomory cuts come off that tableau and
+branching reads its fractional values. Made the default, it reaches the worse vertex on
+most of this set and widens most gaps even where the relaxation improves sharply.
+
+Reached only where the primal method produced no vertex at all, there is nothing for its
+vertex to be worse than. That is the whole of the safety argument, and it is why the entry
+is gated rather than switched: warm starts, which are every node of the search, keep the
+row selection they had, and only a cold entry pays the extra FTRAN per iteration that
+steepest edge row pricing costs.
+
+```text
+                 primal          dual cold
+air04            >130s           1.5s,  3644 iterations
+tanglegram6      >130s           0.5s,   207 iterations
+bley_xl1         >130s           >130s
+cod105           >130s           >130s
+supportcase4     >130s           >130s
+ex9              >130s           >130s
+ex10             >130s           >130s
+neos-3226448     >130s           >130s
+```
+
+Two of eight. In the search `air04` goes from one node to 380 and `tanglegram6` from no
+incumbent to one.
+
+Three details had to come across with it, and each of them was a defect somewhere:
+
+- Steepest edge row selection is most of why it works, and the chosen row's weight has to
+  be read exactly from the pivot row already in hand, `rho . rho`, rather than carried
+  forward through the recurrence: carried, `drayage-100-23` takes 487230 iterations where
+  the exact value takes 2374.
+- A violating row must never be passed over. Scores underflow to zero when a weight is
+  enormous, and a rule accepting only a strict improvement over zero then selects nothing,
+  which is read as primal feasibility and ends the solve at a basis violating by 1.6e5.
+- Primal feasible is the optimum only if the basis is still dual feasible, which the ratio
+  test holds in exact arithmetic and drifts out of in this one. Checked rather than
+  assumed, and where it has lapsed the basis goes to the primal loop instead of being
+  ruled on.
+
+A cold entry also needs its own way out of a degenerate patch. Warm starts here hand the
+node to the primal loop when the dual objective freezes, which is cheaper than Bland's
+rule and right for them. For a cold entry the primal loop is the thing it was reached in
+place of, and handing back means handing back to something stuck: `tanglegram6` finishes
+in 207 pivots when the dual method escalates to Bland's rule instead, and does not finish
+at all when it gives up.
+
+### What this converts, which is nothing, and what that says
+
+No instance is newly closed. The reason is visible in the trace and is the same lesson a
+third time: at a sixty second limit the first attempt is given 40% of the run before
+anything else may be tried, so `air04`'s root is answered at twenty-five seconds and the
+search gets what is left. `ROOT_LP_FIRST_SHARE` is a share of the caller's time limit, and
+the models it hurts are exactly the ones where the primal method is not slow but stuck,
+which is a property of the model and knowable without the clock.
+
+So the next question is not another root method. It is why a method that is going to fail
+is given nearly half the run to fail in, when whether it will fail is decidable from
+whether phase 1 is making progress. The shape that suggests itself is the one that worked
+for probing: a small budget first, escalating only where the small one paid, with the
+primal method warm started across the escalation so it pays nothing for being interrupted.
+
+One thing was gained on the way that is worth keeping either way. Both rescues now cost
+what they are worth rather than what is left, and a model whose rescues are cheap and
+hopeless no longer returns at 41 seconds of a 60 second budget with a third of the run
+unspent.
+
+### A test that could not fail, again
+
+The dual entry is checked by comparing its relaxation values against a reference solver's,
+which is the only reason the branch's two wrong answers were ever found. The obvious way
+to write that check is to skip whatever comes back non-optimal, since a model that cannot
+be parked dual feasibly declines to run at all. That version passes with the dual ratio
+test deliberately inverted. A broken dual method does not return a wrong optimum, it stops
+reaching an optimum, so every model gets skipped and the test reports success — slowly,
+which is the only visible symptom.
+
+Every sample is now required to be either answered or declined, and a declined one to have
+spent no iterations at all, which is what distinguishes "cannot be parked" from "tried and
+failed". With that, the inverted ratio test fails on the first sample.
+
+### The addressable set, re-derived
+
+The breakdown in "Where the binary losses actually are" is from an older build and has
+been quietly wrong for a while: `mitre` has since moved out of it, and the seven called
+relaxation bound were measured through a code path the solver does not take. This is the
+current one, taken by running all 31 at 60 seconds and 16 threads and reading nodes, cuts
+and whether any feasible point was found. The 31 are the instances some open source
+solver closes and this one does not.
+
+```text
+instance                   nodes   cuts  point  gap
+bley_xl1                       1      0  no     
+cod105                         1      0  yes    -
+ex10                           1      0  no     
+ex9                            1      0  no     
+neos-3226448-wkra              1      0  no     
+neos-780889                    1      0  no     
+supportcase4                   1      0  no     
+neos-1324574                   2      0  yes    67.8571
+neos-5129192-manaia            2      0  no     
+neos-633273                    2    109  no     
+neos-953928                    2      0  yes    104.3261
+neos-957143                    2    128  yes    68.9214
+neos-960392                    2     27  yes    238000000000000.6250
+tanglegram6                    2      0  yes    100.0000
+acc-tight4                    12    128  no     
+acc-tight5                    52    192  no     
+neos-787933                  117    192  yes    89.1029
+neos18                       134    190  yes    60.1449
+ab71-20-100                  135    246  yes    579.2901
+graph20-20-1rand             290      0  no     
+air04                        364      0  no     
+mine-166-5                   877      0  yes    35.5003
+air05                       1064     48  no     
+nw04                        1574     80  yes    0.3992
+chromaticindex32-8          7653      0  yes    25.0000
+neos-3045796-mogo           7819   2688  no     
+neos-820879                 8720      4  no     
+irp                        16058    340  yes    -
+neos-1599274               33419    432  yes    3.8533
+n2seq36f                  158581    978  yes    0.3831
+neos-1516309              468406      7  yes    1.4254
+```
+
+Three groups, and they want opposite work.
+
+**Fourteen stop at one or two nodes.** Eleven of them add no cuts at all, which is the
+tell that the root relaxation never finished: the cut loop breaks the moment the root LP
+is not optimal. Those eleven are the group the two root rescues above are aimed at, and
+the rescues answer two of them. Three more — `neos-633273`, `neos-957143`,
+`neos-960392` — do finish their relaxation and separate cuts, and then stop anyway, so
+they belong with the group below rather than here.
+
+**Seven search and find nothing:** `acc-tight4`, `acc-tight5`, `graph20-20-1rand`,
+`air04`, `air05`, `neos-3045796-mogo`, `neos-820879`, from twelve nodes to 8720. These
+are the genuine feasibility failures, where rounding, diving, the pump, fixing with
+propagation and the LP-free jump all run and all come back empty.
+
+**Ten search, hold a point, and lose on the bound.** Four of them are close enough that
+the bound is the only thing between them and a proof:
+
+```text
+n2seq36f          0.38%   158581 nodes    HiGHS closes it in 3.6s
+nw04              0.40%     1574 nodes    CBC closes it in 15.4s
+neos-1516309      1.43%   468406 nodes    HiGHS closes it in 0.3s
+neos-1599274      3.85%    33419 nodes    HiGHS closes it in 0.6s
+```
+
+`irp` is a fifth, and it is not really in this set: it closes about half the time at 57
+to 60 seconds, so the headline figure reads 26 or 27 depending on it. Anything measured
+against that figure has to say which.
+
+That is where the next work belongs, and it is not where the last three sessions have
+been looking. The 31 divide 14 / 7 / 10, and the ten holding a point and losing on the
+bound are the only group with instances within a percent of closing. Reduced cost fixing
+is the obvious untried thing for them and does not exist here: with an incumbent and the
+root's duals in hand, a nonbasic binary whose reduced cost exceeds the remaining gap
+cannot move in any better solution and can be fixed for good. At a gap of 0.4% that is
+most of the model. Nothing in this solver reads a reduced cost outside the simplex.
 
 ### Scaling, which does not answer this
 

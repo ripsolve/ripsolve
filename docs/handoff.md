@@ -8,31 +8,47 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads, one consistent run:
 
 ```text
-ripsolve     27        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve  26 or 27     HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Started the session at 26. The one gained is `mitre`, at 18.1 seconds, from presolve
-probing; nothing was lost. Four instances came back one to five seconds slower and two
-came back one to four seconds faster, all of them multi-second parallel solves, which is
-the sixteen-thread spread this file already warns about and not a change in the solver:
-the probing every one of them pays for was measured separately and is under a fifth of a
-second on each.
+Started the session at 26. The one gained is `mitre`, at about 18 seconds, from presolve
+probing.
+
+**The figure is 26 or 27 because `irp` is a coin flip.** It closes in 57 to 60 seconds
+against a 60 second limit, so it lands on either side of the line: three consecutive runs
+of one build gave optimal, TimeLimit, TimeLimit. Two full benchmark runs of this session's
+work came back 27 and then 26, differing in `irp` and nothing else, and the code that
+changed between them provably never executes on it. Say which side of the flip a figure
+came from, or the next session will chase a regression that is not there. This is the same
+trap `nw04` set last session.
 
 **The set that matters is 31, not 113.** Of the instances this solver misses, most are
 missed by every open source solver too. The 31 that some open source solver closes and
 this one does not are the whole of the gap.
 
-## What the comparison says to build
+## Where the 31 are, measured rather than inherited
 
-Taken from a reference solver's own logs across all 31, not from first principles.
+Re-derived this session by running all 31 and reading nodes, cuts and whether any feasible
+point was found; the full table is in `design-notes.md` under "The addressable set,
+re-derived". The breakdown the last three sessions worked from was stale in two ways, so
+do not inherit this one either without checking it.
 
-| what | reach | state |
+| group | how many | what they need |
 |---|---|---|
-| presolve | 12 of 31 lose >20% of columns | **done, and it converted one of them.** See below |
-| root relaxation | 7 of 31 never finish it; 20 reach only 1-3 nodes | **the blocker now** |
-| sub-MIP | fires on 21 of 31 | blocked: every construction needs a relaxation, and the instances that need it have none |
-| restarts | 9 of 31 | not built |
-| symmetry | 6 of 31 | not built |
+| stop at 1-2 nodes, no cuts separated | 11 | the root relaxation, which never finishes |
+| search and never find a point | 7 | feasibility |
+| hold a point and lose on the bound | 10 | the bound, and **four are within 4%** |
+| finish their root, separate cuts, still stop at 2 nodes | 3 | not yet understood |
+
+The last two rows are where the cheap conversions are and are not where the last three
+sessions have been looking:
+
+```text
+n2seq36f          0.38%   158581 nodes    HiGHS closes it in 3.6s
+nw04              0.40%     1574 nodes    CBC closes it in 15.4s
+neos-1516309      1.43%   468406 nodes    HiGHS closes it in 0.3s
+neos-1599274      3.85%    33419 nodes    HiGHS closes it in 0.6s
+```
 
 ## Presolve is finished, and it was not the lever it looked like
 
@@ -51,31 +67,49 @@ So the twelve instances that lose a fifth of their columns are not twelve conver
 waiting on presolve. They are waiting on the same thing the twenty root bound instances
 are waiting on, and that is where the next work goes.
 
-## Next: the root relaxation, through the dual method as a fallback
+## The root relaxation was attacked this session and is answered as far as it goes
 
-The largest identified group, and the one the last three sessions have kept arriving at
-from different directions. `dual-cold-start` is kept unmerged because the dual method
-reaches a *different* optimal vertex and the search downstream reads that vertex —
-Gomory cuts come off its tableau, branching reads its fractional values — so on this set
-most gaps widened even though four relaxations improved sharply.
+Two defects and one capability, none of which converted anything, all of which are in.
 
-That objection applies only where the primal method reaches a vertex at all. On the seven
-where it returns nothing, there is no vertex to be worse than. The shape to try is a
-second rescue beside `perturbed_root`, which already sits at exactly that point in
-`search.rs` and already rescued `neos-1324574` and `tanglegram6` this way: when the
-primal has not finished the root, re-enter cold through the dual method rather than
-returning nothing. By construction it cannot reach the instances the branch regressed.
+The rescue that already existed for a stalled root was given the caller's entire
+remaining clock, so on all eight models that need it, it spent the whole run and returned
+nothing — and nothing after it could ever run. It is now bounded by what the attempt it
+repeats spent. A second rescue, the dual method entered cold, was taken from
+`dual-cold-start` and gated so warm starts keep the row selection they had. `air04`'s
+relaxation goes from not finishing in 130 seconds to 1.5, `tanglegram6`'s to 0.5, and in
+the search `air04` goes from one node to 380 and `tanglegram6` from no incumbent to one.
+Five of the seven still do not finish either way.
 
-Cheap first step before building anything: check out `dual-cold-start`, build, and run
-`ripsolve relax` on `air04`, `bley_xl1`, `cod105`, `neos-3226448-wkra`, `supportcase4`,
-`ex9` and `ex10`. If those relaxations finish there and do not on main, the fallback is
-worth the work; if they do not, this whole line is answered and the notes should say so.
+Nothing closes, and the reason is worth carrying forward: at a 60 second limit the first
+attempt is given 40% of the run before anything else may be tried, so `air04`'s root is
+answered at 25 seconds. But do not go straight at `ROOT_LP_FIRST_SHARE`. `air04` needs
+well over 60 seconds even from a free root — the branch reached a 0.62% gap only at 120
+seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
+where the next conversion is.
 
-Two things to carry into that work if it happens. The dual entry needs gating so that
-warm starts — every node of the search — keep the row selection they have now; the
-branch changes them too, and that is a second variable in a measurement that already has
-enough. And the branch's steepest edge row selection is most of why its cold starts work
-(`drayage-100-23`, 487230 iterations to 2374), so it has to come along.
+## Next: reduced cost fixing, for the ten that lose on the bound
+
+The only group with instances within a percent of closing, and the obvious untried thing
+for them. With an incumbent and the root's duals in hand, a nonbasic binary whose reduced
+cost exceeds the remaining gap cannot take its other value in any better solution and can
+be fixed for good. At `nw04`'s 0.4% that is most of the model.
+
+Nothing here reads a reduced cost outside the simplex: `LpSolution` carries the status,
+the objective, the primal values and the basis, and no duals. Exposing them is the first
+step and is small — the solver already computes `y` by BTRAN of the basic costs every
+iteration and has `Solver::reduced_cost`.
+
+Two things to get right, both of which decide whether it is sound:
+
+- It is only valid against a *proven* bound and a *feasible* incumbent, so it belongs
+  after the root LP has actually reached Optimal, not after whatever the rescues left.
+- The obvious place to apply it is the root, and at the root there is usually no
+  incumbent yet: on this set the incumbent arrives during the search. So the version
+  worth building re-runs it when the incumbent improves, not once at the start.
+
+Measure it on the ten first — `ripsolve solve` on each at 60s and 16 threads — before
+spending two hours on a full benchmark run. A full run is the confirmation, not the
+experiment.
 
 ## Parked, with the evidence for each in design-notes.md
 
@@ -111,8 +145,10 @@ enough. And the branch's steepest edge row selection is most of why its cold sta
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-02.json`. Diff against that rather than against a
-  remembered number, and copy the current one aside before a run that might matter.
+  `docs/baselines/binary-2026-09-02b.json`, with the run before the root work kept as
+  `binary-2026-09-02.json` and the one before probing as `binary-2026-09-01.json`. Diff
+  against those rather than against a remembered number, and copy the current one aside
+  before a run that might matter.
 - `cargo run --release --example probecost -- <models>` times presolve with and without
   probing on the same model and reports both reductions. Use it in preference to a solve
   for anything about presolve: it is seconds rather than an hour, and it has no search
