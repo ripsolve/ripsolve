@@ -64,8 +64,10 @@ not followed up.
 ## Measuring here without being misled
 
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
-  drops this solver's cached rows only. **`bench/out/binary_results.json` is untracked**:
-  copy it before a run that might overwrite a baseline worth keeping.
+  drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
+  over it, so the run behind the figures above is kept as
+  `docs/baselines/binary-2026-09-01.json`. Diff against that rather than against a
+  remembered number, and copy the current one aside before a run that might matter.
 - Never run two measurements at once. A benchmark and an A/B on the same machine
   corrupt each other, and the tell is an instance that suddenly cannot solve something
   it solves in isolation.
