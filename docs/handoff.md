@@ -29,6 +29,39 @@ earns them, and `neos-1516309` and `neos-1599274` from the Gomory density filter
 Five of the 30 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
 `nw04` and `neos-4754521-awarau`.
 
+## Speed, on the instances both solvers close
+
+Worth knowing before optimising anything, and it is not one number. Measured over the 25
+instances this solver and HiGHS both close, with this solver's time net of MPS parsing,
+since the benchmark times HiGHS around `run()` with reading outside the timer and this
+solver as a whole subprocess:
+
+```text
+                      ripsolve   HiGHS
+shifted geomean (10)      4.37    1.92
+shifted geomean (1)       1.91    1.17
+median ratio              0.94x
+faster on                14 of 25
+```
+
+**The median instance is a dead heat and the distribution is bimodal.** This solver is
+two to ten times *faster* on the easy end -- `app2-1` 0.29s against 3.10, `p0201` 0.20
+against 1.20, `neos-3437289-erdre` 0.09 against 1.10 -- and far behind on a handful of
+hard ones, which is what drags the geometric mean to 1.28x and the shifted mean to 2.3x:
+
+```text
+acc-tight2        37.4s vs 0.1     250x
+neos-1599274      22.8  vs 0.6      35x
+mitre             29.0  vs 1.4      20x
+neos-913984       35.9  vs 4.3       8x
+```
+
+So per-node overhead is not the problem and is not where to look. The gap is entirely in
+the heavy machinery, which is the same conclusion the missing-instance analysis reaches
+from the other direction. `acc-tight2` is the one worth a look on its own account:
+HiGHS closes it in a tenth of a second where this solver needs 37 and two nodes, which
+smells like a reduction rather than a search.
+
 **The set that matters is 31, not 113.** Of the instances this solver misses, most are
 missed by every open source solver too. The 31 that some open source solver closes and
 this one does not are the whole of the gap.
