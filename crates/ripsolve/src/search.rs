@@ -429,10 +429,16 @@ struct Worker<'a> {
     options: Options,
     iterations: usize,
     dives: Schedule,
+    /// Bounds the root's reduced costs imply once the incumbent is good enough, and how
+    /// many of them the last incumbent this worker saw had earned. Recomputed when that
+    /// incumbent moves, which is rarely, rather than per node.
+    lurking: &'a Lurking,
+    in_force: usize,
+    priced_at: f64,
 }
 
 impl<'a> Worker<'a> {
-    fn new(problem: &'a Problem, lp: Lp, options: Options) -> Self {
+    fn new(problem: &'a Problem, lp: Lp, options: Options, lurking: &'a Lurking) -> Self {
         let n = problem.n_cols();
         Self {
             problem,
@@ -442,6 +448,9 @@ impl<'a> Worker<'a> {
             options,
             iterations: 0,
             dives: Schedule::new(options.heuristic_frequency),
+            lurking,
+            in_force: 0,
+            priced_at: f64::INFINITY,
         }
     }
 
@@ -514,7 +523,25 @@ impl<'a> Worker<'a> {
             self.lp
                 .set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
         }
+        // Then whatever the incumbent has earned since the root, which is a statement
+        // about the whole tree and so belongs before this node's own branching.
+        if !self.lurking.is_empty() && incumbent != self.priced_at {
+            self.in_force = self.lurking.in_force(incumbent);
+            self.priced_at = incumbent;
+        }
+        for entry in &self.lurking.entries[..self.in_force] {
+            self.lp
+                .set_column_bounds(entry.column as usize, entry.lo, entry.hi);
+        }
+        // The branch last, and intersected rather than assigned: a branch that asks for
+        // a value the incumbent has already ruled out leaves an empty range, and an
+        // empty range is a node with nothing in it rather than a bound to be honoured.
         for &(j, lo, hi) in &node.fixings {
+            let (held_lo, held_hi) = self.lp.column_bounds(j as usize);
+            let (lo, hi) = (lo.max(held_lo), hi.min(held_hi));
+            if lo > hi {
+                return out;
+            }
             self.lp.set_column_bounds(j as usize, lo, hi);
         }
 
@@ -823,6 +850,7 @@ fn run_parallel(
     incumbent: f64,
     incumbent_x: Option<Vec<f64>>,
     threads: usize,
+    lurking: &Lurking,
 ) -> TreeResult {
     let shared = Shared {
         pool: Mutex::new(SharedPool {
@@ -846,7 +874,7 @@ fn run_parallel(
             // bounds, and its own branching history. Sharing the pseudocosts would
             // pool more evidence but put a lock on the hot path; per-worker history
             // is the cheaper trade at these thread counts.
-            let mut worker = Worker::new(problem, lp.clone(), options);
+            let mut worker = Worker::new(problem, lp.clone(), options, lurking);
             let shared = &shared;
             scope.spawn(move || {
                 while let Some(node) = shared.take() {
@@ -1516,6 +1544,31 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         .flatten();
     let problem = tightened.as_ref().unwrap_or(problem);
 
+    // The same reasoning carried forward. The one pass above spends the incumbent the
+    // root heuristics happened to find, which on this set is far weaker than the one the
+    // search ends with -- `n2seq36f` is at a 39.7% gap here and 0.38% at the end -- so
+    // most of what these reduced costs prove is not provable yet. Working out in advance
+    // what each of them will prove, and at which incumbent, costs one pass and lets the
+    // search collect the rest as it earns it.
+    let lurking = if options.fix_by_reduced_cost && root.status == LpStatus::Optimal {
+        lp.reduced_costs(&root.basis)
+            .map(|costs| {
+                Lurking::build(
+                    problem,
+                    &costs,
+                    root.objective,
+                    options.integrality_tolerance,
+                )
+            })
+            .unwrap_or(Lurking {
+                entries: Vec::new(),
+            })
+    } else {
+        Lurking {
+            entries: Vec::new(),
+        }
+    };
+
     let mut status = Status::Optimal;
 
     let threads = options.threads.max(1);
@@ -1529,6 +1582,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             incumbent,
             incumbent_x,
             threads,
+            &lurking,
         );
         nodes += result.nodes;
         iterations += result.iterations;
@@ -1562,7 +1616,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         };
     }
 
-    let mut worker = Worker::new(problem, lp, options);
+    let mut worker = Worker::new(problem, lp, options, &lurking);
 
     while let Some(node) = open.pop() {
         if nodes >= options.max_nodes {
@@ -1746,6 +1800,108 @@ fn perturbed_root(
     let mut cleaned = cleaned;
     cleaned.iterations += solved.iterations;
     (cleaned.status == LpStatus::Optimal).then_some(cleaned)
+}
+
+/// A bound the root's reduced costs will imply, once the incumbent is good enough.
+///
+/// Everything reduced cost fixing needs is fixed at the root except one number. The
+/// reduced costs come from the root basis and do not change; the root's value does not
+/// change; only the room `u - root` shrinks as the search finds better points. So the
+/// bound a column will eventually take, and the incumbent at which it takes it, can both
+/// be worked out once and read off later.
+///
+/// Which is what makes this affordable in a parallel search. Re-deriving the fixing
+/// whenever the incumbent improved would mean narrowing a model that every worker holds
+/// immutably; a table computed once and read against whatever incumbent a worker
+/// currently sees needs no coordination at all, and a worker that is behind on the
+/// incumbent simply applies fewer of them.
+struct Lurking {
+    /// Sorted by `threshold` descending, so the entries in force are always a prefix.
+    /// Later entries for the same column are the tighter ones, since a tighter bound
+    /// needs a better incumbent, so applying a prefix in order leaves each column on
+    /// the best bound it has earned.
+    entries: Vec<LurkingBound>,
+}
+
+struct LurkingBound {
+    /// The incumbent at or below which this bound holds.
+    threshold: f64,
+    column: u32,
+    lo: f64,
+    hi: f64,
+}
+
+/// Lurking bounds recorded per column for a general integer.
+///
+/// A binary needs one: the only bound worth recording is the one that fixes it. A column
+/// with a wide range could have one per value it might be narrowed to, which is a table
+/// the size of the model's total range, so it is sampled instead.
+const LURKING_STEPS: usize = 8;
+
+impl Lurking {
+    /// Work out, for every nonbasic column, what the root's reduced cost will prove
+    /// about it and when.
+    ///
+    /// A column parked at its lower bound with reduced cost `d > 0` can be capped at
+    /// `lo + k` once travelling `k + 1` would pass the incumbent, which is
+    /// `u < root + d (k + 1)`. Recording that for each reachable `k` costs nothing now
+    /// and saves re-deriving it from a factorization later.
+    fn build(problem: &Problem, costs: &[Option<(f64, bool)>], root: f64, tolerance: f64) -> Self {
+        let mut entries: Vec<LurkingBound> = Vec::new();
+        for (j, entry) in costs.iter().enumerate() {
+            let Some((d, at_upper)) = *entry else {
+                continue;
+            };
+            let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+            if lo >= hi || !lo.is_finite() || !hi.is_finite() || !problem.is_integer(j) {
+                continue;
+            }
+            let reach = d.abs();
+            if reach <= tolerance {
+                continue;
+            }
+            // The range is sampled rather than enumerated when it is wide, which for a
+            // binary is one step and the whole story.
+            let span = (hi - lo).round().max(1.0);
+            let step = (span / LURKING_STEPS as f64).ceil().max(1.0);
+            let mut travel = 0.0f64;
+            while travel < span {
+                // Slightly inside what the arithmetic proves, so that a threshold met
+                // by a hair does not fix a column. Every margin here is on the side
+                // that fixes later.
+                let threshold = (travel + 1.0).mul_add(reach, root) - tolerance * reach;
+                if at_upper {
+                    entries.push(LurkingBound {
+                        threshold,
+                        column: j as u32,
+                        lo: hi - travel,
+                        hi,
+                    });
+                } else {
+                    entries.push(LurkingBound {
+                        threshold,
+                        column: j as u32,
+                        lo,
+                        hi: lo + travel,
+                    });
+                }
+                travel += step;
+            }
+        }
+        entries.sort_by(|a, b| b.threshold.total_cmp(&a.threshold));
+        Self { entries }
+    }
+
+    /// How many entries are in force at this incumbent. They are the leading ones,
+    /// because the table is ordered by the incumbent each entry needs.
+    fn in_force(&self, incumbent: f64) -> usize {
+        self.entries
+            .partition_point(|entry| entry.threshold >= incumbent)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Narrow the columns the root's bound and the incumbent together already decide.
