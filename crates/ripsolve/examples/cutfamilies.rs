@@ -1,0 +1,73 @@
+//! Which cut family moves the bound, and by how much, on one model.
+//!
+//! The root cut loop reports one number: cuts added, and the bound before and after.
+//! On `n2seq36f` that reads "1019 added, 52000 -> 52000", which says the loop is not
+//! working and not which half of it. This runs each family on its own against the same
+//! relaxation, adds what it finds, and re-solves, so the answer is per family and the
+//! families cannot hide behind one another.
+use ripsolve::Problem;
+use ripsolve::cuts::{self, Cut};
+use ripsolve::lp::{Lp, LpStatus};
+
+fn re_solve(base: &Problem, cuts: &[Cut]) -> Option<f64> {
+    let mut with = base.clone();
+    with.add_cuts(cuts);
+    let solved = Lp::relaxation(&with).solve_with_limit(1_000_000);
+    (solved.status == LpStatus::Optimal).then_some(solved.objective)
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let path = args.next().expect("model path");
+    let per_family: usize = args.next().map_or(200, |v| v.parse().unwrap());
+    let mut problem = Problem::from_file(std::path::Path::new(&path)).unwrap();
+    ripsolve::presolve::presolve(&mut problem, 20);
+
+    let mut lp = Lp::relaxation(&problem);
+    let root = lp.solve_with_limit(1_000_000);
+    if root.status != LpStatus::Optimal {
+        println!("root relaxation did not finish");
+        return;
+    }
+    println!("root {:.6}", root.objective);
+
+    let conflicts = cuts::Conflicts::of(&problem);
+    let families: Vec<(&str, Vec<Cut>)> = vec![
+        ("cover", cuts::separate(&problem, &root.x, per_family)),
+        ("mir", cuts::separate_mir(&problem, &root.x, per_family)),
+        (
+            "clique",
+            cuts::separate_cliques(&problem, &conflicts, &root.x, per_family),
+        ),
+        (
+            "gomory",
+            cuts::separate_gomory(&lp, &root.basis, &root.x, per_family),
+        ),
+    ];
+
+    let mut all: Vec<Cut> = Vec::new();
+    for (name, found) in &families {
+        let worst = found
+            .iter()
+            .map(|c| c.violation(&root.x))
+            .fold(0.0f64, f64::max);
+        let after = re_solve(&problem, found);
+        println!(
+            "{name:<8} {:>4} cuts, worst violation {worst:.6}, bound {}",
+            found.len(),
+            match after {
+                Some(v) => format!("{v:.6}"),
+                None => "did not solve".to_string(),
+            }
+        );
+        all.extend(found.iter().cloned());
+    }
+    println!(
+        "all      {:>4} cuts, bound {}",
+        all.len(),
+        match re_solve(&problem, &all) {
+            Some(v) => format!("{v:.6}"),
+            None => "did not solve".to_string(),
+        }
+    );
+}

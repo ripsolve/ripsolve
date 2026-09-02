@@ -8,25 +8,20 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve  26 + 2 flips     HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     28        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-**Do not quote a single run's count.** Two instances sit on the sixty second line, so the
-headline reads 26, 27 or 28 depending on where they land, and one benchmark run cannot
-tell a real gain of one from noise of one. Quote the set that closes every time, with the
-flips named beside it. Measured over five consecutive runs each:
+All 28 close on every run, with no instance left sitting on the sixty second line. That
+matters, because for most of this session two of them were: quote the set that closes
+every time rather than one run's count, and check a new one against repeated runs before
+believing it. `nw04` now closes five times in five at 31 to 33 seconds and `irp` five in
+five at 34 to 47.
 
-```text
-closes every run        26
-nw04                     4 runs in 5, 32 to 38s
-irp                      2 runs in 5, 46 to 56s
-```
+Against the start of the session, **25 every run, with `nw04` never closing in any run of
+any version and `irp` a coin flip**. So the three gained are `mitre`, `nw04` and `irp`.
 
-Against the same figures at the start of the session: **25 every run, `nw04` never, `irp`
-a coin flip.** So the session gained `mitre` outright and turned `nw04` from an instance
-that had never closed in any run of any version into one that closes four times in five.
-The full benchmark run that produced the current standing shows neither, because it caught
-both flips on the wrong side; it is kept as `docs/baselines/binary-2026-09-02c.json`.
+Five of the 28 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
+`nw04` and `neos-4754521-awarau`.
 
 **The set that matters is 31, not 113.** Of the instances this solver misses, most are
 missed by every open source solver too. The 31 that some open source solver closes and
@@ -207,10 +202,11 @@ pump, fixing with propagation and the LP-free jump all running and all returning
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-02c.json`, with the run before reduced cost fixing kept
-  as `binary-2026-09-02b.json`, the one before the root work as `binary-2026-09-02.json`
-  and the one before probing as `binary-2026-09-01.json`. Diff against those rather than
-  against a remembered number, and copy the current one aside before a run that matters.
+  `docs/baselines/binary-2026-09-03.json`, with the run before this round's reduced cost
+  work kept as `binary-2026-09-02c.json`, the one before the root work as
+  `binary-2026-09-02.json` and the one before probing as `binary-2026-09-01.json`. Diff
+  against those rather than against a remembered number, and copy the current one aside
+  before a run that matters.
 - `cargo run --release --example probecost -- <models>` times presolve with and without
   probing on the same model and reports both reductions. Use it in preference to a solve
   for anything about presolve: it is seconds rather than an hour, and it has no search
@@ -219,5 +215,9 @@ pump, fixing with propagation and the LP-free jump all running and all returning
   each other, and the tell is an instance that suddenly cannot solve something it solves
   in isolation. A full 140 instance run takes around two hours, so plan what goes into it
   before starting one.
+- `pb-fit2d` runs for 322 seconds against a sixty second limit, and has in every run
+  recorded here, so it is a standing defect rather than a suspended laptop. Something
+  below the search does not check the clock on that model. Nothing else in the set
+  overruns by more than a few seconds.
 - A suspended laptop writes impossible wall times into the cache. Entries above the time
   limit by a wide margin are that, and should be dropped and re-measured.

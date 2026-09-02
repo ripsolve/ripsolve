@@ -1747,11 +1747,15 @@ only in the direction that fixes less.
 ```text
 n2seq36f     5910 of 6642 lurking bounds in force by the end, 158581 nodes a minute -> 314790
 neos-1599274  500 of 1950
-nw04         closes in 31s against 32 to 38
-irp          closes in 30s against 46 to 56
+nw04         five closes in five at 31 to 33s, against four in five at 32 to 38
+irp          five closes in five at 34 to 47s, against two in five at 46 to 56
 ```
 
-Nothing new closes, and `n2seq36f` shows why in one line: **its bound never leaves 52000,
+`nw04` and `irp` were both coin flips against the sixty second limit and are neither any
+more, which is worth two instances on the standing and is the first time this file has
+been able to say a headline figure is not sitting on a boundary.
+
+Nothing that was far from closing closes, and `n2seq36f` shows why in one line: **its bound never leaves 52000,
 the root's own value, however many columns are fixed underneath it.** Fixing columns makes
 the tree cheaper to walk. It does not make the bound move.
 
