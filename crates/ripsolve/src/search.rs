@@ -435,6 +435,9 @@ struct Worker<'a> {
     lurking: &'a Lurking,
     in_force: usize,
     priced_at: f64,
+    /// The spacing of the objective values this model can take; see
+    /// [`objective_granularity`].
+    granularity: Option<f64>,
 }
 
 impl<'a> Worker<'a> {
@@ -451,6 +454,7 @@ impl<'a> Worker<'a> {
             lurking,
             in_force: 0,
             priced_at: f64::INFINITY,
+            granularity: objective_granularity(problem),
         }
     }
 
@@ -526,7 +530,11 @@ impl<'a> Worker<'a> {
         // Then whatever the incumbent has earned since the root, which is a statement
         // about the whole tree and so belongs before this node's own branching.
         if !self.lurking.is_empty() && incumbent != self.priced_at {
-            self.in_force = self.lurking.in_force(incumbent);
+            let cutoff = match self.granularity {
+                Some(g) => lift_to_granularity(incumbent, self.granularity) - g,
+                None => incumbent,
+            };
+            self.in_force = self.lurking.in_force(cutoff);
             self.priced_at = incumbent;
         }
         for entry in &self.lurking.entries[..self.in_force] {
@@ -572,7 +580,11 @@ impl<'a> Worker<'a> {
             LpStatus::Optimal => {}
         }
 
-        if !improves(solved.objective, incumbent, options.gap_tolerance) {
+        // Lifted to the next objective the model can take before it is compared with
+        // anything. A relaxation worth 52000.3 on a model whose objectives step by 200
+        // is a proof that nothing here beats 52200.
+        let relaxed = lift_to_granularity(solved.objective, self.granularity);
+        if !improves(relaxed, incumbent, options.gap_tolerance) {
             return out;
         }
         // Kept only when an improvement search might use it, since it is a copy of the
@@ -584,13 +596,13 @@ impl<'a> Worker<'a> {
 
         // Cuts derived from this node's own relaxation, if it is one of the nodes
         // chosen for it. Only the bound escapes; see `separate_locally`.
-        let mut bound = solved.objective;
+        let mut bound = relaxed;
         if options.local_cut_frequency > 0
             && index.is_multiple_of(options.local_cut_frequency)
             && integral_solution(problem, &solved.x, options.integrality_tolerance).is_none()
             && let Some(tightened) = self.separate_locally(&solved, &options, cutoff)
         {
-            bound = tightened;
+            bound = lift_to_granularity(tightened, self.granularity);
             if !improves(bound, incumbent, options.gap_tolerance) {
                 return out;
             }
@@ -1376,7 +1388,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         };
     }
 
-    let first_bound = root.objective;
+    let first_bound = lift_to_granularity(root.objective, objective_granularity(problem));
 
     // Cutting gets a share of the run rather than the run. Each round re-solves the
     // whole model, so on a large one the loop can spend everything it is given: on
@@ -1400,7 +1412,8 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let with_cuts_model = cut.model;
     let problem = with_cuts_model.as_ref().unwrap_or(problem);
 
-    let root_bound = root.objective;
+    let granularity = objective_granularity(problem);
+    let root_bound = lift_to_granularity(root.objective, granularity);
     let mut open = OpenNodes::new(options.plunge_limit);
     open.push(Node {
         fixings: Vec::new(),
@@ -1514,7 +1527,6 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             incumbent_x = Some(found.x);
             heuristic_solutions += 1;
         }
-
     }
 
     // Consider the root itself first, so an integral relaxation is picked up without
@@ -1537,11 +1549,19 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     //
     // The bounds go into the model rather than into a node, because every node rebuilds
     // its bounds from the model before solving; one pass here reaches all of them.
-    let tightened = (options.fix_by_reduced_cost
-        && root.status == LpStatus::Optimal
-        && incumbent.is_finite())
-        .then(|| fix_by_reduced_cost(problem, &lp, &root, incumbent, &options))
-        .flatten();
+    // What a *better* solution has to reach, which on a model whose objectives step by
+    // 200 is 200 below the incumbent rather than a whisker below it. That is the whole
+    // of the room reduced cost fixing has to work in, so a step's worth of it matters:
+    // on `n2seq36f` the room goes from 200 to nothing at all, and a room of nothing
+    // pins every column the relaxation left on a bound.
+    let cutoff = |incumbent: f64| match granularity {
+        Some(g) => lift_to_granularity(incumbent, granularity) - g,
+        None => incumbent,
+    };
+    let tightened =
+        (options.fix_by_reduced_cost && root.status == LpStatus::Optimal && incumbent.is_finite())
+            .then(|| fix_by_reduced_cost(problem, &lp, &root, cutoff(incumbent), &options))
+            .flatten();
     let problem = tightened.as_ref().unwrap_or(problem);
 
     // The same reasoning carried forward. The one pass above spends the incumbent the
@@ -1802,6 +1822,78 @@ fn perturbed_root(
     (cleaned.status == LpStatus::Optimal).then_some(cleaned)
 }
 
+/// The spacing of the objective values this model can actually take.
+///
+/// When every column carrying an objective coefficient is an integer column, and every
+/// one of those coefficients is a whole multiple of `g`, no feasible point scores
+/// anything but a multiple of `g`. A relaxation bound of 52000.3 is then really a bound
+/// of 52200, and a node whose relaxation lands a hair above 52200 is not a node whose
+/// subtree might hold 52200.1, it is a node whose subtree holds nothing better than
+/// 52400.
+///
+/// `n2seq36f` is the case that makes the point: every objective coefficient is a
+/// multiple of 200, its relaxation is worth exactly 52000 and its optimum is 52200, one
+/// step apart. Four thousand cuts do not move that bound and do not need to.
+///
+/// Returns `None` where the reasoning does not apply, which is a fractional coefficient
+/// or one on a column free to take fractional values.
+fn objective_granularity(problem: &Problem) -> Option<f64> {
+    // Below this a coefficient is read as zero rather than as a very fine spacing, and
+    // above it a whole multiple has to look like one.
+    const WHOLE: f64 = 1e-9;
+    let mut granularity: u64 = 0;
+    for j in 0..problem.n_cols() {
+        let c = problem.obj[j];
+        if c.abs() <= WHOLE {
+            continue;
+        }
+        // A continuous column moves the objective continuously, whatever its
+        // coefficient, unless the model has already pinned it.
+        if !problem.is_integer(j) && problem.col_lb[j] < problem.col_ub[j] {
+            return None;
+        }
+        let rounded = c.round();
+        if (c - rounded).abs() > WHOLE * c.abs().max(1.0) {
+            return None;
+        }
+        let magnitude = rounded.abs();
+        // Beyond this the coefficient no longer converts to an integer exactly, and a
+        // greatest common divisor of approximations is not a granularity.
+        if magnitude > 2.0f64.powi(53) {
+            return None;
+        }
+        granularity = gcd(granularity, magnitude as u64);
+        // No early exit once the divisor reaches one, tempting as it is. Whether this
+        // reasoning applies at all is decided by *every* column, and returning as soon
+        // as the spacing stops improving skips the ones not yet looked at. A fuzz
+        // instance whose first two integer coefficients were 8 and 3 returned a spacing
+        // of one before reaching the continuous column with a coefficient of 6.5, and
+        // the search then proved an optimum of 34.375 where the answer is 34.25.
+    }
+    (granularity > 0).then_some(granularity as f64)
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Lift a bound to the next objective value the model can actually take.
+///
+/// Sound because every feasible point of every subtree scores a multiple of `g`, so the
+/// least multiple at or above a valid bound is also a valid bound. The tolerance is
+/// what keeps it sound in floating point: a bound sitting a whisker above a multiple
+/// because of rounding must round *to* that multiple and not past it, which would claim
+/// a whole step more than was proven.
+fn lift_to_granularity(bound: f64, granularity: Option<f64>) -> f64 {
+    let Some(g) = granularity else { return bound };
+    if !bound.is_finite() {
+        return bound;
+    }
+    let steps = bound / g;
+    let tolerance = 1e-9 * steps.abs().max(1.0);
+    (steps - tolerance).ceil() * g
+}
+
 /// A bound the root's reduced costs will imply, once the incumbent is good enough.
 ///
 /// Everything reduced cost fixing needs is fixed at the root except one number. The
@@ -1892,11 +1984,11 @@ impl Lurking {
         Self { entries }
     }
 
-    /// How many entries are in force at this incumbent. They are the leading ones,
-    /// because the table is ordered by the incumbent each entry needs.
-    fn in_force(&self, incumbent: f64) -> usize {
+    /// How many entries are in force at this cutoff. They are the leading ones, because
+    /// the table is ordered by the cutoff each entry needs.
+    fn in_force(&self, cutoff: f64) -> usize {
         self.entries
-            .partition_point(|entry| entry.threshold >= incumbent)
+            .partition_point(|entry| entry.threshold >= cutoff)
     }
 
     fn is_empty(&self) -> bool {
@@ -1919,7 +2011,7 @@ fn fix_by_reduced_cost(
     problem: &Problem,
     lp: &Lp,
     root: &LpSolution,
-    incumbent: f64,
+    cutoff: f64,
     options: &Options,
 ) -> Option<Problem> {
     let costs = lp.reduced_costs(&root.basis)?;
@@ -1927,8 +2019,8 @@ fn fix_by_reduced_cost(
     // generous side: a *smaller* room caps the travel harder and so fixes more, which
     // is the direction that can cut off a solution nobody has seen yet. The tolerances
     // below are all widenings for the same reason.
-    let room = incumbent - root.objective;
-    if room <= 0.0 || !room.is_finite() {
+    let room = cutoff - root.objective;
+    if room < 0.0 || !room.is_finite() {
         return None;
     }
 
@@ -1990,7 +2082,6 @@ const JUMP_SHARE: f64 = 0.05;
 /// gap of zero, and the one it cost arrives at 37%. Anything in between is untested, so
 /// this is set near the winners rather than midway.
 const JUMP_QUALITY: f64 = 0.10;
-
 
 /// What is left of a time limit that started at `started`, or `None` for no limit.
 fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
@@ -2116,6 +2207,41 @@ mod tests {
     use crate::lp::Lp;
     use crate::model::{RowSense, Sense};
     use crate::sparse::SparseMatrix;
+
+    #[test]
+    fn a_fractional_coefficient_anywhere_rules_out_an_objective_spacing() {
+        // The column that rules the reasoning out can be anywhere, including after the
+        // spacing has already fallen to one. A version that stopped looking at that
+        // point read this model as integral and proved an optimum of 34.375 where the
+        // answer is 34.25.
+        let mut model = crate::model::Builder::new(Sense::Minimize);
+        let a = model.integer("a", 0.0, 4.0);
+        let b = model.integer("b", 0.0, 4.0);
+        let c = model.continuous("c", 0.0, 4.0);
+        // 8 and 3 are coprime, so the spacing is already 1 before `c` is reached.
+        model.objective(&[(a, 8.0), (b, 3.0), (c, 6.5)]);
+        model.row(&[(a, 1.0), (b, 1.0), (c, 1.0)], RowSense::Ge, 1.0);
+        assert_eq!(objective_granularity(&model.build()), None);
+    }
+
+    #[test]
+    fn a_whole_objective_spacing_lifts_a_bound_to_the_next_value() {
+        let mut model = crate::model::Builder::new(Sense::Minimize);
+        let a = model.integer("a", 0.0, 4.0);
+        let b = model.integer("b", 0.0, 4.0);
+        model.objective(&[(a, 200.0), (b, 600.0)]);
+        model.row(&[(a, 1.0), (b, 1.0)], RowSense::Ge, 1.0);
+        let problem = model.build();
+        let granularity = objective_granularity(&problem);
+        assert_eq!(granularity, Some(200.0));
+        // Between two attainable values, so the bound is really the upper one.
+        assert_eq!(lift_to_granularity(52000.3, granularity), 52200.0);
+        // Already attainable, and must not be pushed a whole step past what was proven,
+        // including when rounding leaves it a whisker above.
+        assert_eq!(lift_to_granularity(52200.0, granularity), 52200.0);
+        assert_eq!(lift_to_granularity(52200.000000001, granularity), 52200.0);
+        assert_eq!(lift_to_granularity(-400.5, granularity), -400.0);
+    }
 
     #[test]
     fn a_point_without_a_bound_reports_no_gap_rather_than_none_left() {
