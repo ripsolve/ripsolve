@@ -105,10 +105,23 @@ column rounds inwards and on a binary usually decides it. `nw04` fixes 25471 col
 **The obvious continuation is to re-run it as the incumbent improves.** It currently runs
 once, at the root, against whatever incumbent the root heuristics found, and that
 incumbent is far weaker than the one the search ends with: `n2seq36f` is at a 39.7% gap at
-the root and 0.38% at the end. The room `(u - root)` is widest exactly when the fixing
-runs and narrowest when it would pay most, so most of this reduction is still on the
-table. The awkward part is that the model is shared immutably across the search's threads,
-so a mid-search tightening needs somewhere to live that a running worker can read.
+the root and 0.38% at the end. The room `(u - root)` is widest exactly when the fixing runs
+and narrowest when it would pay most, so most of this reduction is still on the table.
+
+Two obstacles, found by scoping it and worth having before starting rather than after:
+
+- **Globally**, the model is shared immutably across the search's threads, so a
+  mid-search tightening has nowhere to live that a running worker can read. A restart is
+  the shape that fits, and restarts are separately on the list for nine of the 31.
+- **Per node**, where it would otherwise be the textbook answer, `Node.fixings` is not
+  free to grow: `search.rs` uses `node.fixings.len()` as the node's *depth* in the
+  best-bound pool's tie-break. Appending implied bounds to it would silently corrupt node
+  ordering, and on `nw04` it would append 25471 entries to a vector that is cloned per
+  child. Implied bounds need their own field, kept out of the depth measure, and a cap.
+
+The cost side is already dealt with: `Lp::reduced_costs` reuses the factorization the
+basis was left with, so asked right after a node's own solve it is one BTRAN and a pass
+over the columns, not a refactorization.
 
 Two things not to get wrong, both learned the hard way here and both written up in
 `design-notes.md`:
