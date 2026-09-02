@@ -1640,6 +1640,89 @@ The clock backstop was read at every 64th candidate but placed after the skip fo
 candidates with no conflicts, so a model whose first candidates were all skipped ran up
 to 63 probes past its deadline before noticing.
 
+### Fixing the columns the bound and the incumbent already decide
+
+Every reduction before this one reasons about feasibility: presolve asks what the rows
+allow, probing asks what a value implies. This one reasons about *optimality*, and it is
+the first thing here that does.
+
+At an optimal basis a nonbasic column sits on a bound whose reduced cost `d` says the
+objective cannot fall by leaving it. Moving a distance `t` off that bound therefore raises
+the objective by at least `|d| t`. The root's value is a bound on every solution in the
+tree, so any solution better than the incumbent `u` satisfies `root + |d| t < u`, which
+caps `t` at `(u - root) / |d|`. For an integer column the cap rounds inwards, and on a
+binary a cap below one decides the column outright.
+
+Nothing here read a reduced cost outside the simplex before this. `LpSolution` carried the
+status, the objective, the primal values and the basis, and no duals at all.
+
+```text
+                fixed at the root
+nw04            25471 of 87482
+neos-1516309      350 of 4500
+n2seq36f           41 of 8100
+irp                 3 of 20315
+```
+
+`nw04` closes, in 32 to 38 seconds, where it had sat at a 0.40% gap for the whole minute
+and had never closed in any run of any version. Five consecutive runs give four optimal
+and one timeout, which is the honest form of that claim; a single benchmark run caught the
+one and reported no change at all. `neos-1599274` goes from 3.85% to 2.62%. `irp` closes
+in 46 to 56 seconds where it used to take 57 to 60, and is still a coin flip, two runs in
+five.
+
+Which is worth stating separately from the change, because it is a fact about the
+measurement rather than about the solver: **two of the twenty-eight instances this solver
+can close sit on the sixty second line**, so the headline count reads 26, 27 or 28
+depending on where two flips land, and a single run of the benchmark cannot distinguish a
+real gain of one from noise of one. The number to quote is the set that closes every time,
+which went from 25 to 26 this session, with `nw04`'s four-in-five stated beside it.
+
+The narrowed bounds go into the model rather than into the root node, because a node
+rebuilds its bounds from the model before every solve. One pass reaches the whole tree,
+and it costs one copy of the model.
+
+**What it does not reach, and why that is most of it.** The bound this uses is the root's,
+and the incumbent it uses is whatever the root heuristics found, which is far weaker than
+what the search eventually holds: `n2seq36f` is at a 39.7% gap at the root and 0.38% at
+the end. The room `(u - root)` is therefore near its widest exactly when the fixing runs,
+and near its narrowest when it would pay most. Re-running it as the incumbent improves is
+where the rest of this is, and the awkward part is that the search is parallel and the
+model is shared immutably across its threads.
+
+### A margin on the wrong side is not a small mistake
+
+The room a better solution has to move in is `u - root`, and it is tempting to subtract a
+tolerance from it "to be safe". That is backwards, and the direction is worth stating
+plainly because both readings feel conservative:
+
+- A **smaller** room caps the travel harder, so **more** columns are fixed. That is the
+  direction that can remove a solution nobody has seen yet.
+- A **larger** room fixes fewer columns and can only lose reduction.
+
+A first version subtracted the feasibility tolerance and fixed 1566 columns of `irp` where
+the sound version fixes 3. It passed the tests. Every widening here — a relative slack and
+an absolute one on the travel cap, the integrality tolerance added before the floor — is
+on the generous side for the same reason.
+
+### The test, and what it does and does not catch
+
+Solving every sample twice, with the fixing on and off, and requiring the same answer.
+Checked against the search with the claim disabled rather than against a recorded value,
+because a recorded value would also have to be trusted.
+
+It was then checked for whether it can fail, which is the practice this file keeps
+recommending and this session kept needing:
+
+- Cap set to zero, pinning every nonbasic column where it sits: **caught**, on
+  `v064c200`, which answers 1039 against 225. But only once the generated families were
+  added; the bundled samples alone do not catch even that.
+- Cap halved, which is plainly unsound: **not caught** by either set.
+
+So it is a guard against a proof that is wrong in kind, not one that is wrong at the
+margin. That is worth having and worth not overstating, and the test says so in a comment
+rather than leaving the next reader to assume more of it.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

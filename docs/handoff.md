@@ -5,22 +5,28 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 
 ## Standing
 
-Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads, one consistent run:
+Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve  26 or 27     HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve  26 + 2 flips     HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Started the session at 26. The one gained is `mitre`, at about 18 seconds, from presolve
-probing.
+**Do not quote a single run's count.** Two instances sit on the sixty second line, so the
+headline reads 26, 27 or 28 depending on where they land, and one benchmark run cannot
+tell a real gain of one from noise of one. Quote the set that closes every time, with the
+flips named beside it. Measured over five consecutive runs each:
 
-**The figure is 26 or 27 because `irp` is a coin flip.** It closes in 57 to 60 seconds
-against a 60 second limit, so it lands on either side of the line: three consecutive runs
-of one build gave optimal, TimeLimit, TimeLimit. Two full benchmark runs of this session's
-work came back 27 and then 26, differing in `irp` and nothing else, and the code that
-changed between them provably never executes on it. Say which side of the flip a figure
-came from, or the next session will chase a regression that is not there. This is the same
-trap `nw04` set last session.
+```text
+closes every run        26
+nw04                     4 runs in 5, 32 to 38s
+irp                      2 runs in 5, 46 to 56s
+```
+
+Against the same figures at the start of the session: **25 every run, `nw04` never, `irp`
+a coin flip.** So the session gained `mitre` outright and turned `nw04` from an instance
+that had never closed in any run of any version into one that closes four times in five.
+The full benchmark run that produced the current standing shows neither, because it caught
+both flips on the wrong side; it is kept as `docs/baselines/binary-2026-09-02c.json`.
 
 **The set that matters is 31, not 113.** Of the instances this solver misses, most are
 missed by every open source solver too. The 31 that some open source solver closes and
@@ -87,29 +93,40 @@ well over 60 seconds even from a free root — the branch reached a 0.62% gap on
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
 
-## Next: reduced cost fixing, for the ten that lose on the bound
+## Reduced cost fixing is built, at the root only, and that is where to continue
 
-The only group with instances within a percent of closing, and the obvious untried thing
-for them. With an incumbent and the root's duals in hand, a nonbasic binary whose reduced
-cost exceeds the remaining gap cannot take its other value in any better solution and can
-be fixed for good. At `nw04`'s 0.4% that is most of the model.
+Built this session and it is what moved `nw04`. At an optimal basis a nonbasic column's
+reduced cost `d` says the objective cannot fall by leaving the bound it sits on, so moving
+`t` off it raises the objective by at least `|d| t`; anything better than the incumbent
+`u` needs `root + |d| t < u`, capping `t` at `(u - root) / |d|`, which for an integer
+column rounds inwards and on a binary usually decides it. `nw04` fixes 25471 columns of
+87482 this way, `neos-1516309` 350 of 4500.
 
-Nothing here reads a reduced cost outside the simplex: `LpSolution` carries the status,
-the objective, the primal values and the basis, and no duals. Exposing them is the first
-step and is small — the solver already computes `y` by BTRAN of the basic costs every
-iteration and has `Solver::reduced_cost`.
+**The obvious continuation is to re-run it as the incumbent improves.** It currently runs
+once, at the root, against whatever incumbent the root heuristics found, and that
+incumbent is far weaker than the one the search ends with: `n2seq36f` is at a 39.7% gap at
+the root and 0.38% at the end. The room `(u - root)` is widest exactly when the fixing
+runs and narrowest when it would pay most, so most of this reduction is still on the
+table. The awkward part is that the model is shared immutably across the search's threads,
+so a mid-search tightening needs somewhere to live that a running worker can read.
 
-Two things to get right, both of which decide whether it is sound:
+Two things not to get wrong, both learned the hard way here and both written up in
+`design-notes.md`:
 
-- It is only valid against a *proven* bound and a *feasible* incumbent, so it belongs
-  after the root LP has actually reached Optimal, not after whatever the rescues left.
-- The obvious place to apply it is the root, and at the root there is usually no
-  incumbent yet: on this set the incumbent arrives during the search. So the version
-  worth building re-runs it when the incumbent improves, not once at the start.
+- **Any margin belongs on the generous side.** A smaller room caps the travel harder and
+  fixes more, which is the direction that removes a solution nobody has seen. Subtracting
+  the feasibility tolerance "to be safe" fixed 1566 columns of `irp` where the sound
+  version fixes 3, and it passed the tests.
+- **The invariance test only catches a proof wrong in kind.** Solving every sample with
+  the fixing on and off catches the travel cap set to zero, and only once the generated
+  families were added; halving the cap is caught by neither fixture set.
 
-Measure it on the ten first — `ripsolve solve` on each at 60s and 16 threads — before
-spending two hours on a full benchmark run. A full run is the confirmation, not the
-experiment.
+## And after that: the seven that search and never find a point
+
+Untouched this session and the second largest group. `acc-tight4`, `acc-tight5`,
+`graph20-20-1rand`, `air04`, `air05`, `neos-3045796-mogo` and `neos-820879` reach between
+twelve and 8720 nodes and never find a feasible assignment, with rounding, diving, the
+pump, fixing with propagation and the LP-free jump all running and all returning nothing.
 
 ## Parked, with the evidence for each in design-notes.md
 
@@ -133,22 +150,25 @@ experiment.
 2. **Cheapest first is wrong when a heuristic is cheap because its answers are bad.**
    Made three times; such a heuristic belongs last, where it runs only if everything
    else failed.
-3. **The parallel search is too noisy to read a regression from.** Incumbent counts at
-   16 threads swing enough to invent both losses and gains. Anything that matters is
-   confirmed at one thread, or measured with the search taken out of the picture
-   entirely — `cargo run --example probecost` does that for presolve, and finding the
-   real cost of probing took two sessions longer than it should have because every
-   earlier measurement of it had a whole solve sitting on top.
+3. **The parallel search is too noisy to read a regression from, and now too noisy to
+   read the headline count from.** Incumbent counts at 16 threads swing enough to invent
+   both losses and gains. Anything that matters is confirmed at one thread, or measured
+   with the search taken out of the picture entirely — `cargo run --example probecost`
+   does that for presolve, and finding the real cost of probing took two sessions longer
+   than it should have because every earlier measurement of it had a whole solve sitting
+   on top. This session the noise ran the other way for the first time: a single
+   benchmark run reported that reduced cost fixing changed nothing, when five runs of the
+   instance it was aimed at show four closes where there had never been one.
 
 ## Measuring here without being misled
 
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-02b.json`, with the run before the root work kept as
-  `binary-2026-09-02.json` and the one before probing as `binary-2026-09-01.json`. Diff
-  against those rather than against a remembered number, and copy the current one aside
-  before a run that might matter.
+  `docs/baselines/binary-2026-09-02c.json`, with the run before reduced cost fixing kept
+  as `binary-2026-09-02b.json`, the one before the root work as `binary-2026-09-02.json`
+  and the one before probing as `binary-2026-09-01.json`. Diff against those rather than
+  against a remembered number, and copy the current one aside before a run that matters.
 - `cargo run --release --example probecost -- <models>` times presolve with and without
   probing on the same model and reports both reductions. Use it in preference to a solve
   for anything about presolve: it is seconds rather than an hour, and it has no search
