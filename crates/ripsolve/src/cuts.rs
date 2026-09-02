@@ -1033,6 +1033,29 @@ impl Conflicts {
         false
     }
 
+    /// Visit every literal excluded by `node`, allocating nothing and sorting nothing.
+    ///
+    /// `adjacent` builds a deduplicated list, which costs an allocation and a sort per
+    /// call. A propagator calls this once per column it fixes and does not need either:
+    /// forcing a column to a value it already holds is a no-op, so a literal arriving
+    /// twice costs one comparison, where sorting a 3861-literal clique to spare that
+    /// comparison costs everything. Stop by returning false from `visit`.
+    pub fn for_each_adjacent(&self, node: u32, mut visit: impl FnMut(u32) -> bool) -> bool {
+        for &other in &self.neighbours[node as usize] {
+            if !visit(other) {
+                return false;
+            }
+        }
+        for &id in &self.membership[node as usize] {
+            for &other in &self.cliques[id as usize] {
+                if other != node && !visit(other) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Every literal excluded by `node`, from its edges and its cliques together.
     pub fn adjacent(&self, node: u32) -> Vec<u32> {
         let mut out = self.neighbours[node as usize].clone();
@@ -1047,6 +1070,19 @@ impl Conflicts {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// How many literals `node` excludes, without building the list to find out.
+    ///
+    /// Counts cliques as well as edges. Reading only the edges reports zero for every
+    /// column of a set partitioning model, whose conflicts are all held as cliques,
+    /// which is exactly backwards: those are the most constrained columns in the set.
+    pub fn degree(&self, node: u32) -> usize {
+        self.neighbours[node as usize].len()
+            + self.membership[node as usize]
+                .iter()
+                .map(|&id| self.cliques[id as usize].len().saturating_sub(1))
+                .sum::<usize>()
     }
 
     /// Does `node` exclude anything, without building the list to find out?

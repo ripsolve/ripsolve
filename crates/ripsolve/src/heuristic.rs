@@ -919,12 +919,13 @@ mod schedule_tests {
     }
 }
 
-/// How many columns a propagation sweep may force before it gives up.
+/// How much a propagation sweep may read before it gives up, in literals and
+/// coefficients.
 ///
 /// Each forced column re-queues the rows it appears in, so a sweep is bounded by the
 /// model rather than by a count, and the guard is against a cycle rather than against
 /// depth.
-const MAX_PROPAGATIONS: usize = 1_000_000;
+const MAX_PROPAGATIONS: usize = 100_000_000;
 
 /// How many times a fixing may be found infeasible and retried the other way.
 ///
@@ -933,139 +934,419 @@ const MAX_PROPAGATIONS: usize = 1_000_000;
 /// back than the last decision, which this does not chase.
 const MAX_CONFLICTS: usize = 64;
 
-/// A partial assignment of the binary columns, with bounds tightened as it grows.
-struct Partial {
+/// A partial assignment of the columns, with everything a sweep needs to extend it and
+/// to take it back again.
+///
+/// Both callers fix a column tentatively, force what follows, and then keep the result
+/// or discard it. What makes that affordable is that discarding rebuilds nothing: a
+/// sweep writes down every value it overwrote, and undoing is that record walked
+/// backwards. Copying the assignment instead costs a pass over the columns per trial,
+/// and probing tries two per column, so the model is copied twice for every column in
+/// it before any inference is drawn at all.
+///
+/// Row activities are carried the same way, and for the same reason. Recomputing a
+/// row's activity range from its coefficients is what made a sweep cost the rows it
+/// touched rather than the columns it fixed, and on a set partitioning model one row is
+/// a large part of the matrix.
+pub(crate) struct Propagator<'a> {
+    conflicts: &'a Conflicts,
+    csr: &'a SparseMatrix,
+    /// Copied out of the model rather than borrowed from it, so that a caller mirroring
+    /// what is proven back into the model does not have to give this up to do it.
+    row_lb: Vec<f64>,
+    row_ub: Vec<f64>,
+    binary: Vec<bool>,
+    /// The matrix by column: `col_start` indexes `col_rows` and `col_values`.
+    col_start: Vec<usize>,
+    col_rows: Vec<u32>,
+    col_values: Vec<f64>,
     lb: Vec<f64>,
     ub: Vec<f64>,
+    /// The least and greatest activity each row can still take.
+    min_activity: Vec<f64>,
+    max_activity: Vec<f64>,
+    /// The most any single column can move a row's activity, over the bounds the model
+    /// started with. A row with more slack than this at both ends can force nothing,
+    /// whatever else is fixed in it, and is not read.
+    reach: Vec<f64>,
+    trail: Vec<Undo>,
+    queue: Vec<usize>,
+    /// Reused between sweeps so a row's forcings cost no allocation to collect.
+    forced: Vec<u32>,
+    /// Literals and coefficients looked at since this was built, which is what a caller
+    /// rationing propagation has to ration. Counting sweeps or fixings instead prices
+    /// a column in a clique of four the same as one in a clique of four thousand.
+    work: usize,
+    tolerance: f64,
 }
 
-impl Partial {
-    fn new(problem: &Problem) -> Self {
+/// How a propagation sweep ended.
+///
+/// The third case is the one worth naming. A sweep that ran out of work has proved
+/// nothing either way, and a caller that treats that as "proved nothing" — the same as
+/// a sweep that finished and found nothing — concludes the model has no more to give
+/// and stops, when what actually happened is that it was not allowed to look.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sweep {
+    /// The assignment cannot be completed.
+    Refuted,
+    /// A fixed point was reached with the assignment intact.
+    Settled,
+    /// The work ran out first.
+    Abandoned,
+}
+
+/// One overwritten value, kept so it can be put back exactly.
+///
+/// Exactly, rather than by re-adding what was subtracted: an activity walked forwards
+/// and backwards through a million floating point additions does not come back to
+/// where it started, and probing draws conclusions from these numbers that fix columns
+/// for good.
+enum Undo {
+    Column { j: u32, lb: f64, ub: f64 },
+    Activity { i: u32, min: f64, max: f64 },
+}
+
+impl<'a> Propagator<'a> {
+    pub(crate) fn new(
+        problem: &Problem,
+        conflicts: &'a Conflicts,
+        csr: &'a SparseMatrix,
+        tolerance: f64,
+    ) -> Self {
+        let (n, m) = (problem.n_cols(), problem.n_rows());
+        let mut counts = vec![0usize; n + 1];
+        for i in 0..m {
+            for &j in csr.column(i).0 {
+                counts[j + 1] += 1;
+            }
+        }
+        for j in 0..n {
+            counts[j + 1] += counts[j];
+        }
+        let col_start = counts.clone();
+        let mut col_rows = vec![0u32; col_start[n]];
+        let mut col_values = vec![0.0f64; col_start[n]];
+        let mut min_activity = vec![0.0f64; m];
+        let mut max_activity = vec![0.0f64; m];
+        let mut reach = vec![0.0f64; m];
+        for i in 0..m {
+            let (cols, values) = csr.column(i);
+            for (&j, &a) in cols.iter().zip(values) {
+                col_rows[counts[j]] = i as u32;
+                col_values[counts[j]] = a;
+                counts[j] += 1;
+                let (lo, hi) = (a * problem.col_lb[j], a * problem.col_ub[j]);
+                min_activity[i] += lo.min(hi);
+                max_activity[i] += lo.max(hi);
+                reach[i] = reach[i].max((hi - lo).abs());
+            }
+        }
         Self {
+            conflicts,
+            csr,
+            row_lb: problem.row_lb.clone(),
+            row_ub: problem.row_ub.clone(),
+            binary: (0..n).map(|j| is_binary_column(problem, j)).collect(),
+            col_start,
+            col_rows,
+            col_values,
             lb: problem.col_lb.clone(),
             ub: problem.col_ub.clone(),
+            min_activity,
+            max_activity,
+            reach,
+            trail: Vec::new(),
+            queue: Vec::new(),
+            forced: Vec::new(),
+            work: 0,
+            tolerance,
         }
     }
 
-    fn fixed(&self, j: usize) -> bool {
+    /// How much has been looked at so far, in literals and coefficients.
+    pub(crate) fn work(&self) -> usize {
+        self.work
+    }
+
+    pub(crate) fn fixed(&self, j: usize) -> bool {
         self.lb[j] >= self.ub[j] - 1e-9
     }
 
+    /// What column `j` is pinned to, which means anything only where `fixed` holds.
+    pub(crate) fn value(&self, j: usize) -> f64 {
+        self.lb[j]
+    }
+
+    /// Column `j`'s bounds as they stand.
+    pub(crate) fn lower(&self, j: usize) -> f64 {
+        self.lb[j]
+    }
+
+    pub(crate) fn upper(&self, j: usize) -> f64 {
+        self.ub[j]
+    }
+
+    /// Where the columns stand now, to hand back to `rewind`.
+    pub(crate) fn mark(&self) -> usize {
+        self.trail.len()
+    }
+
+    /// Put everything back as it stood at `mark`.
+    pub(crate) fn rewind(&mut self, mark: usize) {
+        while self.trail.len() > mark {
+            match self.trail.pop().expect("length checked") {
+                Undo::Column { j, lb, ub } => {
+                    self.lb[j as usize] = lb;
+                    self.ub[j as usize] = ub;
+                }
+                Undo::Activity { i, min, max } => {
+                    self.min_activity[i as usize] = min;
+                    self.max_activity[i as usize] = max;
+                }
+            }
+        }
+        self.queue.clear();
+    }
+
+    /// Make everything on the trail permanent, so no later rewind reaches it.
+    pub(crate) fn commit(&mut self) {
+        self.trail.clear();
+    }
+
+    /// The columns fixed since `mark`, in the order they were fixed.
+    pub(crate) fn fixed_since(&self, mark: usize, out: &mut Vec<usize>) {
+        out.clear();
+        for entry in &self.trail[mark.min(self.trail.len())..] {
+            if let Undo::Column { j, .. } = entry {
+                out.push(*j as usize);
+            }
+        }
+    }
+
+    /// Queue every column the model already pins, so the first sweep starts from them.
+    pub(crate) fn seed_fixed(&mut self) {
+        for j in 0..self.lb.len() {
+            if self.fixed(j) {
+                self.queue.push(j);
+            }
+        }
+    }
+
     /// Pin `j` to `value`, reporting false if that contradicts what is already known.
-    fn fix(&mut self, j: usize, value: f64) -> bool {
+    ///
+    /// The change is recorded on the trail and carried into the activity range of every
+    /// row `j` appears in, so the rows stay current without being read again.
+    pub(crate) fn fix(&mut self, j: usize, value: f64) -> bool {
         if value < self.lb[j] - 1e-9 || value > self.ub[j] + 1e-9 {
             return false;
         }
-        self.lb[j] = value;
-        self.ub[j] = value;
-        true
-    }
-}
-
-/// Force everything that follows from the columns already fixed.
-///
-/// Two inferences run to a common fixed point. The conflict graph gives the logical
-/// one: a literal that holds excludes every literal it conflicts with, and excluding
-/// `x_k = 1` is fixing `x_k = 0`. This is where a set partitioning row pays, since
-/// fixing one of its columns to one forces every other column in the row to zero at
-/// once, without an LP solve and without looking at the row again.
-///
-/// Row activities give the arithmetic one: a row whose remaining slack cannot absorb a
-/// column's coefficient forces that column to the end that fits. This catches what the
-/// conflict graph does not, the rows that exclude nothing pairwise but still leave only
-/// one value open once enough of their columns are pinned.
-///
-/// Returns false when the two together prove the partial assignment cannot be completed.
-fn propagate_fixings(
-    problem: &Problem,
-    conflicts: &Conflicts,
-    csr: &SparseMatrix,
-    rows_of_col: &[Vec<usize>],
-    partial: &mut Partial,
-    queue: &mut Vec<usize>,
-    tolerance: f64,
-) -> bool {
-    let mut steps = 0usize;
-    while let Some(j) = queue.pop() {
-        steps += 1;
-        if steps > MAX_PROPAGATIONS {
+        if self.lb[j] == value && self.ub[j] == value {
             return true;
         }
-        if !partial.fixed(j) {
-            continue;
-        }
-        // The literal this column now asserts, and everything it excludes.
-        if is_binary_column(problem, j) {
-            let node = if partial.lb[j] > 0.5 { 2 * j } else { 2 * j + 1 };
-            for excluded in conflicts.adjacent(node as u32) {
-                let k = excluded as usize / 2;
-                // Excluding `x_k = 1` means fixing zero, and excluding `x_k = 0` one.
-                let forced = if excluded.is_multiple_of(2) { 0.0 } else { 1.0 };
-                if partial.fixed(k) {
-                    if (partial.lb[k] - forced).abs() > 1e-9 {
-                        return false;
-                    }
-                    continue;
-                }
-                if !partial.fix(k, forced) {
-                    return false;
-                }
-                queue.push(k);
+        self.trail.push(Undo::Column {
+            j: j as u32,
+            lb: self.lb[j],
+            ub: self.ub[j],
+        });
+        let (start, end) = (self.col_start[j], self.col_start[j + 1]);
+        self.work += end - start;
+        for position in start..end {
+            let i = self.col_rows[position] as usize;
+            let a = self.col_values[position];
+            let (lo, hi) = (a * self.lb[j], a * self.ub[j]);
+            let held = a * value;
+            self.trail.push(Undo::Activity {
+                i: i as u32,
+                min: self.min_activity[i],
+                max: self.max_activity[i],
+            });
+            // An infinite bound leaves nothing to subtract, so that row is rebuilt from
+            // its coefficients. Only a column the model left unbounded reaches this.
+            if lo.min(hi).is_finite() {
+                self.min_activity[i] += held - lo.min(hi);
+            } else {
+                self.min_activity[i] = f64::NAN;
+            }
+            if lo.max(hi).is_finite() {
+                self.max_activity[i] += held - lo.max(hi);
+            } else {
+                self.max_activity[i] = f64::NAN;
             }
         }
-        // Rows holding this column may now force others.
-        for &i in &rows_of_col[j] {
-            let (cols, vals) = csr.column(i);
-            let mut min = 0.0f64;
-            let mut max = 0.0f64;
-            for (&k, &a) in cols.iter().zip(vals) {
-                let (lo, hi) = (a * partial.lb[k], a * partial.ub[k]);
-                min += lo.min(hi);
-                max += lo.max(hi);
-            }
-            if min > problem.row_ub[i] + tolerance || max < problem.row_lb[i] - tolerance {
-                return false;
-            }
-            for (&k, &a) in cols.iter().zip(vals) {
-                if partial.fixed(k) || a == 0.0 {
-                    continue;
-                }
-                // What this row leaves open for `k` once every other column is at its
-                // worst, which for a binary is a choice between two values.
-                let (lo, hi) = (a * partial.lb[k], a * partial.ub[k]);
-                let rest_min = min - lo.min(hi);
-                let rest_max = max - lo.max(hi);
-                let mut forced: Option<f64> = None;
-                for value in [0.0f64, 1.0] {
-                    if value < partial.lb[k] - 1e-9 || value > partial.ub[k] + 1e-9 {
-                        continue;
-                    }
-                    let with = a * value;
-                    let feasible = rest_min + with <= problem.row_ub[i] + tolerance
-                        && rest_max + with >= problem.row_lb[i] - tolerance;
-                    if feasible {
-                        // Two values fit, so the row forces nothing here.
-                        if forced.is_some() {
-                            forced = None;
-                            break;
-                        }
-                        forced = Some(value);
-                    }
-                }
-                if let Some(value) = forced {
-                    if !partial.fix(k, value) {
-                        return false;
-                    }
-                    queue.push(k);
-                }
+        self.lb[j] = value;
+        self.ub[j] = value;
+        for position in start..end {
+            let i = self.col_rows[position] as usize;
+            if self.min_activity[i].is_nan() || self.max_activity[i].is_nan() {
+                self.rebuild_activity(i);
             }
         }
+        self.queue.push(j);
+        true
     }
-    true
+
+    /// Recompute one row's activity range from its coefficients.
+    fn rebuild_activity(&mut self, i: usize) {
+        let (cols, values) = self.csr.column(i);
+        let (mut min, mut max) = (0.0f64, 0.0f64);
+        for (&k, &a) in cols.iter().zip(values) {
+            let (lo, hi) = (a * self.lb[k], a * self.ub[k]);
+            min += lo.min(hi);
+            max += lo.max(hi);
+        }
+        self.min_activity[i] = min;
+        self.max_activity[i] = max;
+    }
+
+    /// Suppose `j` takes `value`, and work out what follows.
+    ///
+    /// The supposition is left in place on every outcome, refutation included, so the
+    /// caller can keep what a surviving sweep proved or hand it back with `rewind`.
+    pub(crate) fn probe(&mut self, j: usize, value: f64, max_work: usize) -> Sweep {
+        if !self.fix(j, value) {
+            return Sweep::Refuted;
+        }
+        self.propagate(max_work)
+    }
+
+    /// Force everything that follows from the columns already queued.
+    ///
+    /// Two inferences run to a common fixed point. The conflict graph gives the logical
+    /// one: a literal that holds excludes every literal it conflicts with, and excluding
+    /// `x_k = 1` is fixing `x_k = 0`. This is where a set partitioning row pays, since
+    /// fixing one of its columns to one forces every other column in the row to zero at
+    /// once, without an LP solve and without looking at the row again.
+    ///
+    /// Row activities give the arithmetic one: a row whose remaining slack cannot absorb
+    /// a column's coefficient forces that column to the end that fits. This catches what
+    /// the conflict graph does not, the rows that exclude nothing pairwise but still
+    /// leave only one value open once enough of their columns are pinned.
+    ///
+    /// `max_work` is the literals and coefficients this sweep may read before giving
+    /// up, which is what a sweep costs. Bounding the number of fixings instead prices a
+    /// column in a clique of four the same as one in a clique of four thousand, and the
+    /// second is a thousand times the work.
+    ///
+    /// Returns false when the two together prove the assignment cannot be completed.
+    /// Running out of work returns true: a sweep that stopped early has refuted
+    /// nothing, while every fixing it did make is still implied by what it started from.
+    pub(crate) fn propagate(&mut self, max_work: usize) -> Sweep {
+        let ceiling = self.work.saturating_add(max_work);
+        while let Some(j) = self.queue.pop() {
+            if self.work > ceiling {
+                return Sweep::Abandoned;
+            }
+            if !self.fixed(j) {
+                continue;
+            }
+            if !self.propagate_conflicts(j) {
+                return Sweep::Refuted;
+            }
+            let (start, end) = (self.col_start[j], self.col_start[j + 1]);
+            for position in start..end {
+                let i = self.col_rows[position] as usize;
+                if !self.propagate_row(i) {
+                    return Sweep::Refuted;
+                }
+            }
+        }
+        Sweep::Settled
+    }
+
+    /// Fix everything excluded by the literal `j` now asserts.
+    fn propagate_conflicts(&mut self, j: usize) -> bool {
+        if !self.binary[j] {
+            return true;
+        }
+        let node = if self.lb[j] > 0.5 { 2 * j } else { 2 * j + 1 };
+        let conflicts = self.conflicts;
+        self.work += conflicts.degree(node as u32);
+        let mut ok = true;
+        conflicts.for_each_adjacent(node as u32, |excluded| {
+            let k = excluded as usize / 2;
+            // Excluding `x_k = 1` means fixing zero, and excluding `x_k = 0` one.
+            let value = if excluded.is_multiple_of(2) { 0.0 } else { 1.0 };
+            ok = self.fix(k, value);
+            ok
+        });
+        ok
+    }
+
+    /// Fix whatever row `i` now leaves only one value for.
+    fn propagate_row(&mut self, i: usize) -> bool {
+        let (min, max) = (self.min_activity[i], self.max_activity[i]);
+        let (row_lb, row_ub) = (self.row_lb[i], self.row_ub[i]);
+        let tolerance = self.tolerance;
+        // A row can neither force nor refute while both its slacks exceed what any one
+        // column could contribute, and most rows of most models stay that way for a
+        // whole sweep. Reading the row to find that out is the cost being avoided; this
+        // is two comparisons against numbers the row already carries.
+        //
+        // A row still holding an unbounded column compares against an infinity and
+        // gives NaN, which fails both tests and skips the row. That is the right answer:
+        // an activity range open at one end refutes nothing at that end, and it cannot
+        // be a binary column that opened it.
+        let above = min + self.reach[i] > row_ub + tolerance;
+        let below = max - self.reach[i] < row_lb - tolerance;
+        if !above && !below {
+            return true;
+        }
+        if min > row_ub + tolerance || max < row_lb - tolerance {
+            return false;
+        }
+        let (cols, values) = self.csr.column(i);
+        self.work += cols.len();
+        let mut forced = std::mem::take(&mut self.forced);
+        forced.clear();
+        for (&k, &a) in cols.iter().zip(values) {
+            if a == 0.0 || self.fixed(k) || !self.binary[k] {
+                continue;
+            }
+            // What this row leaves open for `k` once every other column is at its
+            // worst, which for a binary is a choice between two values.
+            let (lo, hi) = (a * self.lb[k], a * self.ub[k]);
+            let rest_min = min - lo.min(hi);
+            let rest_max = max - lo.max(hi);
+            let mut only: Option<f64> = None;
+            for value in [0.0f64, 1.0] {
+                if value < self.lb[k] - 1e-9 || value > self.ub[k] + 1e-9 {
+                    continue;
+                }
+                let with = a * value;
+                let feasible =
+                    rest_min + with <= row_ub + tolerance && rest_max + with >= row_lb - tolerance;
+                if feasible {
+                    // Two values fit, so the row forces nothing here.
+                    if only.is_some() {
+                        only = None;
+                        break;
+                    }
+                    only = Some(value);
+                }
+            }
+            if let Some(value) = only {
+                // Packed as a literal so the fixing pass does not need the coefficient
+                // again. Fixing inside the scan instead would leave the rest of the row
+                // reading an activity range that has already moved.
+                forced.push(2 * k as u32 + u32::from(value < 0.5));
+            }
+        }
+        let mut ok = true;
+        for &literal in &forced {
+            let value = if literal.is_multiple_of(2) { 1.0 } else { 0.0 };
+            if !self.fix(literal as usize / 2, value) {
+                ok = false;
+                break;
+            }
+        }
+        self.forced = forced;
+        ok
+    }
 }
 
 /// Is this column a binary, including one already pinned to an end?
-fn is_binary_column(problem: &Problem, j: usize) -> bool {
+pub(crate) fn is_binary_column(problem: &Problem, j: usize) -> bool {
     problem.is_integer(j) && problem.col_lb[j] >= 0.0 && problem.col_ub[j] <= 1.0
 }
 
@@ -1093,39 +1374,20 @@ pub fn fix_and_propagate(
 ) -> Option<Incumbent> {
     let n = problem.n_cols();
     let csr = problem.matrix.to_csr();
-    let mut rows_of_col: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for i in 0..problem.n_rows() {
-        let (cols, _) = csr.column(i);
-        for &j in cols {
-            rows_of_col[j].push(i);
-        }
-    }
-
-    let mut partial = Partial::new(problem);
-    let mut queue: Vec<usize> = Vec::new();
+    let mut state = Propagator::new(problem, conflicts, &csr, limits.feasibility_tolerance);
     // Columns the model already pins are part of the assignment from the start.
-    for j in 0..n {
-        if partial.fixed(j) {
-            queue.push(j);
-        }
-    }
-    if !propagate_fixings(
-        problem,
-        conflicts,
-        &csr,
-        &rows_of_col,
-        &mut partial,
-        &mut queue,
-        limits.feasibility_tolerance,
-    ) {
+    state.seed_fixed();
+    if state.propagate(MAX_PROPAGATIONS) == Sweep::Refuted {
         return None;
     }
+    // Nothing after this point is allowed to take those back.
+    state.commit();
 
     // Most nearly decided first: a column the relaxation has already pushed to an end
     // is the one it is most confident about, and fixing it forces the most for the
     // least risk of being wrong.
     let mut order: Vec<usize> = (0..n)
-        .filter(|&j| is_binary_column(problem, j) && !partial.fixed(j))
+        .filter(|&j| is_binary_column(problem, j) && !state.fixed(j))
         .collect();
     order.sort_by(|&a, &b| {
         let (da, db) = ((x[a] - 0.5).abs(), (x[b] - 0.5).abs());
@@ -1134,34 +1396,20 @@ pub fn fix_and_propagate(
 
     let mut conflicts_seen = 0usize;
     for &j in &order {
-        if partial.fixed(j) {
+        if state.fixed(j) {
             continue;
         }
         let prefer = if x[j] > 0.5 { 1.0 } else { 0.0 };
         let mut settled = false;
         for value in [prefer, 1.0 - prefer] {
-            let mut trial = Partial {
-                lb: partial.lb.clone(),
-                ub: partial.ub.clone(),
-            };
-            if !trial.fix(j, value) {
-                continue;
-            }
-            queue.clear();
-            queue.push(j);
-            if propagate_fixings(
-                problem,
-                conflicts,
-                &csr,
-                &rows_of_col,
-                &mut trial,
-                &mut queue,
-                limits.feasibility_tolerance,
-            ) {
-                partial = trial;
+            let mark = state.mark();
+            if state.fix(j, value) && state.propagate(MAX_PROPAGATIONS) != Sweep::Refuted {
+                // Kept, so the fixings it made are as permanent as the choice itself.
+                state.commit();
                 settled = true;
                 break;
             }
+            state.rewind(mark);
             // The preferred value is refuted; the other one is the whole of the repair
             // this attempts, and counting the refutations bounds how long it may go on
             // being wrong.
@@ -1178,11 +1426,11 @@ pub fn fix_and_propagate(
     // Every binary is decided. Continuous columns stay where the relaxation left them
     // when that is still within their bounds, which polish may improve on afterwards.
     let mut point = vec![0.0f64; n];
-    for j in 0..n {
-        point[j] = if partial.fixed(j) {
-            partial.lb[j]
+    for (j, slot) in point.iter_mut().enumerate() {
+        *slot = if state.fixed(j) {
+            state.value(j)
         } else {
-            x[j].clamp(partial.lb[j], partial.ub[j])
+            x[j].clamp(state.lower(j), state.upper(j))
         };
     }
     is_feasible(problem, &point, limits.feasibility_tolerance).then(|| Incumbent {

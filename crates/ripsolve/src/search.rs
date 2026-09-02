@@ -1141,7 +1141,12 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut reduced;
     let (problem, presolve_stats) = if options.presolve {
         reduced = problem.clone();
-        match presolve::presolve(&mut reduced, 20) {
+        // A backstop, not the budget: what bounds probing is the work it may do per
+        // column. This catches a pathological model, not the ordinary case.
+        let presolve_deadline = options
+            .time_limit
+            .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
+        match presolve::presolve_until(&mut reduced, 20, presolve_deadline) {
             Outcome::Infeasible => {
                 return Solution::without_solution(Status::Infeasible, 0, 0, None);
             }
@@ -1602,6 +1607,9 @@ const ROOT_CUT_SHARE: f64 = 0.33;
 /// Generous: a relaxation that is merely slow should be allowed to finish, and only one
 /// that is going nowhere is worth restarting from a different point.
 const ROOT_LP_FIRST_SHARE: f64 = 0.40;
+
+/// A backstop on presolve's expensive half, not its budget.
+const PRESOLVE_SHARE: f64 = 0.25;
 
 /// How far the bounds are moved when a relaxation has stalled.
 ///
