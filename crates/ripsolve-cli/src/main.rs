@@ -86,6 +86,9 @@ enum Command {
         /// Maximum simplex iterations.
         #[arg(long, default_value_t = 25_000)]
         max_iterations: usize,
+        /// Enter through the dual method instead of the primal.
+        #[arg(long)]
+        dual: bool,
     },
     /// Write a reproducible random instance in LP format.
     Gen {
@@ -252,13 +255,19 @@ fn main() -> Result<()> {
         Command::Relax {
             path,
             max_iterations,
+            dual,
         } => {
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
             problem.validate()?;
 
             let started = std::time::Instant::now();
-            let solution = Lp::relaxation(&problem).solve_with_limit(max_iterations);
+            let mut lp = Lp::relaxation(&problem);
+            let solution = if dual {
+                lp.solve_cold_dual(max_iterations)
+            } else {
+                lp.solve_with_limit(max_iterations)
+            };
             let elapsed = started.elapsed();
 
             match solution.status {

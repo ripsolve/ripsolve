@@ -416,6 +416,49 @@ impl Lp {
         self.run_solver(None, None, max_iterations)
     }
 
+    /// Solve from a cold start, entering through the dual method rather than the primal.
+    ///
+    /// The primal method reaches feasibility through phase 1, and phase 1 is where this
+    /// solver gets stuck: the cost vector there scores a basic variable by whether it
+    /// currently violates a bound, so it is blind to the kink at one sitting exactly on
+    /// one, and no ratio test can repair a column choice made that way. The dual method
+    /// has no phase 1 to get stuck in.
+    ///
+    /// This is a fallback, not the default, and the distinction is the whole of why it
+    /// is safe. The two methods end on *different* optimal vertices, and everything
+    /// downstream reads the root's vertex rather than its objective: Gomory cuts come
+    /// off that tableau and branching reads its fractional values. Made the default,
+    /// this reaches the worse vertex on most of this set and widens most gaps. Reached
+    /// only where the primal method returned no vertex at all, there is nothing for it
+    /// to be worse than.
+    ///
+    /// Reports `IterationLimit` without trying when the model cannot be parked dual
+    /// feasibly, which is a column whose cost points at a bound it does not have.
+    pub fn solve_cold_dual(&mut self, max_iterations: usize) -> LpSolution {
+        let (solution, basic, basis) = {
+            let lp = &*self;
+            let solver = Solver::cold(lp, true);
+            if solver.entry_hint != Entry::Dual {
+                // Not parkable dual feasibly. Running anyway would be the primal solve
+                // the caller has already tried and which already failed.
+                return LpSolution {
+                    status: LpStatus::IterationLimit,
+                    objective: f64::NAN,
+                    x: Vec::new(),
+                    iterations: 0,
+                    basis: BasisState {
+                        basic: Vec::new(),
+                        status: Vec::new(),
+                    },
+                };
+            }
+            solver.run(max_iterations, None)
+        };
+        self.factors.insert(0, (basic, basis));
+        self.factors.truncate(FACTOR_CACHE);
+        solution
+    }
+
     /// Generate Gomory mixed-integer cuts from the tableau at `basis`.
     ///
     /// Returned in terms of the *structural* columns, as `(coefficients, lower
@@ -561,6 +604,18 @@ struct Solver<'a> {
     factorized: bool,
     /// Values of the basic variables, recomputed after a refactorization.
     basic_values: Vec<f64>,
+    /// Price the dual method's leaving row by steepest edge rather than by the largest
+    /// violation, carrying the weights below across each pivot.
+    ///
+    /// Only a cold dual entry sets this. A warm start begins next to its parent's
+    /// optimum and repairs one bound in a few pivots, so the row choice barely matters
+    /// there and the extra FTRAN per iteration is pure cost; a cold one crosses the
+    /// whole model and the choice is most of the solve.
+    dual_steepest: bool,
+    /// Dual steepest edge weights, one per basis row; see [`Solver::leaving_row`].
+    row_weights: Vec<f64>,
+    /// Scratch for the steepest edge update, `B^-1` applied to the pivot row.
+    tau: Vec<f64>,
 }
 
 /// What the ratio test decided.
@@ -579,23 +634,77 @@ enum Step {
 
 impl<'a> Solver<'a> {
     fn new(lp: &'a Lp) -> Solver<'a> {
+        Solver::cold(lp, false)
+    }
+
+    /// A solver with every logical basic and every structural parked on a bound.
+    ///
+    /// Where each structural is parked decides which method can run from here, so with
+    /// `prefer_dual` it is chosen deliberately. The logicals being basic makes the
+    /// basis the identity, and their costs are zero, so the duals are zero and every
+    /// structural's reduced cost is exactly its own objective coefficient. Dual
+    /// feasibility is then a sign condition per column, decidable without any
+    /// factorization: a column that costs something to increase belongs at its lower
+    /// bound, one that pays to increase at its upper, and a free column is fine
+    /// wherever it sits as long as it costs nothing.
+    ///
+    /// A column whose cost points at a bound it does not have cannot be parked
+    /// feasibly, and one such column rules the dual method out for the model. The
+    /// ordinary rule, nearest bound to zero, is then restored so the primal path starts
+    /// exactly where it always did.
+    fn cold(lp: &'a Lp, prefer_dual: bool) -> Solver<'a> {
         let n_total = lp.n_total();
         let m = lp.m;
+        let tol = lp.tol.dual_feasibility;
 
-        // Start with every logical basic and every structural nonbasic on the bound
-        // nearer zero, which for a binary relaxation is the lower bound.
         let mut status = vec![Status::NonBasic(At::Lower); n_total];
         let mut z = vec![0.0; n_total];
-        for j in 0..lp.n_structural {
-            let at = if lp.lower[j].is_finite() {
-                At::Lower
-            } else if lp.upper[j].is_finite() {
-                At::Upper
-            } else {
-                At::Zero
-            };
-            status[j] = Status::NonBasic(at);
-            z[j] = lp.value_at(j, at);
+        let mut dual_ready = prefer_dual;
+        if prefer_dual {
+            for j in 0..lp.n_structural {
+                let (lo, hi) = (lp.lower[j], lp.upper[j]);
+                let at = if lo == hi {
+                    // Fixed: it cannot move, so its reduced cost constrains nothing.
+                    if lo.is_finite() { At::Lower } else { At::Zero }
+                } else if lp.cost[j] > tol {
+                    if lo.is_finite() {
+                        At::Lower
+                    } else {
+                        dual_ready = false;
+                        break;
+                    }
+                } else if lp.cost[j] < -tol {
+                    if hi.is_finite() {
+                        At::Upper
+                    } else {
+                        dual_ready = false;
+                        break;
+                    }
+                } else if lo.is_finite() {
+                    At::Lower
+                } else if hi.is_finite() {
+                    At::Upper
+                } else {
+                    At::Zero
+                };
+                status[j] = Status::NonBasic(at);
+                z[j] = lp.value_at(j, at);
+            }
+        }
+        if !dual_ready {
+            // Every structural nonbasic on the bound nearer zero, which for a binary
+            // relaxation is the lower bound.
+            for j in 0..lp.n_structural {
+                let at = if lp.lower[j].is_finite() {
+                    At::Lower
+                } else if lp.upper[j].is_finite() {
+                    At::Upper
+                } else {
+                    At::Zero
+                };
+                status[j] = Status::NonBasic(at);
+                z[j] = lp.value_at(j, at);
+            }
         }
         let mut basic = Vec::with_capacity(m);
         for i in 0..m {
@@ -616,9 +725,12 @@ impl<'a> Solver<'a> {
             y: Vec::new(),
             cost_b: vec![0.0; m],
             rhs: vec![0.0; m],
-            entry_hint: Entry::Primal,
+            entry_hint: if dual_ready { Entry::Dual } else { Entry::Primal },
             factorized: false,
             basic_values: Vec::new(),
+            dual_steepest: dual_ready,
+            row_weights: vec![1.0; m],
+            tau: Vec::new(),
         };
         solver.recompute_basic_values();
         solver
@@ -660,6 +772,9 @@ impl<'a> Solver<'a> {
             basis: factors.unwrap_or_else(|| Basis::all_logical(m)),
             factorized,
             basic_values: Vec::new(),
+            dual_steepest: false,
+            row_weights: Vec::new(),
+            tau: Vec::new(),
             basic: start.basic.clone(),
             status,
             z,
@@ -1092,12 +1207,92 @@ impl<'a> Solver<'a> {
                 if found.is_none_or(|(prev, _)| j < self.basic[prev]) {
                     found = Some((i, side));
                 }
-            } else if violation > worst {
-                worst = violation;
-                found = Some((i, side));
+            } else if !self.dual_steepest {
+                if violation > worst {
+                    worst = violation;
+                    found = Some((i, side));
+                }
+            } else {
+                // Steepest edge, not the largest violation. The violation says how far
+                // this row is from feasible in whatever units the row happens to be
+                // written in; dividing by the row's norm in the basis inverse says how
+                // far the solution actually moves to repair it, which is what decides
+                // whether the pivot is worth taking. The two differ by however badly the
+                // rows are scaled against one another, which on a real model is a lot.
+                //
+                // Whichever row scores highest, but *some* row every time. A violating
+                // row must never be passed over, because returning nothing from here is
+                // read as primal feasibility and ends the solve; scores can legitimately
+                // underflow to zero when a weight is enormous, and a rule accepting only
+                // a strict improvement over zero would then skip every violating row.
+                let score = violation * violation / self.row_weights[i];
+                if found.is_none() || score > worst {
+                    worst = score;
+                    found = Some((i, side));
+                }
             }
         }
         found
+    }
+
+    /// Keep a steepest edge weight inside the range where it still means something.
+    ///
+    /// A weight is a squared norm, so it is positive by construction, but the update is
+    /// only exact in exact arithmetic: it can drift negative, and `ratio^2 * reference`
+    /// can overflow outright when a pivot is small. Either ruins the score it feeds, and
+    /// an infinite weight is the worse of the two, because it drives the score to zero
+    /// rather than to nonsense, which reads as a row not worth choosing.
+    fn clamp_weight(weight: f64) -> f64 {
+        if weight.is_finite() {
+            weight.clamp(1e-4, 1e12)
+        } else {
+            1.0
+        }
+    }
+
+    /// Carry the steepest edge weights across a pivot.
+    ///
+    /// The weight of row `i` approximates the squared norm of row `i` of `B^-1`, which
+    /// is what turns a bound violation into the distance the solution must travel to
+    /// remove it. With the entering column `alpha = B^-1 A_q`, the pivot row
+    /// `rho = B^-T e_r` and `tau = B^-1 rho`, the exact update is
+    ///
+    /// ```text
+    ///     w_r <- w_r / alpha_r^2
+    ///     w_i <- w_i - 2 (alpha_i / alpha_r) tau_i + (alpha_i / alpha_r)^2 w_r
+    /// ```
+    ///
+    /// which costs one extra FTRAN per iteration. That is the price of the rule, and
+    /// the reason it is paid only here, where the alternative is choosing a row by a
+    /// number with no fixed meaning across rows.
+    fn update_row_weights(&mut self, r: usize, rho: &[f64]) {
+        let pivot = self.alpha[r];
+        if pivot.abs() <= self.lp.tol.pivot {
+            return;
+        }
+        let mut tau = std::mem::take(&mut self.tau);
+        self.basis.ftran(rho, &mut tau);
+
+        // The chosen row's weight is available exactly rather than carried forward:
+        // `rho` is `B^-T e_r`, so the squared norm this weight holds is `rho . rho`.
+        // Taking it from there costs nothing, since `rho` is already in hand, and stops
+        // the update compounding its own error, which is what a recurrence like this
+        // does if left to itself: carried forward, `drayage-100-23` took 487230
+        // iterations where the exact value takes 2374.
+        let reference = Self::clamp_weight(rho.iter().map(|v| v * v).sum());
+        for (i, &tau_i) in tau.iter().enumerate().take(self.lp.m) {
+            if i == r {
+                continue;
+            }
+            let ratio = self.alpha[i] / pivot;
+            if ratio == 0.0 {
+                continue;
+            }
+            let updated = self.row_weights[i] - 2.0 * ratio * tau_i + ratio * ratio * reference;
+            self.row_weights[i] = Self::clamp_weight(updated);
+        }
+        self.row_weights[r] = Self::clamp_weight(reference / (pivot * pivot));
+        self.tau = tau;
     }
 
     /// The dual simplex: repair primal infeasibility while holding dual feasibility.
@@ -1166,8 +1361,20 @@ impl<'a> Solver<'a> {
             self.y = y;
 
             let Some((r, violated)) = self.most_infeasible_row(bland) else {
-                // Primal feasible and still dual feasible, so this is the optimum.
-                return Some(LpStatus::Optimal);
+                // Primal feasible. For a warm start that is the optimum, because the
+                // basis came in dual feasible and the ratio test holds it there.
+                //
+                // A cold entry crosses the whole model to get here, and the invariant
+                // the ratio test preserves in exact arithmetic drifts out in this one.
+                // Checking rather than assuming is what turned two wrong answers into
+                // right ones on the branch this came from, `gasprod1-2` and `s55`,
+                // where a non-optimal basis was reported as the optimum. Primal
+                // feasible but not dual feasible is exactly the state the primal method
+                // is for, so hand it the basis rather than ruling here.
+                if !self.dual_steepest || self.is_dual_feasible() {
+                    return Some(LpStatus::Optimal);
+                }
+                return None;
             };
 
             self.basis.btran_unit(r, &mut rho);
@@ -1229,7 +1436,13 @@ impl<'a> Solver<'a> {
             }
 
             let Some((entering, _)) = best else {
-                // The dual is unbounded, so the primal has no feasible point.
+                // The dual is unbounded, so the primal has no feasible point. That
+                // reasoning also rests on the basis being dual feasible, and an
+                // infeasibility claim is the most expensive thing to get wrong, so a
+                // cold entry checks before making it.
+                if self.dual_steepest && !self.is_dual_feasible() {
+                    return None;
+                }
                 return Some(LpStatus::Infeasible);
             };
 
@@ -1268,21 +1481,31 @@ impl<'a> Solver<'a> {
             // step length keeps the counter at zero, was only ever reached through the
             // cold-start dual entry on the `dual-cold-start` branch, where it is kept.
             // Warm starts, which is all this method does here, have not shown it.
-            stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
-            // The counter above reads primal step length. Degeneracy here is a zero
-            // *ratio*: the entering column was already priced at zero, so the dual
-            // objective cannot move whatever the step turns out to be, and no count of
-            // steps can see it.
-            //
-            // Counting ratios and escalating to Bland's rule was tried and reverted,
-            // because zero ratios are ordinary rather than exceptional in this method
-            // and Bland is slow: drayage-25-23 fell from 98 nodes in a minute to 4.
-            // Handing the node over is the cheaper answer to the same signal. The
-            // primal loop continues from this basis and brings its own way out of a
-            // cycle, so nothing is given up by leaving here.
-            degenerate = if best_ratio <= tol { degenerate + 1 } else { 0 };
-            if degenerate > STALL_LIMIT {
-                return None;
+            if self.dual_steepest {
+                // A cold entry counts the ratio and escalates to Bland's rule. Handing
+                // over, as a warm start does below, hands this basis to the primal loop
+                // it was reached in place of, which is stuck: `tanglegram6` finishes in
+                // 207 pivots when the dual method is allowed its own way out of a
+                // degenerate patch and does not finish at all when it gives up here.
+                // The cost of Bland's rule is affordable because this runs once.
+                stalled = if best_ratio <= tol { stalled + 1 } else { 0 };
+            } else {
+                stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
+                // The counter above reads primal step length. Degeneracy here is a zero
+                // *ratio*: the entering column was already priced at zero, so the dual
+                // objective cannot move whatever the step turns out to be, and no count
+                // of steps can see it.
+                //
+                // Counting ratios and escalating to Bland's rule was tried and reverted
+                // for warm starts, because zero ratios are ordinary rather than
+                // exceptional there and Bland is slow: drayage-25-23 fell from 98 nodes
+                // in a minute to 4. Handing the node over is the cheaper answer to the
+                // same signal. The primal loop continues from this basis and brings its
+                // own way out of a cycle, so nothing is given up by leaving here.
+                degenerate = if best_ratio <= tol { degenerate + 1 } else { 0 };
+                if degenerate > STALL_LIMIT {
+                    return None;
+                }
             }
             self.z[entering] += step;
             for i in 0..self.lp.m {
@@ -1290,6 +1513,12 @@ impl<'a> Solver<'a> {
                 self.z[bj] -= self.alpha[i] * step;
             }
             self.z[leaving] = target;
+
+            // Before the basis moves: the update reads `alpha` and the pivot row
+            // against the factorization they were computed from.
+            if self.dual_steepest {
+                self.update_row_weights(r, &rho);
+            }
 
             self.basis.update(&self.alpha, r);
             self.basic[r] = entering;
@@ -1564,10 +1793,17 @@ impl<'a> Solver<'a> {
             // basis it reached. Answering the node slowly beats not answering it, and
             // the general case is untouched because the dual method almost always
             // finishes well inside its share.
+            //
+            // A cold entry is the exception: there is no parent's optimum to be near,
+            // so the dual method is not repairing a bound, it is the solve. It gets the
+            // whole budget.
             const DUAL_SHARE: usize = 2;
-            if let Some(status) =
-                self.run_dual(max_iterations / DUAL_SHARE, cutoff, &mut iterations)
-            {
+            let budget = if self.dual_steepest {
+                max_iterations
+            } else {
+                max_iterations / DUAL_SHARE
+            };
+            if let Some(status) = self.run_dual(budget, cutoff, &mut iterations) {
                 return self.done(status, iterations);
             }
         }

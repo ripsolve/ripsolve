@@ -1241,11 +1241,40 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     lp.set_deadline(deadline);
     iterations += root.iterations;
 
-    // A relaxation that did not finish is usually not slow, it is stuck: the models this
-    // happens on are set partitioning problems whose every coefficient is one, where a
-    // crowd of bases describes one point and the steps between them have length zero.
-    // `ex9` spends 8871 consecutive iterations taking steps of length zero without the
-    // worst violation moving off 1.0.
+    // A relaxation that did not finish is usually not slow, it is stuck. Two rescues,
+    // each bounded by what the first attempt spent: the same model at the same size is
+    // worth about as much again, and no more. Held to the caller's deadline instead,
+    // the first of them took everything that was left, and on all eight of the models
+    // that need a rescue here it came back at IterationLimit with the whole run gone.
+    // The second rescue was unreachable for that reason alone.
+    let budget = root.iterations.clamp(1, options.max_iterations_per_node);
+
+    // The dual method first, because it is cheap where it works: `air04`'s relaxation
+    // goes from not finishing in 130 seconds to finishing in 1.5, and `tanglegram6`'s
+    // in 0.5. Where it does not work it is bounded like everything else here.
+    //
+    // Asked here and nowhere else, and that is the whole of why it is safe. The primal
+    // method reaches feasibility through phase 1, whose cost vector scores a basic
+    // variable by whether it currently violates a bound and so is blind to the kink at
+    // one sitting exactly on one; no ratio test repairs a column choice made that way,
+    // and the dual method has no phase 1 to get stuck in. Made the default it loses
+    // anyway: the two methods end on *different* optimal vertices, and everything
+    // downstream reads the root's vertex rather than its objective, since Gomory cuts
+    // come off that tableau and branching reads its fractional values. On this set the
+    // vertex it reaches is usually the worse one to start from. Asked only where the
+    // primal method produced no vertex at all, there is nothing to be worse than.
+    if root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
+        let rescued = lp.solve_cold_dual(budget);
+        iterations += rescued.iterations;
+        if rescued.status == LpStatus::Optimal {
+            root = rescued;
+        }
+    }
+
+    // Then perturbation. The models this catches are set partitioning problems whose
+    // every coefficient is one, where a crowd of bases describes one point and the
+    // steps between them have length zero: `ex9` spends 8871 consecutive iterations
+    // taking steps of length zero without the worst violation moving off 1.0.
     //
     // Perturbing the bounds by a random amount too small to matter breaks that: no two
     // variables sit on the same bound any more, so the steps have somewhere to go. What
@@ -1260,12 +1289,24 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     // matters: that one perturbed and warm started from the *stalled* basis, which puts
     // the search back in the degeneracy it was trying to leave.
     if root.status != LpStatus::Optimal
-        && !deadline.is_some_and(|d| Instant::now() >= d)
+        && deadline.is_none_or(|d| Instant::now() < d)
         && options.perturb_stalled_root
+        && let Some(rescued) = perturbed_root(problem, &lp, deadline, budget)
     {
-        if let Some(rescued) = perturbed_root(problem, &lp, &options, deadline) {
-            iterations += rescued.iterations;
-            root = rescued;
+        iterations += rescued.iterations;
+        root = rescued;
+    }
+    // Both rescues bounded and both failed, with the caller's clock still running. The
+    // budget above is what makes a *second* attempt worth trying, not a ceiling on the
+    // relaxation itself: what the caller asked for is the best answer available by their
+    // deadline, so the last resort is the first attempt continued to it. Without this a
+    // model whose rescues are cheap and hopeless returns at 41 seconds of a 60 second
+    // budget, having given up with a third of the run unspent.
+    if root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
+        let again = lp.solve_with_limit(options.max_iterations_per_node);
+        iterations += again.iterations;
+        if again.status == LpStatus::Optimal {
+            root = again;
         }
     }
     nodes += 1;
@@ -1633,8 +1674,8 @@ const PERTURBATION_REACH: f64 = 1e-6;
 fn perturbed_root(
     problem: &Problem,
     exact: &Lp,
-    options: &Options,
     deadline: Option<Instant>,
+    max_iterations: usize,
 ) -> Option<LpSolution> {
     // SplitMix64, so a run is reproducible.
     let mut state = 0x5DEE_CE66Du64;
@@ -1671,18 +1712,13 @@ fn perturbed_root(
 
     let mut loose = Lp::relaxation(&loosened);
     loose.set_deadline(deadline);
-    let solved = loose.solve_with_limit(options.max_iterations_per_node);
+    let solved = loose.solve_with_limit(max_iterations);
     if solved.status != LpStatus::Optimal {
         return None;
     }
     // The perturbed objective is a bound on a weaker problem and is not used. Only the
     // basis crosses back.
-    let cleaned = exact.solve_with_rows(
-        &solved.basis,
-        &[],
-        None,
-        options.max_iterations_per_node,
-    );
+    let cleaned = exact.solve_with_rows(&solved.basis, &[], None, max_iterations);
     let mut cleaned = cleaned;
     cleaned.iterations += solved.iterations;
     (cleaned.status == LpStatus::Optimal).then_some(cleaned)
