@@ -1723,6 +1723,118 @@ So it is a guard against a proof that is wrong in kind, not one that is wrong at
 margin. That is worth having and worth not overstating, and the test says so in a comment
 rather than leaving the next reader to assume more of it.
 
+### Reduced cost fixing beyond the root, which is a table and not a mutation
+
+The root fixing spends whatever incumbent the root heuristics happened to find, and on
+this set that is far weaker than the one the search ends with: `n2seq36f` is at a 39.7%
+gap at the root and 0.38% at the end. So most of what the root's reduced costs prove is
+not provable when the only chance to use them goes by.
+
+This was written up as blocked, on the grounds that re-deriving the fixing whenever the
+incumbent improved means narrowing a model every worker holds immutably. It is not
+blocked, and HiGHS's `HighsRedcostFixing` says why: nothing in the derivation changes
+except one number. The reduced costs come from the root basis, the root's value is fixed,
+and only the room `u - root` shrinks. The bound each column will eventually take, and the
+incumbent at which it takes it, can both be worked out at the root and read off later.
+
+That makes it a table rather than a mutation, which is what makes it free in a parallel
+search. Ordered by the incumbent each entry needs, the entries in force are always a
+prefix: a worker recomputes the prefix length when the incumbent it sees moves, which is
+rarely, and applies it per node for the cost of the bound resets it was already doing. No
+coordination, and a worker behind on the incumbent applies fewer entries, which is wrong
+only in the direction that fixes less.
+
+```text
+n2seq36f     5910 of 6642 lurking bounds in force by the end, 158581 nodes a minute -> 314790
+neos-1599274  500 of 1950
+nw04         closes in 31s against 32 to 38
+irp          closes in 30s against 46 to 56
+```
+
+Nothing new closes, and `n2seq36f` shows why in one line: **its bound never leaves 52000,
+the root's own value, however many columns are fixed underneath it.** Fixing columns makes
+the tree cheaper to walk. It does not make the bound move.
+
+### Three things that do not move that bound, measured rather than assumed
+
+**A restart does not.** The obvious amplifier, and what HiGHS does at 55.8% inactive
+columns. Simulated before building it, with `cargo run --example restartsim`, which solves
+for one budget, applies the fixing the incumbent earned, and solves what is left for
+another. `n2seq36f` narrows to 6348 of 8100 columns decided and the restarted search
+returns a bound of **52000**, to the unit. `neos-1516309` comes back *worse*, 35487
+against 35525, having thrown away the cuts the first pass accumulated. This is a large
+refactor that the measurement says not to do.
+
+**Objective granularity does not, here.** Every coefficient of `n2seq36f` is a multiple of
+200, so 52000 and 52200 are adjacent attainable values and the bound is already on one of
+them. It is worth having for other reasons and is in; see below.
+
+**Accumulating more cuts does not.** The cut loop ages a cut out after two rounds sitting
+slack, and on a degenerate model that looked like the reason nothing accumulates. Holding
+every cut instead, 1019 of them, moves the bound by nothing at all. So it is not cut
+management:
+
+```text
+cuts held    2 rounds     10 rounds    forever
+bound        52000        52000        52000
+```
+
+### What HiGHS does on the same model, which is the target
+
+```text
+ J    0   0.00%   -inf          123000    Large       0 cuts     0 inlp    0.3s
+      0   0.00%   52000         123000    57.72%      0          0         0.3s
+ C    0   0.00%   52000          63200    17.72%    200         33         0.4s
+ L    0   0.00%   52200          57000     8.42%   1120        101         2.0s
+ L    0   0.00%   52200          52400     0.38%   1121        108         2.8s
+55.8% inactive integer columns, restarting
+      ... 254 rows, 1427 cols after restart ...
+ L    0   0.00%   52200          52200     0.00%    975        102         3.6s
+```
+
+It starts from the same bound this solver has, 52000, and **cuts move it to 52200 at two
+seconds**, closing the whole of the gap from the bound side. 1120 cuts generated, 101 held
+in the LP. This solver generates 1019 in the same place and moves the bound zero.
+
+So the difference is not the number of cuts, nor how long they are kept. It is what they
+cut. `n2seq36f` has 285 rows and 8100 columns, and its optimal face is enormous: every cut
+here removes one vertex of it and the LP steps to another vertex worth the same 52000.
+Cutting a face rather than a vertex is what single-row separation cannot do, and it is
+what this solver's four families all are. HiGHS's extra reach on this model comes from
+aggregation, `HighsPathSeparator` and `HighsLpAggregator` building MIR cuts over
+*combinations* of rows rather than one row at a time.
+
+That is the next thing to build for the bound group, and it is the first time this file
+has had a specific target for it rather than "stronger cuts".
+
+### Bounds lifted to the objective values a model can take
+
+Not aimed at `n2seq36f`, though it is what found it. When every column carrying an
+objective coefficient is an integer column and every such coefficient is a whole multiple
+of `g`, no feasible point scores anything but a multiple of `g`, so a bound of 52000.3 is
+really a bound of 52200. Twenty-four of the thirty-one addressable instances have an
+integral objective and four have a spacing above one: `n2seq36f` 200, `neos-780889` and
+`bley_xl1` 5, `nw04` 2.
+
+It also tightens reduced cost fixing, which is where most of what it does shows up. A
+solution better than the incumbent is better by a whole step, so the cutoff is `u - g` and
+the room is a step smaller. On `n2seq36f` the room goes from 200 to nothing, and a room of
+nothing pins every column the relaxation left on a bound.
+
+Small, measured at one thread where the search is deterministic: `nw04` optimal in 29.2s
+against 30.9, `neos-1516309` a better bound over more nodes, `air05` 127 nodes against 85,
+nothing worse. No instance newly closed.
+
+The defect in it is the part worth keeping. The divisor loop returned as soon as the
+spacing reached one, which is where it stops improving and so looks like the right place
+to stop. It is not: whether the reasoning applies at all is decided by *every* column, and
+returning early skips the ones not yet looked at. A fuzz instance whose first two integer
+coefficients were 8 and 3 was read as integral before the loop reached the continuous
+column with a coefficient of 6.5, and the search then proved an optimum of 34.375 where
+the answer is 34.25. The unit tests did not catch it and the differential fuzz did, on the
+first run after the change. An early exit on the *value* being computed is safe; an early
+exit that also skips a *validity* check is not, and the two are easy to write as one line.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

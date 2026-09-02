@@ -93,7 +93,36 @@ well over 60 seconds even from a free root — the branch reached a 0.62% gap on
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
 
-## Reduced cost fixing is built, at the root only, and that is where to continue
+## Next: cuts that cut a face, not a vertex
+
+The first specific target this file has had for the bound group, and it comes from
+watching HiGHS solve `n2seq36f` rather than from first principles.
+
+Both solvers start from the same relaxation bound of 52000 against an optimum of 52200.
+HiGHS moves the bound to 52200 at two seconds with 1120 cuts, 101 of them held in the LP,
+and that closes the whole gap from the bound side. This solver generates 1019 cuts in the
+same place and moves the bound by **nothing at all**, to the unit.
+
+Three explanations were tested and all three are wrong:
+
+- Not the *number* of cuts. 4036 of them move it zero.
+- Not how long they are kept. The loop ages a cut out after two rounds sitting slack;
+  holding every one of them instead still moves it zero.
+- Not reduced cost fixing, and not a restart. `n2seq36f` narrows to 78% of its columns
+  decided and the bound is still 52000. `cargo run --example restartsim` simulates the
+  restart in a few minutes rather than building it, and says not to build it.
+
+What is left is what the cuts *are*. `n2seq36f` has 285 rows and 8100 columns and an
+enormous optimal face; every cut here removes one vertex of it and the LP steps to another
+vertex worth the same 52000. All four families in `cuts.rs` -- cover, MIR, clique, GMI --
+separate from a single row or a single tableau row. Cutting a face needs aggregation: MIR
+over *combinations* of rows, which in HiGHS is `HighsPathSeparator` over `HighsLpAggregator`.
+
+That is the build. It is the largest identified group (ten instances lose on the bound,
+four of them within 4%), and it is the only lever on that group that has not been tried
+and measured this session.
+
+## Reduced cost fixing is built, root and beyond, and is not the bound group's answer
 
 Built this session and it is what moved `nw04`. At an optimal basis a nonbasic column's
 reduced cost `d` says the objective cannot fall by leaving the bound it sits on, so moving
@@ -102,26 +131,26 @@ reduced cost `d` says the objective cannot fall by leaving the bound it sits on,
 column rounds inwards and on a binary usually decides it. `nw04` fixes 25471 columns of
 87482 this way, `neos-1516309` 350 of 4500.
 
-**The obvious continuation is to re-run it as the incumbent improves.** It currently runs
-once, at the root, against whatever incumbent the root heuristics found, and that
-incumbent is far weaker than the one the search ends with: `n2seq36f` is at a 39.7% gap at
-the root and 0.38% at the end. The room `(u - root)` is widest exactly when the fixing runs
-and narrowest when it would pay most, so most of this reduction is still on the table.
+It now runs beyond the root as well, as a table rather than a mutation, which is how the
+"shared immutably across threads" obstacle dissolves: nothing in the derivation changes
+except the room, so the bound each column will take and the incumbent at which it takes it
+are both worked out at the root. Entries are ordered by the incumbent they need, so the
+ones in force are a prefix and a worker recomputes its length only when the incumbent
+moves. On `n2seq36f`, 5910 of 6642 come into force and the node count over a minute
+doubles.
 
-Two obstacles, found by scoping it and worth having before starting rather than after:
+**It is not what the bound group needs, and that is now measured rather than assumed.**
+`n2seq36f`'s bound never leaves 52000 however many columns are fixed underneath it. See
+the section above for what does move it.
 
-- **Globally**, the model is shared immutably across the search's threads, so a
-  mid-search tightening has nowhere to live that a running worker can read. A restart is
-  the shape that fits, and restarts are separately on the list for nine of the 31.
-- **Per node**, where it would otherwise be the textbook answer, `Node.fixings` is not
-  free to grow: `search.rs` uses `node.fixings.len()` as the node's *depth* in the
-  best-bound pool's tie-break. Appending implied bounds to it would silently corrupt node
-  ordering, and on `nw04` it would append 25471 entries to a vector that is cloned per
-  child. Implied bounds need their own field, kept out of the depth measure, and a cap.
-
-The cost side is already dealt with: `Lp::reduced_costs` reuses the factorization the
-basis was left with, so asked right after a node's own solve it is one BTRAN and a pass
-over the columns, not a refactorization.
+Still genuinely open, if someone wants the rest of the reduction: node-local fixing, using
+each node's own LP duals against its own bound, which is stronger than the root's. One
+obstacle to know about first -- `search.rs` uses `node.fixings.len()` as the node's *depth*
+in the best-bound pool's tie-break, so implied bounds cannot be appended to that vector
+without silently corrupting node ordering, and on `nw04` it would append 25471 entries to
+something cloned once per child. They need their own field and a cap. The cost side is
+already dealt with: `Lp::reduced_costs` reuses the factorization the basis was left with,
+so asked right after a node's own solve it is one BTRAN and a pass over the columns.
 
 Two things not to get wrong, both learned the hard way here and both written up in
 `design-notes.md`:
