@@ -114,6 +114,62 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
 }
 
 #[test]
+fn reduced_cost_fixing_does_not_change_any_optimum() {
+    // Reduced cost fixing narrows columns on the strength of a proof about the whole
+    // tree: that no solution better than the incumbent has them anywhere else. A proof
+    // that is a little too strong removes the optimum and the search reports the
+    // second best answer with every appearance of certainty, which is why this is
+    // checked against the same search with the claim turned off rather than against a
+    // recorded value that would also have to be trusted.
+    let data = fixtures();
+    let samples = data["samples"].as_array().unwrap().iter().map(|entry| {
+        let file = entry["file"].as_str().unwrap().to_string();
+        (
+            Problem::from_file(&samples_dir().join(&file)).unwrap(),
+            file,
+        )
+    });
+    // The generated families as well as the samples, and it is worth knowing how much
+    // this catches. Setting the travel cap to zero, so that every nonbasic column is
+    // pinned where it sits, is caught on `v064c200`, which answers 1039 against 225.
+    // Merely halving the cap is not caught by either set, so this is a guard against a
+    // proof that is wrong in kind rather than a proof that is wrong at the margin.
+    let generated = data["instances"].as_array().unwrap().iter().map(|entry| {
+        let spec = spec_of(entry);
+        let name = entry["name"].as_str().unwrap().to_string();
+        (
+            Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap(),
+            name,
+        )
+    });
+    for (problem, file) in samples.chain(generated) {
+        let with = search::solve(
+            &problem,
+            Options {
+                fix_by_reduced_cost: true,
+                ..Options::default()
+            },
+        );
+        let without = search::solve(
+            &problem,
+            Options {
+                fix_by_reduced_cost: false,
+                ..Options::default()
+            },
+        );
+
+        assert_eq!(with.status, without.status, "{file}");
+        match (with.objective, without.objective) {
+            (Some(a), Some(b)) => {
+                assert!((a - b).abs() < 1e-6, "{file}: fixing {a}, plain {b}")
+            }
+            (None, None) => {}
+            (a, b) => panic!("{file}: fixing {a:?}, plain {b:?}"),
+        }
+    }
+}
+
+#[test]
 fn presolve_does_not_change_any_optimum() {
     // Presolve is allowed to reduce the model however it likes, provided the answer
     // is identical. Checked on every sample, both ways.

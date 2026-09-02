@@ -459,6 +459,40 @@ impl Lp {
         solution
     }
 
+    /// The reduced cost of every structural column at `basis`, with the bound each
+    /// nonbasic one is parked on. Basic columns report `None`.
+    ///
+    /// This is what makes a bound do more than prune. A nonbasic column's reduced cost
+    /// is the rate at which the objective rises as it moves off the bound it sits on,
+    /// so with a proven bound `z` and an incumbent `u`, a column that would push the
+    /// objective past `u` before reaching its other bound cannot take that other value
+    /// in any solution better than the one already in hand.
+    ///
+    /// Returned rather than acted on here because the decision needs an incumbent,
+    /// which is the search's business and not the LP's.
+    pub fn reduced_costs(&self, basis: &BasisState) -> Option<Vec<Option<(f64, bool)>>> {
+        let mut solver = Solver::warm(self, basis, None);
+        if solver.refactorize().is_err() {
+            return None;
+        }
+        solver.load_basic_costs(false);
+        let mut y = std::mem::take(&mut solver.y);
+        solver.basis.btran(&solver.cost_b, &mut y);
+        solver.y = y;
+        Some(
+            (0..self.n_structural)
+                .map(|j| match solver.status[j] {
+                    Status::Basic { .. } => None,
+                    Status::NonBasic(At::Lower) => Some((solver.reduced_cost(j, false), false)),
+                    Status::NonBasic(At::Upper) => Some((solver.reduced_cost(j, false), true)),
+                    // A free column parked at zero is on no bound, so there is no
+                    // "other value" for a reduced cost to rule out.
+                    Status::NonBasic(At::Zero) => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Generate Gomory mixed-integer cuts from the tableau at `basis`.
     ///
     /// Returned in terms of the *structural* columns, as `(coefficients, lower

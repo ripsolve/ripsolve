@@ -81,6 +81,12 @@ pub struct Options {
     pub local_cuts_per_node: usize,
     /// Restart a stalled root relaxation from a perturbed one.
     pub perturb_stalled_root: bool,
+    /// Narrow columns the root's bound and the incumbent together already decide.
+    ///
+    /// A toggle because the claim it makes is a proof about the whole tree, and a proof
+    /// is worth being able to turn off and compare against: the test that keeps it
+    /// honest solves every sample both ways and requires the same answer.
+    pub fix_by_reduced_cost: bool,
     /// Flips the LP-free feasibility search may make before giving up.
     ///
     /// It runs ahead of the root relaxation, so this is the one heuristic budget that
@@ -194,6 +200,7 @@ impl Default for Options {
             local_cuts_per_node: 8,
             jump_moves: 25_000,
             perturb_stalled_root: true,
+            fix_by_reduced_cost: true,
             cut_rounds: 50,
             cuts_per_round: 64,
             refactor_interval: 200,
@@ -1492,6 +1499,23 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         open = OpenNodes::new(options.plunge_limit);
     }
 
+    // With a proven bound and a point in hand, some columns are already decided.
+    //
+    // A nonbasic column's reduced cost is the rate at which the objective rises as it
+    // leaves the bound it is parked on, so if travelling to its other bound would push
+    // the root's own bound past the incumbent, no solution better than the one already
+    // held has it there. That is a proof about the whole tree, made once, from numbers
+    // the root LP has already computed.
+    //
+    // The bounds go into the model rather than into a node, because every node rebuilds
+    // its bounds from the model before solving; one pass here reaches all of them.
+    let tightened = (options.fix_by_reduced_cost
+        && root.status == LpStatus::Optimal
+        && incumbent.is_finite())
+        .then(|| fix_by_reduced_cost(problem, &lp, &root, incumbent, &options))
+        .flatten();
+    let problem = tightened.as_ref().unwrap_or(problem);
+
     let mut status = Status::Optimal;
 
     let threads = options.threads.max(1);
@@ -1722,6 +1746,74 @@ fn perturbed_root(
     let mut cleaned = cleaned;
     cleaned.iterations += solved.iterations;
     (cleaned.status == LpStatus::Optimal).then_some(cleaned)
+}
+
+/// Narrow the columns the root's bound and the incumbent together already decide.
+///
+/// At an optimal basis every nonbasic column sits on a bound with a reduced cost `d`
+/// whose sign says the objective cannot fall by leaving it. Moving distance `t` off that
+/// bound therefore raises the objective by at least `|d| t`, and since the root's value
+/// is a bound on every solution in the tree, anything better than the incumbent `u`
+/// satisfies `root + |d| t < u`. That caps `t` at `(u - root) / |d|`, and for an integer
+/// column the cap rounds inwards, which on a binary usually means fixing it outright.
+///
+/// Returns the narrowed model, or `None` when nothing moved and the caller should keep
+/// the one it has rather than pay for a copy.
+fn fix_by_reduced_cost(
+    problem: &Problem,
+    lp: &Lp,
+    root: &LpSolution,
+    incumbent: f64,
+    options: &Options,
+) -> Option<Problem> {
+    let costs = lp.reduced_costs(&root.basis)?;
+    // The room a better solution has to move in. Any margin on this belongs on the
+    // generous side: a *smaller* room caps the travel harder and so fixes more, which
+    // is the direction that can cut off a solution nobody has seen yet. The tolerances
+    // below are all widenings for the same reason.
+    let room = incumbent - root.objective;
+    if room <= 0.0 || !room.is_finite() {
+        return None;
+    }
+
+    let mut narrowed = problem.clone();
+    let mut changed = 0usize;
+    for (j, entry) in costs.iter().enumerate() {
+        let Some((d, at_upper)) = *entry else {
+            continue;
+        };
+        let (lo, hi) = (narrowed.col_lb[j], narrowed.col_ub[j]);
+        if lo >= hi || !lo.is_finite() || !hi.is_finite() {
+            continue;
+        }
+        let reach = d.abs();
+        if reach <= 1e-9 {
+            continue;
+        }
+        // Widened by a relative and an absolute slack, because `room` and `reach` are
+        // both floating point results of a long solve and the claim being made is that
+        // no better solution exists past this point.
+        let travel = (room / reach).mul_add(1.0 + 1e-9, 1e-9);
+        if travel >= hi - lo {
+            continue;
+        }
+        // Integer columns round the cap inwards; a fractional cap of 0.4 on a binary
+        // parked at zero means it can only be zero.
+        let travel = if narrowed.is_integer(j) {
+            (travel + options.integrality_tolerance).floor()
+        } else {
+            travel
+        };
+        if at_upper {
+            narrowed.col_lb[j] = (hi - travel).min(hi).max(lo);
+        } else {
+            narrowed.col_ub[j] = (lo + travel).max(lo).min(hi);
+        }
+        if narrowed.col_lb[j] != lo || narrowed.col_ub[j] != hi {
+            changed += 1;
+        }
+    }
+    (changed > 0).then_some(narrowed)
 }
 
 /// How much of the run the LP-free feasibility search may have.
