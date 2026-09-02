@@ -181,13 +181,18 @@ fn main() -> Result<()> {
                     // limit-terminated run reports its remaining gap instead.
                     if solution.status == SearchStatus::Optimal {
                         println!("status:    optimal");
-                    } else {
+                    } else if solution.bound.is_finite() {
                         println!(
                             "status:    {:?} (bound {}, gap {:.4}%)",
                             solution.status,
                             solution.bound,
                             solution.gap() * 100.0
                         );
+                    } else {
+                        // Nothing was proven about this point, and saying so in words
+                        // beats printing a bound of NaN and leaving the reader to work
+                        // out what that means.
+                        println!("status:    {:?} (no bound proven)", solution.status);
                     }
                     // `-v` is the old spelling of `--values nonzero` and still works.
                     let wanted = if verbose && values == Values::None {

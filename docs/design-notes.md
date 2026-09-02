@@ -1296,6 +1296,11 @@ The measurement stands whatever happens to the code: the reduction is available,
 matches a reference solver on one instance and gets most of the way on two more, and it
 is the only thing tried here that closes `mitre`.
 
+**Superseded.** Everything above about the cost is true of the implementation and false
+of the idea; the next three sections are what happened when the sweep stopped rebuilding
+itself. The reasoning about reach, and about what "most constrained first" means on a set
+partitioning model, still holds.
+
 ### The corners of the box
 
 The cheapest heuristic here, and the last one added. Putting every column on one of its
@@ -1316,6 +1321,115 @@ answer and none, and nothing is compared against it because there is nothing to 
 That ordering mistake has now been made three times in this file, with two of them
 already written down when the third was made. Cheapest first is the wrong rule whenever
 a heuristic is cheap because its answers are bad.
+
+### What probing actually cost, which was not probing
+
+This supersedes "Probing, which reduces the models and cannot be afforded" above.
+
+Probing was parked twice for cost, both times after trying another budget. The cost was
+never in the idea. It was in what a sweep rebuilt before it did any reasoning, and a
+probe does two sweeps per column.
+
+Three things were being rebuilt. `adjacent` allocated a vector, cloned a literal's edges
+into it, appended each of its cliques, sorted the result and deduplicated it, once per
+column fixed; the widest literal of `air03` excludes 3861 others, so that is a
+3861-element sort performed to spare the propagator a comparison it does not mind making.
+A trial assignment was a copy of the model's bounds, so a probe paid a pass over the
+columns before looking at anything, and a model of ten thousand columns was copied twenty
+thousand times over a pass. And a row's activity range was recomputed from its
+coefficients whenever any column in it moved, which on a set partitioning model is most
+of the matrix per fixing.
+
+None of it is needed. Literals are visited in place. The assignment records the value it
+overwrote and undoes by walking that record backwards, which is what "does not rebuild
+its state per probe" meant when this file asked for it. Row activities are carried on the
+same record, restored to the value they held rather than by re-adding what was subtracted,
+because an activity walked forwards and backwards through a million floating point
+additions does not come back to where it started and probing fixes columns for good on
+what these numbers say. And a row whose slack at both ends exceeds what any single column
+could contribute to it can force nothing whatever is fixed in it, so it is skipped on two
+comparisons against numbers it already carries, instead of being read.
+
+Measured on presolve alone, with the search taken out of the picture:
+
+```text
+                 before              after
+mitre            3677 in 0.29s       3677 in 0.06s
+mod010            168 in 8.97s        168 in 0.10s
+air04             787 in 10.19s      1343 in 2.33s
+air03               0 in 3.14s          0 in 0.51s
+```
+
+`air04` is the interesting column. The old budget was spending ten seconds to get 787
+columns because most of the ten seconds was overhead; the same budget spent honestly gets
+1343, against a reference solver's 1400.
+
+### A budget for probing that is not another share of something
+
+With the overhead gone the budgets could be reconsidered, and the six that failed have
+one thing in common: they counted probes. A probe's cost is how far its consequences
+reach, and reach spans three orders of magnitude within one model, so counting probes
+prices a column in a clique of four the same as one in a clique of four thousand. A
+model whose probes are all expensive and all fruitless then spends its whole pass earning
+the right to stop.
+
+The unit is matrix entries read. Two bounds on it, because they catch different failures:
+
+- **Patience.** What may be read without proving anything, reset on every column proved.
+  A model that keeps proving things keeps its budget; one that has stopped proving them
+  loses it quickly. This is what a run of unproductive probes was trying to be.
+- **Total.** What may be read in all. Patience alone does not bound a model with nine
+  thousand proofs to find, each individually earned and affordable, because every one of
+  them resets the count: `ex10` goes on finding them for two minutes.
+
+Both are absolute counts rather than multiples of the matrix. Multiples of the matrix
+were tried and are the wrong shape: a model with eight million nonzeros then gets a
+hundred times the work a model with eighty thousand gets for the same reduction, and
+`rail02` and `opm2-z12-s8` spend twenty seconds proving nothing on that account. What the
+absolute figure encodes is a judgement about how much reasoning about a model is worth
+doing before solving it, which is a property of neither the caller's clock nor the
+matrix's size.
+
+A third bound, on one probe, is separate from both rather than a share of them. It says
+how far a single consequence is worth chasing; shrinking it because the model has already
+proved everything it is going to prove would abandon every remaining probe at once, which
+is what happened when it was derived from patience.
+
+The distinction that makes patience work is between a sweep that finished and found
+nothing and a sweep that ran out of work. The first says the column has nothing to give.
+The second says only that it was not allowed to look. Treating them alike stops the pass
+on models that were about to pay: with the two conflated, `ex9` stopped after 512 probes
+having proved nothing, because all 512 had been abandoned rather than completed.
+
+### What the reduction is worth, and what it is not
+
+At the figures chosen, every instance this solver already closes pays under half a second
+for probing and most pay under a tenth, `mitre` gets the whole of its 3677 column
+reduction, and `mitre` closes at 18.2 seconds. Nothing else tried here has closed it.
+
+Ten times the budget buys several thousand more fixings on `ex9`, `ex10`, `air04`,
+`neos-4754521-awarau` and `rail01`, and closes none of them. Those first four all stop at
+one node with the root relaxation unfinished, which is the wall already recorded for them
+and is not a presolve problem: `air04` fixed 1343 columns and still spent sixty seconds
+on 37994 simplex iterations without leaving the root. The same ten times costs `irp`,
+which closes with two seconds to spare, more than two seconds.
+
+So the honest reading is that the reduction is now affordable and only one instance was
+waiting for it. The rest of the twelve that lose a fifth of their columns are waiting for
+something else, and it is the same something the twenty root bound instances are waiting
+for.
+
+### Two corrections found by rewriting it
+
+Row propagation offered `0` and `1` to any column in the row, taking whichever was the
+only one that fitted. On a continuous column bounded in `[0, 5]` that "forces" it to 0
+whenever 1 does not fit, which is harmless in the heuristic, where the point it produces
+is checked for feasibility afterwards, and unsound in presolve, where it is a proof that
+fixes a column for good. Values are now offered only to binaries.
+
+The clock backstop was read at every 64th candidate but placed after the skip for
+candidates with no conflicts, so a model whose first candidates were all skipped ran up
+to 63 probes past its deadline before noticing.
 
 ## Measuring the search
 
@@ -1353,6 +1467,14 @@ diagonal, which made pivot choice irrelevant. They passed with the bad pivot sea
 deliberately reintroduced. Any test asserting that an optimization is correct should
 be checked against the unoptimized path, and any threshold should be checked by
 disabling it and confirming the test then fails.
+
+A guard that quietly undoes itself. A search that proves nothing sets its bound to
+`NaN`, deliberately, so that a bound left over from an earlier phase cannot be read as a
+proof. The gap was then computed with a `.max(0.0)` on the end, and `f64::max` returns
+its non-`NaN` argument, so the guard came out the other side as `gap 0.0000%` — the
+reading it existed to prevent, and the most reassuring one available. `neos-954925`
+reported it on every run whose root relaxation did not finish, which is every run of it.
+A sentinel is only a guard if every path that consumes it knows it is a sentinel.
 
 Circular verification. A check written to confirm two pivot orderings agreed compared
 a shortlist against a stable sort of the same ordering it came from, so it could not

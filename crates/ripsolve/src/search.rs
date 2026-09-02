@@ -260,9 +260,16 @@ impl Solution {
     }
 
     /// Remaining optimality gap, relative to the incumbent. Zero when proven.
+    ///
+    /// A run that never got a bound reports no gap rather than a gap of zero. The
+    /// bound is deliberately `NaN` where nothing was proven, so that a leftover from an
+    /// earlier phase cannot be read as a proof, and `f64::max` returns its non-`NaN`
+    /// argument: clamping the gap at zero turned that `NaN` into exactly the "proven
+    /// optimal" reading the `NaN` was there to prevent. A run of `neos-954925` whose
+    /// root relaxation never finished reported `gap 0.0000%`.
     pub fn gap(&self) -> f64 {
         match self.objective {
-            Some(obj) if obj.is_finite() => {
+            Some(obj) if obj.is_finite() && self.bound.is_finite() => {
                 let denom = obj.abs().max(1e-10);
                 ((obj - self.bound).abs() / denom).max(0.0)
             }
@@ -1825,6 +1832,22 @@ mod tests {
     use crate::lp::Lp;
     use crate::model::{RowSense, Sense};
     use crate::sparse::SparseMatrix;
+
+    #[test]
+    fn a_point_without_a_bound_reports_no_gap_rather_than_none_left() {
+        // The state a time limit at an unfinished root leaves behind: a heuristic point
+        // in hand and nothing proven about it. Reported as a gap of zero, that reads as
+        // a proof of optimality, which is the one thing it is not.
+        let mut solution =
+            Solution::without_solution(Status::TimeLimit, 1, 0, None);
+        solution.objective = Some(0.0);
+        assert!(!solution.bound.is_finite());
+        assert_eq!(solution.gap(), f64::INFINITY);
+
+        // A bound that was proven still reports the gap it proves.
+        solution.bound = -1.0;
+        assert!(solution.gap().is_finite());
+    }
 
     /// Maximize `x0 + 2 x1 + 3 x2` subject to `x0 + x1 + x2 <= 2`, all binary.
     ///

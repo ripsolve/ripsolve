@@ -499,6 +499,147 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
     changed
 }
 
+/// Matrix entries one probe may read before it is abandoned.
+///
+/// Abandoning a probe that outruns this is safe in the only direction that matters: an
+/// unfinished sweep refutes nothing, so the column keeps both of its values.
+const PROBE_REACH: usize = 4_000_000;
+
+/// Matrix entries probing may read without proving anything, before it gives up.
+const PROBE_PATIENCE: usize = 30_000_000;
+
+/// Matrix entries probing may read in all, whether or not it is proving anything.
+///
+/// A count of work rather than a share of the caller's time limit, which would price
+/// this against how long someone happens to be willing to wait, and rather than a
+/// number of passes over the matrix, which lets a model with eight million nonzeros
+/// spend a hundred times what a model with eighty thousand does for the same reduction.
+/// The number is a judgement about how much reasoning about a model is worth doing
+/// before solving it, calibrated on the pure binary set: at this figure the worst model
+/// in it spends a second and a half, the twenty-four hardest average a third of a
+/// second between them, and every model the solver currently closes pays under half a
+/// second, while `mitre` still gets the whole of the 3677 column reduction that closes
+/// it. Roughly ten times this buys another few thousand fixings on models that do not
+/// close either way, and costs `irp`, which closes with two seconds to spare, more than
+/// two seconds.
+const PROBE_TOTAL: usize = 100_000_000;
+
+/// Fix the columns for which only one of the two values survives its own consequences.
+///
+/// Every other reduction here reasons forwards from the bounds it has. This one reasons
+/// backwards: suppose a column takes a value, work out what follows, and if that ends in
+/// a contradiction the supposition was wrong and the column is fixed to the other value.
+/// Nothing is guessed; a value refuted this way is in no feasible solution.
+///
+/// It reasons with the search's own propagator, conflict graph and row activities
+/// together, which is what makes it reach anything: the conflicts of these models live
+/// in long set partitioning rows that pairwise reasoning never sees.
+///
+/// **Parked, not finished.** It reduces the models it is aimed at, `mitre` by 3677
+/// columns of 10724 against a reference solver's 4693, `air04` by 787, and it is the
+/// only thing yet tried here that closes `mitre`. It also costs `air03` between three
+/// and four times its solve, because the reach cap gates the column a probe starts from
+/// and not the ones its propagation walks into. Six budgets were tried and every one
+/// trades the reduction against the cost; the coupling is not incidental, since probing
+/// pays where conflicts are dense and dense conflicts are what make it expensive.
+///
+/// What it wants next is not another budget: it is propagation that does not rebuild its
+/// state per probe, or a restriction to columns whose whole reachable set is small.
+fn probe_columns(
+    problem: &mut Problem,
+    stats: &mut Stats,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    use crate::heuristic::Sweep;
+    const CLOCK_STRIDE: usize = 64;
+    let conflicts = crate::cuts::Conflicts::of(problem);
+    if conflicts.is_empty() {
+        return true;
+    }
+    let csr = problem.matrix.to_csr();
+    let n = problem.n_cols();
+    let mut state = crate::heuristic::Propagator::new(problem, &conflicts, &csr, TOL);
+
+    // Whatever the model already pins implies more, and that is settled once here
+    // rather than re-derived inside every probe.
+    state.seed_fixed();
+    if state.propagate(PROBE_TOTAL) == Sweep::Refuted {
+        return false;
+    }
+    state.commit();
+
+    let mut candidates: Vec<(usize, usize)> = (0..n)
+        .filter(|&j| crate::heuristic::is_binary_column(problem, j) && !state.fixed(j))
+        .map(|j| {
+            let reach = conflicts.degree(2 * j as u32) + conflicts.degree(2 * j as u32 + 1);
+            (j, reach)
+        })
+        .collect();
+    // Widest first. Reach is where the refutations are; it used to also be where the
+    // cost was, which made this ordering the worst available, and it is not any more.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Probing spends what the model has already earned it. `PROBE_PATIENCE` resets on
+    // every column proved, so a model that keeps proving things keeps its budget and
+    // one that has stopped proving them loses it quickly; `PROBE_TOTAL` catches what
+    // that cannot, a model with nine thousand proofs to find, each of them individually
+    // earned and affordable, that would otherwise go on finding them for two minutes.
+    let mut idle_since = state.work();
+    let mut settled: Vec<usize> = Vec::new();
+    for (position, &(j, reach)) in candidates.iter().enumerate() {
+        if state.work() - idle_since > PROBE_PATIENCE || state.work() > PROBE_TOTAL {
+            break;
+        }
+        if position.is_multiple_of(CLOCK_STRIDE)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            break;
+        }
+        if reach == 0 || state.fixed(j) {
+            continue;
+        }
+        let mark = state.mark();
+        let zero = state.probe(j, 0.0, PROBE_REACH);
+        state.rewind(mark);
+        let one = state.probe(j, 1.0, PROBE_REACH);
+        // A value refuted means the other one holds, and so does everything its own
+        // sweep forced: those are consequences of a value now proven rather than of a
+        // guess, so the whole trail is kept instead of being thrown away and re-derived
+        // one column at a time. A sweep that ran out of work refutes nothing, but the
+        // fixings it did make are still sound, so the surviving side is kept whether it
+        // finished or not.
+        match (zero, one) {
+            // Neither value survives its own consequences, so neither does the model.
+            (Sweep::Refuted, Sweep::Refuted) => return false,
+            // Zero is refuted, and the sweep that proved one is the live state already.
+            (Sweep::Refuted, _) => {}
+            // One is refuted, but the sweep for zero was rewound to make room for it.
+            // Only a proof pays for this, so it is re-run rather than held onto.
+            (_, Sweep::Refuted) => {
+                state.rewind(mark);
+                if state.probe(j, 0.0, PROBE_REACH) == Sweep::Refuted {
+                    return false;
+                }
+            }
+            // Nothing proved. Only a sweep that finished says the column has nothing to
+            // give; one that ran out says only that it was not allowed to look.
+            _ => {
+                state.rewind(mark);
+                continue;
+            }
+        }
+        state.fixed_since(mark, &mut settled);
+        for &k in &settled {
+            if !fix_column(problem, k, state.value(k), stats) {
+                return false;
+            }
+        }
+        state.commit();
+        idle_since = state.work();
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,145 +1091,4 @@ mod tests {
         assert_eq!(once.col_ub, p.col_ub);
         assert_eq!(once.matrix, p.matrix);
     }
-}
-
-/// Matrix entries one probe may read before it is abandoned.
-///
-/// Abandoning a probe that outruns this is safe in the only direction that matters: an
-/// unfinished sweep refutes nothing, so the column keeps both of its values.
-const PROBE_REACH: usize = 4_000_000;
-
-/// Matrix entries probing may read without proving anything, before it gives up.
-const PROBE_PATIENCE: usize = 30_000_000;
-
-/// Matrix entries probing may read in all, whether or not it is proving anything.
-///
-/// A count of work rather than a share of the caller's time limit, which would price
-/// this against how long someone happens to be willing to wait, and rather than a
-/// number of passes over the matrix, which lets a model with eight million nonzeros
-/// spend a hundred times what a model with eighty thousand does for the same reduction.
-/// The number is a judgement about how much reasoning about a model is worth doing
-/// before solving it, calibrated on the pure binary set: at this figure the worst model
-/// in it spends a second and a half, the twenty-four hardest average a third of a
-/// second between them, and every model the solver currently closes pays under half a
-/// second, while `mitre` still gets the whole of the 3677 column reduction that closes
-/// it. Roughly ten times this buys another few thousand fixings on models that do not
-/// close either way, and costs `irp`, which closes with two seconds to spare, more than
-/// two seconds.
-const PROBE_TOTAL: usize = 100_000_000;
-
-/// Fix the columns for which only one of the two values survives its own consequences.
-///
-/// Every other reduction here reasons forwards from the bounds it has. This one reasons
-/// backwards: suppose a column takes a value, work out what follows, and if that ends in
-/// a contradiction the supposition was wrong and the column is fixed to the other value.
-/// Nothing is guessed; a value refuted this way is in no feasible solution.
-///
-/// It reasons with the search's own propagator, conflict graph and row activities
-/// together, which is what makes it reach anything: the conflicts of these models live
-/// in long set partitioning rows that pairwise reasoning never sees.
-///
-/// **Parked, not finished.** It reduces the models it is aimed at, `mitre` by 3677
-/// columns of 10724 against a reference solver's 4693, `air04` by 787, and it is the
-/// only thing yet tried here that closes `mitre`. It also costs `air03` between three
-/// and four times its solve, because the reach cap gates the column a probe starts from
-/// and not the ones its propagation walks into. Six budgets were tried and every one
-/// trades the reduction against the cost; the coupling is not incidental, since probing
-/// pays where conflicts are dense and dense conflicts are what make it expensive.
-///
-/// What it wants next is not another budget: it is propagation that does not rebuild its
-/// state per probe, or a restriction to columns whose whole reachable set is small.
-fn probe_columns(
-    problem: &mut Problem,
-    stats: &mut Stats,
-    deadline: Option<std::time::Instant>,
-) -> bool {
-    use crate::heuristic::Sweep;
-    const CLOCK_STRIDE: usize = 64;
-    let conflicts = crate::cuts::Conflicts::of(problem);
-    if conflicts.is_empty() {
-        return true;
-    }
-    let csr = problem.matrix.to_csr();
-    let n = problem.n_cols();
-    let mut state = crate::heuristic::Propagator::new(problem, &conflicts, &csr, TOL);
-
-    // Whatever the model already pins implies more, and that is settled once here
-    // rather than re-derived inside every probe.
-    state.seed_fixed();
-    if state.propagate(PROBE_TOTAL) == Sweep::Refuted {
-        return false;
-    }
-    state.commit();
-
-    let mut candidates: Vec<(usize, usize)> = (0..n)
-        .filter(|&j| crate::heuristic::is_binary_column(problem, j) && !state.fixed(j))
-        .map(|j| {
-            let reach = conflicts.degree(2 * j as u32) + conflicts.degree(2 * j as u32 + 1);
-            (j, reach)
-        })
-        .collect();
-    // Widest first. Reach is where the refutations are; it used to also be where the
-    // cost was, which made this ordering the worst available, and it is not any more.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    // Probing spends what the model has already earned it. `PROBE_PATIENCE` resets on
-    // every column proved, so a model that keeps proving things keeps its budget and
-    // one that has stopped proving them loses it quickly; `PROBE_TOTAL` catches what
-    // that cannot, a model with nine thousand proofs to find, each of them individually
-    // earned and affordable, that would otherwise go on finding them for two minutes.
-    let mut idle_since = state.work();
-    let mut settled: Vec<usize> = Vec::new();
-    for (position, &(j, reach)) in candidates.iter().enumerate() {
-        if state.work() - idle_since > PROBE_PATIENCE || state.work() > PROBE_TOTAL {
-            break;
-        }
-        if position.is_multiple_of(CLOCK_STRIDE)
-            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
-        {
-            break;
-        }
-        if reach == 0 || state.fixed(j) {
-            continue;
-        }
-        let mark = state.mark();
-        let zero = state.probe(j, 0.0, PROBE_REACH);
-        state.rewind(mark);
-        let one = state.probe(j, 1.0, PROBE_REACH);
-        // A value refuted means the other one holds, and so does everything its own
-        // sweep forced: those are consequences of a value now proven rather than of a
-        // guess, so the whole trail is kept instead of being thrown away and re-derived
-        // one column at a time. A sweep that ran out of work refutes nothing, but the
-        // fixings it did make are still sound, so the surviving side is kept whether it
-        // finished or not.
-        match (zero, one) {
-            // Neither value survives its own consequences, so neither does the model.
-            (Sweep::Refuted, Sweep::Refuted) => return false,
-            // Zero is refuted, and the sweep that proved one is the live state already.
-            (Sweep::Refuted, _) => {}
-            // One is refuted, but the sweep for zero was rewound to make room for it.
-            // Only a proof pays for this, so it is re-run rather than held onto.
-            (_, Sweep::Refuted) => {
-                state.rewind(mark);
-                if state.probe(j, 0.0, PROBE_REACH) == Sweep::Refuted {
-                    return false;
-                }
-            }
-            // Nothing proved. Only a sweep that finished says the column has nothing to
-            // give; one that ran out says only that it was not allowed to look.
-            _ => {
-                state.rewind(mark);
-                continue;
-            }
-        }
-        state.fixed_since(mark, &mut settled);
-        for &k in &settled {
-            if !fix_column(problem, k, state.value(k), stats) {
-                return false;
-            }
-        }
-        state.commit();
-        idle_since = state.work();
-    }
-    true
 }
