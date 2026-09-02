@@ -8,27 +8,25 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     28 confirmed, 30 expected     HiGHS 46   SCIP 45   CBC 30   commercial 94
+ripsolve     30        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-**The 30 is not yet confirmed by a full run.** 28 is the last complete benchmark,
-`docs/baselines/binary-2026-09-03.json`. Since then the Gomory density filter was fixed
-and `neos-1516309` and `neos-1599274` close, three runs each, with all 28 re-checked
-individually and none lost. The confirming benchmark was stopped 72 instances in when the
-machine had to travel; what it had measured is kept as
-`docs/baselines/binary-2026-09-03-partial.log` and shows both gains and no losses.
-**Re-run `bench/binary_bench.py 60 16 --refresh` before quoting 30 anywhere.**
+Confirmed by a full run, `docs/baselines/binary-2026-09-04.json`, which gained
+`neos-1516309` and `neos-1599274` against the previous one and lost nothing. Level with
+CBC, and sixteen behind HiGHS.
 
-The 28 all close on every run, with no instance left sitting on the sixty second line. That
+The 30 all close on every run, with no instance left sitting on the sixty second line. That
 matters, because for most of this session two of them were: quote the set that closes
 every time rather than one run's count, and check a new one against repeated runs before
 believing it. `nw04` now closes five times in five at 31 to 33 seconds and `irp` five in
 five at 34 to 47.
 
 Against the start of the session, **25 every run, with `nw04` never closing in any run of
-any version and `irp` a coin flip**. So the three gained are `mitre`, `nw04` and `irp`.
+any version and `irp` a coin flip**. The five gained are `mitre` and `nw04` from presolve
+probing and reduced cost fixing, `irp` from collecting those fixings as the incumbent
+earns them, and `neos-1516309` and `neos-1599274` from the Gomory density filter.
 
-Five of the 28 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
+Five of the 30 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
 `nw04` and `neos-4754521-awarau`.
 
 **The set that matters is 31, not 113.** Of the instances this solver misses, most are
@@ -96,12 +94,7 @@ well over 60 seconds even from a free root — the branch reached a 0.62% gap on
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
 
-## Next: pick up the unconfirmed benchmark first
-
-One command, and it decides whether the standing is 30. The machine's cached rows for the
-other solvers are still good, so `--refresh` only re-measures this one.
-
-## Then: cuts that cut a face, not a vertex
+## Next: cuts that cut a face, not a vertex
 
 The first specific target this file has had for the bound group, and it comes from
 watching HiGHS solve `n2seq36f` rather than from first principles.
@@ -218,11 +211,11 @@ pump, fixing with propagation and the LP-free jump all running and all returning
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-03.json`, with the run before this round's reduced cost
-  work kept as `binary-2026-09-02c.json`, the one before the root work as
-  `binary-2026-09-02.json` and the one before probing as `binary-2026-09-01.json`. Diff
-  against those rather than against a remembered number, and copy the current one aside
-  before a run that matters.
+  `docs/baselines/binary-2026-09-04.json`, with the run before the cut density fix kept
+  as `binary-2026-09-03.json`, the one before this round's reduced cost work as
+  `binary-2026-09-02c.json`, the one before the root work as `binary-2026-09-02.json` and
+  the one before probing as `binary-2026-09-01.json`. Diff against those rather than
+  against a remembered number, and copy the current one aside before a run that matters.
 - `cargo run --release --example probecost -- <models>` times presolve with and without
   probing on the same model and reports both reductions. Use it in preference to a solve
   for anything about presolve: it is seconds rather than an hour, and it has no search
@@ -231,9 +224,9 @@ pump, fixing with propagation and the LP-free jump all running and all returning
   each other, and the tell is an instance that suddenly cannot solve something it solves
   in isolation. A full 140 instance run takes around two hours, so plan what goes into it
   before starting one.
-- `pb-fit2d` runs for 322 seconds against a sixty second limit, and has in every run
-  recorded here, so it is a standing defect rather than a suspended laptop. Something
-  below the search does not check the clock on that model. Nothing else in the set
-  overruns by more than a few seconds.
+- `pb-fit2d` runs for around 300 seconds against a sixty second limit, and has in every
+  run recorded here, so it is a standing defect rather than a suspended laptop. Something
+  below the search does not check the clock on that model. `n3seq24` overruns to 87
+  seconds; nothing else in the set is out by more than a few.
 - A suspended laptop writes impossible wall times into the cache. Entries above the time
   limit by a wide margin are that, and should be dropped and re-measured.
