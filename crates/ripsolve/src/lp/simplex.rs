@@ -470,9 +470,19 @@ impl Lp {
     ///
     /// Returned rather than acted on here because the decision needs an incumbent,
     /// which is the search's business and not the LP's.
+    /// Reuses the factorization `basis` was left with when the cache is still holding
+    /// it, which it is immediately after the solve that produced it. Called there this
+    /// costs one BTRAN and a pass over the columns; called anywhere else it falls back
+    /// to a fresh factorization, which is what the old path cost and is never wrong.
     pub fn reduced_costs(&self, basis: &BasisState) -> Option<Vec<Option<(f64, bool)>>> {
-        let mut solver = Solver::warm(self, basis, None);
-        if solver.refactorize().is_err() {
+        let factors = self
+            .factors
+            .iter()
+            .find(|(columns, _)| *columns == basis.basic)
+            .map(|(_, held)| held.clone());
+        let factorized = factors.is_some();
+        let mut solver = Solver::warm(self, basis, factors);
+        if !factorized && solver.refactorize().is_err() {
             return None;
         }
         solver.load_basic_costs(false);
