@@ -8,10 +8,18 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     28        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     28 confirmed, 30 expected     HiGHS 46   SCIP 45   CBC 30   commercial 94
 ```
 
-All 28 close on every run, with no instance left sitting on the sixty second line. That
+**The 30 is not yet confirmed by a full run.** 28 is the last complete benchmark,
+`docs/baselines/binary-2026-09-03.json`. Since then the Gomory density filter was fixed
+and `neos-1516309` and `neos-1599274` close, three runs each, with all 28 re-checked
+individually and none lost. The confirming benchmark was stopped 72 instances in when the
+machine had to travel; what it had measured is kept as
+`docs/baselines/binary-2026-09-03-partial.log` and shows both gains and no losses.
+**Re-run `bench/binary_bench.py 60 16 --refresh` before quoting 30 anywhere.**
+
+The 28 all close on every run, with no instance left sitting on the sixty second line. That
 matters, because for most of this session two of them were: quote the set that closes
 every time rather than one run's count, and check a new one against repeated runs before
 believing it. `nw04` now closes five times in five at 31 to 33 seconds and `irp` five in
@@ -88,7 +96,12 @@ well over 60 seconds even from a free root — the branch reached a 0.62% gap on
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
 
-## Next: cuts that cut a face, not a vertex
+## Next: pick up the unconfirmed benchmark first
+
+One command, and it decides whether the standing is 30. The machine's cached rows for the
+other solvers are still good, so `--refresh` only re-measures this one.
+
+## Then: cuts that cut a face, not a vertex
 
 The first specific target this file has had for the bound group, and it comes from
 watching HiGHS solve `n2seq36f` rather than from first principles.
@@ -98,7 +111,7 @@ HiGHS moves the bound to 52200 at two seconds with 1120 cuts, 101 of them held i
 and that closes the whole gap from the bound side. This solver generates 1019 cuts in the
 same place and moves the bound by **nothing at all**, to the unit.
 
-Three explanations were tested and all three are wrong:
+Four explanations were tested and all four are wrong:
 
 - Not the *number* of cuts. 4036 of them move it zero.
 - Not how long they are kept. The loop ages a cut out after two rounds sitting slack;
@@ -106,6 +119,9 @@ Three explanations were tested and all three are wrong:
 - Not reduced cost fixing, and not a restart. `n2seq36f` narrows to 78% of its columns
   decided and the bound is still 52000. `cargo run --example restartsim` simulates the
   restart in a few minutes rather than building it, and says not to build it.
+- Not the density filter, though that one was a real defect and fixing it closed two
+  other instances. With it out of the way `n2seq36f` produces twenty GMI cuts, each
+  violated by a full unit, and the bound stays at 52000 to the digit.
 
 What is left is what the cuts *are*. `n2seq36f` has 285 rows and 8100 columns and an
 enormous optimal face; every cut here removes one vertex of it and the LP steps to another

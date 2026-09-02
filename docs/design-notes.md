@@ -1839,6 +1839,88 @@ the answer is 34.25. The unit tests did not catch it and the differential fuzz d
 first run after the change. An early exit on the *value* being computed is safe; an early
 exit that also skips a *validity* check is not, and the two are easy to write as one line.
 
+### The cut filter that rejected everything, silently
+
+The root cut loop reports one line: cuts added, bound before, bound after. On `n2seq36f`
+that reads "1019 added, 52000 -> 52000", which says the loop is not working and does not
+say which part of it. `cargo run --example cutfamilies` runs each family on its own
+against the same relaxation, adds what it finds and re-solves, so the families cannot
+hide behind one another:
+
+```text
+n2seq36f      root 52000
+cover      20 cuts, worst violation 0.80, bound 52000
+mir        60 cuts, worst violation 0.80, bound 52000
+clique      0 cuts,                       bound 52000
+gomory      0 cuts,                       bound 52000
+```
+
+Gomory reporting zero on a relaxation with twenty fractional columns is not a result, it
+is a symptom. It was generating twenty-six cuts and discarding all twenty-six, on a
+density filter, and the largest missed by eight terms out of 647.
+
+The filter compares a cut against three times the model's average row. The reasoning
+behind "relative rather than absolute" is sound and is written up above: an absolute cap
+rejected every GMI cut on a 99.5% dense model, where dense cuts are what there is. What
+was not noticed is that the same rule is far too strict at the other end. On a sparse
+model a cut denser than the rows is still an ordinary cut, and GMI cuts always come out
+denser than the rows they derive from.
+
+`neos-1516309` is the clean case: rows of 62 columns in a model of 4500, an allowance of
+186, and 77 of the 80 cuts the root produced thrown away. The three that survived were
+worth 1300 of bound between them, and the ones thrown away another 640.
+
+```text
+allowance     cuts kept    root bound      (optimum 35954)
+186 (3x row)      3        34739
+450                10        35187
+1125               28        35379
+```
+
+### Loosening it needs a bound at both ends
+
+Either bound alone breaks a model that the other one holds:
+
+- **Relative alone.** At any factor loose enough to help, the allowance passes the column
+  count on a model with few, wide rows: `irp` has 39 rows and 20315 columns, an average
+  row of 2519, and at twelve times that the filter is not a filter. It stops closing
+  entirely, nought runs in four, having closed five in five.
+- **A share of the columns alone.** On `decomp2`, whose rows average five columns of
+  fourteen thousand, a quarter of the columns allows a cut seven hundred times denser
+  than anything in the model, which is exactly what the original reasoning warns about.
+  It went from closing in 25 seconds to closing once in three attempts.
+
+Twenty-four times the average row, capped at a third of the columns, holds both and
+closes two more. `neos-1516309` goes from a 1.4% gap after 450000 nodes to **optimal at
+one node in 0.22 seconds**, and `neos-1599274` from 2.6% to optimal in 20 seconds. Three
+runs of each of the four instances involved agree, and every instance that closed before
+still closes.
+
+The general shape is worth keeping in mind for the next filter: a threshold with one free
+end is a threshold that will be wrong on half the models, and the half it is wrong on is
+the half nobody is looking at.
+
+### What this does not fix, and why that is the more useful half
+
+`n2seq36f` still does not close, and the diagnostic now says why in a way that four
+thousand cuts did not. With the filter out of the way it produces twenty GMI cuts, each
+violated by a full unit, and the bound stays at 52000 to the digit:
+
+```text
+allowance         cuts    bound
+639 (as shipped)     0    52000
+810                  1    52000
+2025                 4    52000
+8100 (all)          20    52000
+```
+
+Twenty violated cuts that move nothing is a statement about the shape of the problem. The
+optimal face of `n2seq36f` is large enough that each single-row cut removes one vertex of
+it and the relaxation steps to another vertex worth the same 52000. Cutting a face rather
+than a vertex is what a single-row separator cannot do, and all four families here are
+single-row or single-tableau-row. That is the case for aggregation, and it now rests on a
+measurement rather than on the observation that HiGHS has one.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
