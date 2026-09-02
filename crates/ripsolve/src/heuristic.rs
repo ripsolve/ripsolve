@@ -1235,6 +1235,43 @@ impl PartialOrd for Candidate {
     }
 }
 
+/// The corners of the box, tried before anything else.
+///
+/// Putting every column on one of its bounds costs a single pass over the matrix and is
+/// feasible more often than it has any right to be: on the pure binary set the all-zero
+/// point satisfies `mine-166-5`, `neos-953928`, `neos-957143` and `neos-960392`, and the
+/// all-upper point satisfies `neos-787933`. A reference solver reports these as its first
+/// incumbent on eight of the thirty instances this solver loses.
+///
+/// Cheap enough that it is unconditional. Anything it finds is a genuine feasible point,
+/// usually a poor one, and everything downstream is free to improve on it.
+pub fn corners(problem: &Problem, limits: &Limits) -> Option<Incumbent> {
+    let n = problem.n_cols();
+    let mut best: Option<Incumbent> = None;
+    for pick_upper in [false, true] {
+        let x: Vec<f64> = (0..n)
+            .map(|j| {
+                let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+                // A corner of an unbounded column is not a corner; zero stands in.
+                let value = if pick_upper { hi } else { lo };
+                if value.is_finite() {
+                    value
+                } else {
+                    0.0f64.clamp(lo, hi)
+                }
+            })
+            .collect();
+        if !is_feasible(problem, &x, limits.feasibility_tolerance) {
+            continue;
+        }
+        let objective = objective_of(problem, &x);
+        if best.as_ref().is_none_or(|held| objective < held.objective) {
+            best = Some(Incumbent { objective, x });
+        }
+    }
+    best
+}
+
 /// Search for a feasible point without solving a single LP.
 ///
 /// Every heuristic above this one is a way of asking the relaxation where to look, and

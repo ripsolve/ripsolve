@@ -1296,6 +1296,27 @@ The measurement stands whatever happens to the code: the reduction is available,
 matches a reference solver on one instance and gets most of the way on two more, and it
 is the only thing tried here that closes `mitre`.
 
+### The corners of the box
+
+The cheapest heuristic here, and the last one added. Putting every column on one of its
+bounds costs a single pass over the matrix, and is feasible more often than it deserves
+to be: on the pure binary set the all-zero point satisfies `mine-166-5`, `neos-953928`,
+`neos-957143` and `neos-960392`, and the all-upper point satisfies `neos-787933`. A
+reference solver reports one of these as its first incumbent on eight of the thirty
+instances this solver loses to it.
+
+`mine-166-5` and `neos-957143` went from reporting no solution at all to reporting one.
+Neither closes, and the points are poor, which is the entire reason this runs last rather
+than first: a corner of the box is exactly the kind of cheap, weak point that takes the
+search's incumbent away from a better one. Put ahead of diving it would repeat what
+putting the propagating heuristic ahead of diving did to `cap6000`, 500 nodes to 1500.
+Reached only when everything above has failed, it is the difference between a feasible
+answer and none, and nothing is compared against it because there is nothing to compare.
+
+That ordering mistake has now been made three times in this file, with two of them
+already written down when the third was made. Cheapest first is the wrong rule whenever
+a heuristic is cheap because its answers are bad.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

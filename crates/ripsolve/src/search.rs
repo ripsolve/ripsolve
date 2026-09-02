@@ -1393,7 +1393,15 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                     let scale = found.objective.abs().max(1.0);
                     found.objective - root.objective <= JUMP_QUALITY * scale
                 })
-            });
+            })
+            // Last of all, and cheapest of all. A corner of the box is usually a poor
+            // point and is not offered ahead of anything: put in front of diving, a
+            // cheap heuristic whose points are poor takes the search's incumbent away
+            // from a better one, which is what a corner point mostly is. Reached only
+            // when everything above has failed, it is the difference between reporting
+            // a feasible solution and reporting none, and no quality bar is applied
+            // because at that point there is nothing to compare it against.
+            .or_else(|| heuristic::corners(problem, &options.heuristic_limits));
         // Whatever produced the point, its continuous columns are still sitting where
         // the relaxation left them. Re-optimizing them is one LP and is often worth
         // far more than the choice of heuristic that found the integers.
