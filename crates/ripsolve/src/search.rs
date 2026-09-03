@@ -1306,9 +1306,36 @@ struct Attempt {
 /// how that work gets redone, and on a model where three quarters of the columns have
 /// gone it is a different problem.
 pub fn solve(problem: &Problem, options: Options) -> Solution {
+    solve_from(problem, options, None)
+}
+
+/// Solve, starting from a point already known to be feasible.
+///
+/// The usual way to hand a solver an answer it should not have to rediscover: a solution
+/// from a previous run, from a related model, or from somewhere outside the solver
+/// entirely. The point is checked before it is believed, and a point that does not
+/// satisfy the model is ignored rather than trusted, because an incumbent is a claim the
+/// search prunes against and a wrong one removes the answer.
+///
+/// It is also how the primal side is measured. Handing the search a known optimum and
+/// asking whether it can then *prove* optimality separates an instance that is short of a
+/// point from one that is short of a bound, and those want completely different work.
+pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
     let started = Instant::now();
     let mut model: Option<Problem> = None;
-    let mut seed: Option<(f64, Vec<f64>)> = None;
+    let mut seed: Option<(f64, Vec<f64>)> = start
+        .filter(|x| {
+            x.len() == problem.n_cols()
+                && heuristic::is_feasible(
+                    problem,
+                    x,
+                    options.heuristic_limits.feasibility_tolerance,
+                )
+                && problem
+                    .integer_columns()
+                    .all(|j| (x[j] - x[j].round()).abs() <= options.integrality_tolerance)
+        })
+        .map(|x| (objective_at(problem, x), x.to_vec()));
     let (mut nodes, mut iterations, mut heuristics) = (0usize, 0usize, 0usize);
     for _ in 0..=MAX_RESTARTS {
         let current = model.as_ref().unwrap_or(problem);

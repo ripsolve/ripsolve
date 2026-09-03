@@ -2183,6 +2183,54 @@ relaxation is sure of, fixing it carefully, fixing as much as the LP allows, or 
 what a dive has already paid for. That is a real narrowing of the search space and the
 next attempt should start from it rather than from the same four ideas.
 
+### The primal side is not the gap, measured by removing it
+
+Before building a suite of primal heuristics, the thing to establish is what a perfect
+one would be worth. `search::solve_from` takes a point the caller already has, and
+`cargo run --release --example primalceiling` hands the search a reference solver's
+*optimum* and asks whether it can then prove optimality. An instance short of a point and
+one short of a bound both time out with a gap and want opposite work; this separates them.
+
+```text
+                     seeded with the true optimum      gap left
+neos-3045796-mogo    Optimal                            0%
+neos-953928          TimeLimit                          0.0156%
+neos-820879          TimeLimit                          0.69%
+air05                TimeLimit                          0.77%
+neos18               TimeLimit                          50%
+mine-166-5           TimeLimit                          22%
+```
+
+**Handed the answer, five of the six still cannot prove it.** So a primal heuristic suite
+converts none of them, and the classification above -- which called three of these primal
+bound -- was wrong. It compared this solver's bound against the optimum, and this solver's
+bound was measured in runs where the incumbent was poor; with a perfect incumbent the
+bound improves and still falls short. The right question was never "is our bound below the
+optimum" but "would a better point let us prove it", and only the second one can be
+answered by asking.
+
+`neos-953928` is the near miss and is worth its own line: with the optimum in hand it is
+0.0156% short of proving it, against a default gap tolerance of 0.01%. Its objective is
+not integral, so no rounding of the bound helps.
+
+### A permuted vector looks exactly like an infeasible point
+
+The first run of this measurement said `neos18` was seeded with a point scoring 40 against
+a true 16, violating 536 rows, and `neos-953928` with one violating 92. Both were read as
+infeasible reference solutions.
+
+They were not. **Two readers of the same MPS file need not agree on column order, and
+these two do not**: on `neos18` this solver's first column is `r_0` and the reference
+solver's is `x_1_0`. Matching by position makes the seed a permutation of the answer,
+which scores wrongly and violates rows exactly as an infeasible point would. Neither
+reader is wrong; column order is an internal matter, and the file names its columns for
+precisely this reason.
+
+Two instances happened to agree on order, which is what made the failure look like a
+property of the other two rather than of the method. Anything crossing a solver boundary
+has to be keyed by name, and a check that the reference point is feasible before it is
+believed is what turns this from a wrong conclusion into a caught mistake.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
