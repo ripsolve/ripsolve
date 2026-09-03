@@ -1921,6 +1921,86 @@ than a vertex is what a single-row separator cannot do, and all four families he
 single-row or single-tableau-row. That is the case for aggregation, and it now rests on a
 measurement rather than on the observation that HiGHS has one.
 
+### Mod-2 cuts, and a hypothesis corrected by reading rather than reasoning
+
+The section above concluded that `n2seq36f` needs cuts that combine rows, and named
+aggregation as the thing to build, on the strength of HiGHS having `HighsPathSeparator`
+and `HighsLpAggregator`. That was reasoning from a name. Reading the file says
+`HighsPathSeparator` aggregates along **continuous** columns -- every loop in it is over
+`continuous_cols` -- and `n2seq36f` has none, so on that model it produces nothing at
+all. The right answer was two files away in `HighsModkSeparator`.
+
+The construction is simple and does combine rows. Take tight rows `a_i x <= b_i` with
+integer coefficients, add a subset `S`, halve, and round the coefficients down, which is
+valid because every column is a nonnegative integer:
+
+```text
+    floor(A/2) . x  <=  floor(B/2),      A = sum_S a_i,  B = sum_S b_i
+```
+
+The rounding is worth something exactly when it loses nothing on the left and a half on
+the right: every `A_j` even and `B` odd. Because the rows were tight, the cut is then
+violated by exactly one half.
+
+The step that makes it cheap is that a column sitting *on* a bound costs nothing when its
+coefficient is odd, since it contributes zero to the activity either way. So the parity
+condition is needed only on the **fractional** columns. `n2seq36f` has twenty-one of them
+against 8100 columns, and choosing the subset becomes a linear system over GF(2) with
+twenty-one equations and one per tight row -- wide, cheap, and with a large null space
+that is where the cuts are. Complementing the binaries sitting at one is what puts every
+variable at zero or fractional so that this holds.
+
+A Python prototype against the same relaxation settled it in an afternoon rather than a
+build:
+
+```text
+round  0: +12 cuts, bound 52000
+round  1: + 6 cuts, bound 52200      <- the optimum
+...
+round 20: no violated cut, stopping
+```
+
+Two rounds and eighteen cuts, where four thousand single-row cuts moved nothing. In the
+solver `n2seq36f` closes in 8 to 15 seconds, three runs in three.
+
+### An eighth of the allowance, not the whole of it
+
+These cuts are not comparable to the other four families, and giving them the same
+allowance is wrong in a way worth naming. Every mod-2 cut is violated by *exactly* one
+half, by construction. Ranking a set of identically-violated cuts against families whose
+violation varies admits all of them or none of them, so the allowance is doing the
+selecting rather than the ranking, and a handful is all they need to be: eighteen closed
+`n2seq36f`.
+
+Taken at a quarter of the allowance they crowd the node LPs instead. `irp` is 39 rows
+against 20315 columns, so cuts multiply its row count rather than adding to it, and it
+went from closing five runs in five to none in three. An eighth holds both.
+
+What does *not* separate the two cases is worth recording, because it was the first
+guess: cut density relative to the model's rows. `irp`'s mod-2 cuts run 645 to 2962 terms
+against an average row of 2519, so they are *sparser* relative to the model than
+`n2seq36f`'s at 936 to 1584 against 213. Density was the right rule for the GMI filter
+and is the wrong rule here.
+
+### A skipped node does not always forfeit the claim
+
+A node whose LP runs out of simplex iterations leaves its subtree unexamined, and the
+search has always downgraded `Optimal` to `NodeLimit` on account of it. That is right
+when the subtree could have held something, and `neos-1599274` is the case where it is
+not: with mod-2 cuts it reaches a gap of zero, holds the optimum, and reports NodeLimit
+against a node it skipped early on.
+
+The bound that node inherited holds over its whole subtree. If the incumbent has since
+overtaken it, the subtree contained nothing worth having, and skipping it cost nothing --
+which is the same test the search applies before opening any node at all, so nothing new
+is being assumed. Keeping the weakest such bound and checking it at the end turns
+`neos-1599274` into four closes in four.
+
+Relaxing a rule about when optimality may be claimed is only safe if it never claims it
+wrongly, so the test squeezes the per-node iteration limit until nodes are actually
+skipped, and requires every run that says `Optimal` to match the reference optimum.
+Without the guard, `v064c064` claims 165 against a true 137.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

@@ -8,25 +8,31 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     30        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     31        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Confirmed by a full run, `docs/baselines/binary-2026-09-04.json`, which gained
-`neos-1516309` and `neos-1599274` against the previous one and lost nothing. Level with
-CBC, and sixteen behind HiGHS.
+Confirmed by a full run, `docs/baselines/binary-2026-09-05.json`, which gained
+`n2seq36f` against the previous one and lost nothing. Ahead of CBC, and fifteen behind
+HiGHS.
 
-The 30 all close on every run, with no instance left sitting on the sixty second line. That
-matters, because for most of this session two of them were: quote the set that closes
+The 31 all close on every run, with no instance left sitting on the sixty second line.
+That matters, because for a long stretch two of them were: quote the set that closes
 every time rather than one run's count, and check a new one against repeated runs before
-believing it. `nw04` now closes five times in five at 31 to 33 seconds and `irp` five in
-five at 34 to 47.
+believing it.
 
-Against the start of the session, **25 every run, with `nw04` never closing in any run of
-any version and `irp` a coin flip**. The five gained are `mitre` and `nw04` from presolve
-probing and reduced cost fixing, `irp` from collecting those fixings as the incumbent
-earns them, and `neos-1516309` and `neos-1599274` from the Gomory density filter.
+Against the start of these sessions, **25 every run, with `nw04` never closing in any run
+of any version and `irp` a coin flip**. The six gained:
 
-Five of the 30 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
+```text
+mitre           presolve probing, once the propagator stopped rebuilding itself
+nw04            reduced cost fixing at the root
+irp             those fixings collected as the incumbent earns them
+neos-1516309    the Gomory density filter
+neos-1599274    the same, plus not forfeiting optimality to a prunable skipped node
+n2seq36f        mod-2 cuts
+```
+
+Five of the 31 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
 `nw04` and `neos-4754521-awarau`.
 
 ## Speed, on the instances both solvers close
@@ -127,7 +133,24 @@ well over 60 seconds even from a free root — the branch reached a 0.62% gap on
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
 
-## Next: cuts that cut a face, not a vertex
+## Where the cut work got to
+
+`n2seq36f` closes. The section below is kept because the *reasoning* in it was wrong in
+an instructive way and the measurements in it stand.
+
+**The answer was not aggregation.** `HighsPathSeparator` aggregates along continuous
+columns, and `n2seq36f` has none, so it produces nothing there; naming it as the target
+was reasoning from a name rather than from the file. `HighsModkSeparator` is what moves
+that bound, and mod-2 separation is now built: take tight rows with integer coefficients,
+add a subset whose coefficient sums are all even and whose right-hand side is odd, halve
+and round down. A Python prototype settled it in an afternoon -- 52000 to 52200 in two
+rounds and eighteen cuts -- before any Rust was written.
+
+Aggregation over continuous columns is still untried and is still the obvious next cut
+family, but it is aimed at *mixed* models and there is no measurement here saying it
+would pay on this set, which is pure binary by construction.
+
+## The reasoning that led there, with one wrong turn
 
 The first specific target this file has had for the bound group, and it comes from
 watching HiGHS solve `n2seq36f` rather than from first principles.
@@ -244,8 +267,9 @@ pump, fixing with propagation and the LP-free jump all running and all returning
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-04.json`, with the run before the cut density fix kept
-  as `binary-2026-09-03.json`, the one before this round's reduced cost work as
+  `docs/baselines/binary-2026-09-05.json`, with the run before mod-2 cuts kept as
+  `binary-2026-09-04.json`, the one before the cut density fix as
+  `binary-2026-09-03.json`, the one before this round's reduced cost work as
   `binary-2026-09-02c.json`, the one before the root work as `binary-2026-09-02.json` and
   the one before probing as `binary-2026-09-01.json`. Diff against those rather than
   against a remembered number, and copy the current one aside before a run that matters.
