@@ -2231,6 +2231,42 @@ property of the other two rather than of the method. Anything crossing a solver 
 has to be keyed by name, and a check that the reference point is feasible before it is
 believed is what turns this from a wrong conclusion into a caught mistake.
 
+### `air05` and `neos-953928`: the filter is right and the face is large
+
+`air05` produces no Gomory cut at all from a relaxation with 224 fractional columns,
+which is the symptom that turned out last time to be a filter discarding them silently.
+It is that again, and this time the filter is correct.
+
+```text
+air05        367 basic integer rows, 217 usably fractional, 150 too near an integer
+             all 217 cuts dropped for density, every one of them exactly 6557 terms
+             against an allowance of 2398 and a model of 7195 columns
+```
+
+Ninety-one per cent dense, and uniformly so. One such cut carries 6557 nonzeros into a
+matrix that has 52121 altogether, so it is an eighth of the model per row; the two hundred
+of them are twenty-seven times the matrix, and adding them does not finish an LP solve in
+two hundred seconds. Taken a handful at a time they do move the bound -- three cuts are
+worth 10, ten are worth 15, thirty are worth 18 -- and `air05`'s *clique* cuts are worth
+29 for a small fraction of the cost and are already getting in. So the filter is keeping
+out cuts that are both ruinous and worse than what is already there, which is what it is
+for.
+
+None of it is nearly enough either way. `air05`'s root is 25877.6 against an optimum of
+26374, and seeded with that optimum the search still reaches only 26170. The root is short
+by five hundred and the cut families here argue about thirty.
+
+`neos-953928` answers even more plainly. Its Gomory cuts are dropped the same way, 348 of
+them at sizes from 1519 to 21475 against an allowance of 312, and allowing all of them
+changes the bound by **nothing at all**: -99.9200 with five, with thirty, and with a
+hundred and nine across every family. That is the large-optimal-face case again, and what
+answered it on `n2seq36f` does not apply here, because mod-2 separation finds no cut on
+this model at all.
+
+So neither instance is short of a filter setting. `air05` wants a bound five hundred
+better than any family here produces, and `neos-953928` wants a family that can cut a face
+it has no cut for.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

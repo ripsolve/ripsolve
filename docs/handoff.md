@@ -20,15 +20,22 @@ air05           root 25877.61   gomory generates *nothing*, clique 17 -> 25906.4
                                 optimum 26374
 ```
 
-Three different problems. `neos-953928` is the `n2seq36f` situation again — a face large
-enough that 158 violated cuts move the bound by nothing — except that mod-2, which was the
-answer there, finds no cut at all here. `neos-820879` responds to cuts and needs about
-twenty times more of that response. `air05` produces no Gomory cut whatsoever from a
-fractional relaxation, which on the evidence of the density filter is worth understanding
-before anything is built: last time that symptom meant a filter was discarding them
-silently, and it is the same shape of question.
+Two of the three are now answered, and neither is short of a filter setting; see
+"`air05` and `neos-953928`: the filter is right and the face is large" in
+`design-notes.md`.
 
-Start there, with `cutfamilies`, rather than with a new separator.
+`air05` was indeed a filter discarding cuts silently — all 217 of them, every one exactly
+6557 terms of 7195 columns — and this time the filter is right: one such cut is an eighth
+of the matrix, two hundred of them will not finish an LP solve in 200 seconds, and taken a
+few at a time they are worth less bound than the clique cuts already getting in. It needs
+five hundred of bound and the families here argue about thirty.
+
+`neos-953928` moves by nothing at any density, across every family. Large optimal face,
+and mod-2 — which answered that on `n2seq36f` — finds no cut on it at all.
+
+`neos-820879` is the one still worth trying: it *responds* to cuts, 24874 to 24970 at the
+root, and needs about six times that response to reach 25468. It is the only instance in
+the set where more of what already works would be enough.
 
 ## Standing
 
