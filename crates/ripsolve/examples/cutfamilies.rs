@@ -61,6 +61,7 @@ fn main() {
             "gomory",
             cuts::separate_gomory(&lp, &root.basis, &root.x, per_family),
         ),
+        ("mod2", cuts::separate_mod2(&problem, &root.x, per_family)),
     ];
 
     let mut all: Vec<Cut> = Vec::new();
@@ -69,9 +70,14 @@ fn main() {
             .iter()
             .map(|c| c.violation(&root.x))
             .fold(0.0f64, f64::max);
+        let sizes: Vec<usize> = found.iter().map(|c| c.coefficients.len()).collect();
+        let (smin, smax) = (
+            sizes.iter().copied().min().unwrap_or(0),
+            sizes.iter().copied().max().unwrap_or(0),
+        );
         let after = re_solve(&problem, found);
         println!(
-            "{name:<8} {:>4} cuts, worst violation {worst:.6}, bound {}",
+            "{name:<8} {:>4} cuts, size {smin}-{smax}, worst violation {worst:.6}, bound {}",
             found.len(),
             match after {
                 Some(v) => format!("{v:.6}"),

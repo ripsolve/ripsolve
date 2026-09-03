@@ -759,6 +759,9 @@ struct Shared {
     stopped: AtomicUsize,
     /// Nodes whose LP never resolved. Any of them could hold the optimum.
     unresolved: AtomicUsize,
+    /// The weakest bound among the nodes skipped for running out of iterations, which
+    /// is what decides whether skipping them forfeited the optimality claim.
+    unresolved_bound: AtomicU64,
 }
 
 /// Reasons a parallel search stops early, encoded for the atomic.
@@ -792,6 +795,22 @@ impl Shared {
     fn incumbent_solution(&self) -> (f64, Option<Vec<f64>>) {
         let best = self.best.lock().expect("incumbent lock");
         (best.0, best.1.clone())
+    }
+
+    /// Remember the weakest bound skipped, so the claim can be settled at the end.
+    fn weaken_unresolved(&self, bound: f64) {
+        let mut held = self.unresolved_bound.load(Ordering::Relaxed);
+        while bound < f64::from_bits(held) {
+            match self.unresolved_bound.compare_exchange_weak(
+                held,
+                bound.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => held = current,
+            }
+        }
     }
 
     /// Install a better incumbent, if it really is better.
@@ -878,6 +897,7 @@ fn run_parallel(
         heuristic_hits: AtomicUsize::new(0),
         stopped: AtomicUsize::new(STOP_NONE),
         unresolved: AtomicUsize::new(0),
+        unresolved_bound: AtomicU64::new(f64::INFINITY.to_bits()),
     };
 
     std::thread::scope(|scope| {
@@ -914,9 +934,11 @@ fn run_parallel(
 
                     let outcome = worker.process(&node, best, index);
                     if outcome.exhausted {
-                        // Skip the node and keep going; see the serial driver. The
-                        // count is what stops the search claiming optimality.
+                        // Skip the node and keep going; see the serial driver. What is
+                        // remembered is the node's own bound, which is what decides
+                        // later whether skipping it cost anything.
                         shared.unresolved.fetch_add(1, Ordering::Relaxed);
+                        shared.weaken_unresolved(node.bound);
                     }
                     if let Some((objective, x)) = outcome.incumbent
                         && shared.offer(objective, x)
@@ -965,8 +987,17 @@ fn run_parallel(
     let status = match shared.stopped.load(Ordering::Relaxed) {
         STOP_NODES => Status::NodeLimit,
         STOP_TIME => Status::TimeLimit,
-        // A tree that was exhausted apart from a skipped node proves nothing.
-        _ if shared.unresolved.load(Ordering::Relaxed) > 0 => Status::NodeLimit,
+        // A tree exhausted apart from a skipped node proves nothing, unless the
+        // skipped node could not have held anything better anyway; see `improves`.
+        _ if shared.unresolved.load(Ordering::Relaxed) > 0
+            && improves(
+                f64::from_bits(shared.unresolved_bound.load(Ordering::Relaxed)),
+                incumbent,
+                options.gap_tolerance,
+            ) =>
+        {
+            Status::NodeLimit
+        }
         _ => Status::Optimal,
     };
 
@@ -1082,10 +1113,10 @@ fn separate_at_root(
         {
             break;
         }
-        // Four families with different reach: covers need a row that reads as a
+        // Five families with different reach: covers need a row that reads as a
         // knapsack, MIR needs a row mixing integer and continuous columns, cliques need
-        // columns that exclude one another, and GMI comes off the tableau and applies
-        // to any fractional basic column. On dense random rows the last is usually the
+        // columns that exclude one another, GMI comes off the tableau and applies to any
+        // fractional basic column, and mod-2 combines whole rows. On dense random rows the last is usually the
         // only one that finds anything; on mixed models from MIPLIB the second carries
         // most of the bound; and on the pure binary set, where there is no continuous
         // structure for MIR to reach, the third is the one with anything to say.
@@ -1102,6 +1133,17 @@ fn separate_at_root(
             &root.basis,
             &root.x,
             options.cuts_per_round,
+        ));
+        // Fifth family, and the only one that combines rows. The four above each read a
+        // single row or a single tableau row, and on a model whose optimal face is large
+        // that removes one vertex of it and the relaxation steps to the next one worth
+        // the same. See `separate_mod2`.
+        //
+        // On a smaller allowance than the rest; see `MOD2_SHARE`.
+        found.extend(cuts::separate_mod2(
+            problem,
+            &root.x,
+            options.cuts_per_round / MOD2_SHARE,
         ));
         // Separation is deliberately generous; this is where the model's row count is
         // actually decided. Ranking by efficacy and dropping near-parallel duplicates
@@ -1424,6 +1466,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut heuristic_solutions = 0usize;
     // Nodes whose LP never resolved. Any of them could hold the optimum.
     let mut unresolved = 0usize;
+    let mut unresolved_bound = f64::INFINITY;
 
     // An incumbent before the first branch is worth more than one found later: the
     // search cannot prune anything until it holds one.
@@ -1666,7 +1709,13 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             // forfeits the *optimality claim*, but abandoning the whole search over
             // it is far worse: on MIPLIB's pk1 the run stopped after four nodes with
             // an incumbent of 35, where continuing reaches 21.
+            //
+            // Its own bound is kept, because it decides later whether the claim was
+            // really forfeited: the bound this node inherited holds over its whole
+            // subtree, so if the incumbent has since overtaken it there was nothing in
+            // there worth having and skipping it cost nothing.
             unresolved += 1;
+            unresolved_bound = unresolved_bound.min(node.bound);
             continue;
         }
         heuristic_solutions += outcome.heuristic_hits;
@@ -1716,9 +1765,15 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     };
 
     let status = match (status, &incumbent_x) {
-        // A search that exhausted its tree but skipped a node has not proven
-        // anything, and must not say it has.
-        (Status::Optimal, _) if unresolved > 0 => Status::NodeLimit,
+        // A search that exhausted its tree but skipped a node has not proven anything,
+        // and must not say it has -- unless the incumbent has since overtaken every
+        // bound it skipped, which is the same test the search applies before opening a
+        // node at all.
+        (Status::Optimal, _)
+            if unresolved > 0 && improves(unresolved_bound, incumbent, options.gap_tolerance) =>
+        {
+            Status::NodeLimit
+        }
         (Status::Optimal, None) => Status::Infeasible,
         (other, _) => other,
     };
@@ -1753,6 +1808,15 @@ const ROOT_CUT_SHARE: f64 = 0.33;
 /// Generous: a relaxation that is merely slow should be allowed to finish, and only one
 /// that is going nowhere is worth restarting from a different point.
 const ROOT_LP_FIRST_SHARE: f64 = 0.40;
+
+/// The reciprocal of the share of a round's cut allowance mod-2 separation may take.
+///
+/// An eighth. These are not comparable to the other families: every one is violated by
+/// exactly one half, so ranking them alongside families whose violation varies admits
+/// all of them or none, and a handful is all they need to be, since eighteen close
+/// `n2seq36f` in two rounds. Taken at a quarter they crowd the node LPs on a model with
+/// few, wide rows, and `irp`, 39 rows against 20315 columns, stops closing at all.
+const MOD2_SHARE: usize = 8;
 
 /// A backstop on presolve's expensive half, not its budget.
 const PRESOLVE_SHARE: f64 = 0.25;

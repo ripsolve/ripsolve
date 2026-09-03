@@ -482,6 +482,252 @@ pub fn separate_gomory(
     found
 }
 
+/// Rows a single mod-2 combination may draw on.
+///
+/// The elimination is cubic in this, and the cuts that pay come out of a handful of
+/// rows rather than a hundred, so a model with thousands of tight rows is truncated
+/// rather than declined.
+const MOD2_MAX_ROWS: usize = 512;
+
+/// Fractional columns the parity system may span.
+///
+/// Every one of them is an equation, and a system with more equations than rows has no
+/// null space to search. Beyond this the model is not one this reduction can say
+/// anything about, and building the system to discover that is the expensive part.
+const MOD2_MAX_COLUMNS: usize = 512;
+
+/// A set of row or column indices, as a bitmap.
+#[derive(Clone, PartialEq, Eq)]
+struct BitSet(Vec<u64>);
+
+impl BitSet {
+    fn new(bits: usize) -> Self {
+        BitSet(vec![0; bits.div_ceil(64)])
+    }
+
+    fn set(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+
+    fn get(&self, i: usize) -> bool {
+        self.0[i / 64] >> (i % 64) & 1 == 1
+    }
+
+    fn xor(&mut self, other: &BitSet) {
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a ^= b;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&w| w == 0)
+    }
+
+    /// The lowest index set, if any.
+    fn first(&self) -> Option<usize> {
+        self.0
+            .iter()
+            .enumerate()
+            .find(|&(_, &w)| w != 0)
+            .map(|(word, &w)| word * 64 + w.trailing_zeros() as usize)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.0.len() * 64).filter(|&i| self.get(i))
+    }
+}
+
+/// Chvatal-Gomory cuts over GF(2): combine tight rows so that the halving bites.
+///
+/// Take rows `a_i x <= b_i` with integer coefficients, all tight at the current point,
+/// and add up a subset `S`. The sum is valid, and so is halving it; and because every
+/// `x_j` is a nonnegative integer, the coefficients may then be rounded down:
+///
+/// ```text
+///     floor(A/2) . x  <=  floor(B/2),      A = sum_S a_i,  B = sum_S b_i
+/// ```
+///
+/// The rounding is worth something exactly when it loses nothing on the left and a half
+/// on the right, which is when every `A_j` is even and `B` is odd. Then the cut is
+/// violated by exactly one half, because the rows were tight.
+///
+/// A column sitting *on* a bound costs nothing when its coefficient is odd, since it
+/// contributes zero to the activity either way. So the parity condition is needed only
+/// on the columns that are fractional, and finding the subset is then a linear system
+/// over GF(2) with one equation per fractional column, plus one for the parity of the
+/// right-hand side. There are usually a handful of those and hundreds of tight rows, so
+/// the system is wide and its null space is where the cuts are.
+///
+/// This is the family that closes the models a single-row separator cannot touch. On
+/// `n2seq36f`, whose relaxation is worth 52000 against an optimum of 52200, every
+/// single-row family here produces cuts violated by a full unit and moves the bound by
+/// nothing, because the optimal face is large enough that removing one vertex of it
+/// leaves another worth the same. Eighteen of these move it to 52200 in two rounds.
+pub fn separate_mod2(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
+    let tolerance = 1e-6;
+    let binary = |j: usize| {
+        problem.is_integer(j) && problem.col_lb[j] == 0.0 && problem.col_ub[j] == 1.0
+    };
+
+    // Columns the parity has to be right on. A column at a bound is not one of them:
+    // an odd coefficient there is rounded away against a value of zero.
+    let fractional: Vec<usize> = (0..problem.n_cols())
+        .filter(|&j| binary(j) && x[j] > tolerance && x[j] < 1.0 - tolerance)
+        .collect();
+    if fractional.is_empty() || fractional.len() > MOD2_MAX_COLUMNS {
+        return Vec::new();
+    }
+    let mut equation = vec![usize::MAX; problem.n_cols()];
+    for (e, &j) in fractional.iter().enumerate() {
+        equation[j] = e;
+    }
+    // Complemented, so that every variable is at zero or fractional and the paragraph
+    // above holds. A binary at one becomes `1 - y` with `y` at zero.
+    let complemented: Vec<bool> = (0..problem.n_cols())
+        .map(|j| binary(j) && x[j] >= 1.0 - tolerance)
+        .collect();
+
+    let csr = problem.matrix.to_csr();
+    let mut tight: Vec<(Vec<(usize, i64)>, i64)> = Vec::new();
+    for i in 0..problem.n_rows() {
+        let (cols, values) = csr.column(i);
+        if cols.is_empty() || cols.iter().any(|&j| !binary(j)) {
+            continue;
+        }
+        let activity: f64 = cols.iter().zip(values).map(|(&j, &a)| a * x[j]).sum();
+        // Both sides of a range row are worth trying, and an equality is tight on both.
+        for &(sign, bound) in &[(1.0f64, problem.row_ub[i]), (-1.0, problem.row_lb[i])] {
+            if !bound.is_finite() || (sign * activity - sign * bound).abs() > tolerance {
+                continue;
+            }
+            let whole = |v: f64| (v - v.round()).abs() <= 1e-9;
+            if !whole(sign * bound) || !values.iter().all(|&a| whole(sign * a)) {
+                continue;
+            }
+            let mut rhs = (sign * bound).round() as i64;
+            let mut row: Vec<(usize, i64)> = Vec::with_capacity(cols.len());
+            for (&j, &a) in cols.iter().zip(values) {
+                let a = (sign * a).round() as i64;
+                if a == 0 {
+                    continue;
+                }
+                if complemented[j] {
+                    rhs -= a;
+                    row.push((j, -a));
+                } else {
+                    row.push((j, a));
+                }
+            }
+            tight.push((row, rhs));
+            if tight.len() >= MOD2_MAX_ROWS {
+                break;
+            }
+        }
+        if tight.len() >= MOD2_MAX_ROWS {
+            break;
+        }
+    }
+    if tight.is_empty() {
+        return Vec::new();
+    }
+
+    // Eliminate over GF(2), carrying which rows each partial combination is made of.
+    // A row that reduces to nothing on the left with an odd right-hand side is a cut.
+    let mut pivots: Vec<Option<(BitSet, bool, BitSet)>> = vec![None; fractional.len()];
+    let mut combinations: Vec<BitSet> = Vec::new();
+    for (index, (row, rhs)) in tight.iter().enumerate() {
+        let mut parity = BitSet::new(fractional.len());
+        for &(j, a) in row {
+            if a & 1 != 0 && equation[j] != usize::MAX {
+                parity.set(equation[j]);
+            }
+        }
+        let mut odd = rhs & 1 != 0;
+        let mut from = BitSet::new(tight.len());
+        from.set(index);
+        while let Some(e) = parity.first() {
+            match &pivots[e] {
+                Some((held, held_odd, held_from)) => {
+                    parity.xor(held);
+                    odd ^= held_odd;
+                    from.xor(held_from);
+                }
+                None => {
+                    pivots[e] = Some((parity, odd, from));
+                    parity = BitSet::new(0);
+                    odd = false;
+                    from = BitSet::new(0);
+                    break;
+                }
+            }
+        }
+        if parity.0.is_empty() {
+            continue;
+        }
+        if parity.is_empty() && odd && !from.is_empty() {
+            combinations.push(from);
+        }
+    }
+
+    let mut found: Vec<Cut> = Vec::new();
+    let mut summed: Vec<i64> = vec![0; problem.n_cols()];
+    let mut touched: Vec<usize> = Vec::new();
+    for combination in &combinations {
+        for &j in &touched {
+            summed[j] = 0;
+        }
+        touched.clear();
+        let mut rhs = 0i64;
+        for i in combination.iter() {
+            let (row, b) = &tight[i];
+            rhs += b;
+            for &(j, a) in row {
+                if summed[j] == 0 {
+                    touched.push(j);
+                }
+                summed[j] += a;
+            }
+        }
+        // Halve and round down. Euclidean division, because rounding a negative
+        // coefficient towards zero rounds it *up* and the cut stops being valid.
+        let mut coefficients: Vec<(usize, f64)> = Vec::new();
+        let mut bound = rhs.div_euclid(2) as f64;
+        for &j in &touched {
+            let a = summed[j].div_euclid(2);
+            if a == 0 {
+                continue;
+            }
+            if complemented[j] {
+                // Back out of the complement: `a y = a (1 - x)`.
+                bound -= a as f64;
+                coefficients.push((j, -a as f64));
+            } else {
+                coefficients.push((j, a as f64));
+            }
+        }
+        if coefficients.is_empty() {
+            continue;
+        }
+        coefficients.sort_by_key(|&(j, _)| j);
+        let cut = Cut {
+            coefficients,
+            lb: f64::NEG_INFINITY,
+            ub: bound,
+        };
+        if cut.violation(x) > MIN_VIOLATION {
+            found.push(cut);
+        }
+    }
+
+    found.sort_by(|a, b| {
+        b.violation(x)
+            .partial_cmp(&a.violation(x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    found.truncate(limit);
+    found
+}
+
 /// Most divisors tried per row when deriving a mixed-integer rounding cut.
 const MAX_MIR_DIVISORS: usize = 6;
 
@@ -1614,6 +1860,56 @@ mod tests {
         cuts.len()
     }
 
+    /// Every mod-2 cut a model yields must hold at every one of its feasible points.
+    ///
+    /// Enumerated rather than argued. The derivation halves a sum of rows and rounds the
+    /// coefficients down, and rounding down is only valid because the columns are
+    /// nonnegative integers; a sign slip in the halving, or rounding a negative
+    /// coefficient towards zero instead of down, produces a cut that looks perfectly
+    /// ordinary and quietly removes the optimum.
+    fn assert_mod2_is_valid(p: &Problem, label: &str) -> usize {
+        let relaxed = Lp::relaxation(p).solve();
+        if relaxed.status != LpStatus::Optimal {
+            return 0;
+        }
+        let cuts = separate_mod2(p, &relaxed.x, 32);
+        let columns: Vec<usize> = (0..p.n_cols()).collect();
+        assert!(columns.len() <= 16);
+        assert!(columns.iter().all(|&j| p.is_integer(j) && p.col_ub[j] == 1.0));
+
+        let csr = p.matrix.to_csr();
+        for mask in 0u32..(1u32 << columns.len()) {
+            let point: Vec<f64> = columns
+                .iter()
+                .map(|&j| f64::from((mask >> j) & 1))
+                .collect();
+            let feasible = (0..p.n_rows()).all(|i| {
+                let (cols, values) = csr.column(i);
+                let activity: f64 = cols.iter().zip(values).map(|(&j, &a)| a * point[j]).sum();
+                activity >= p.row_lb[i] - 1e-9 && activity <= p.row_ub[i] + 1e-9
+            });
+            if !feasible {
+                continue;
+            }
+            for cut in &cuts {
+                let activity = cut.activity(&point);
+                assert!(
+                    activity <= cut.ub + 1e-6 && activity >= cut.lb - 1e-6,
+                    "{label}: cut {:?} <= {} cuts off the feasible point {point:?}",
+                    cut.coefficients,
+                    cut.ub
+                );
+            }
+        }
+        for cut in &cuts {
+            assert!(
+                cut.violation(&relaxed.x) > MIN_VIOLATION,
+                "{label}: cut does not separate the relaxation"
+            );
+        }
+        cuts.len()
+    }
+
     /// A mixed-integer knapsack: a continuous column and several integer ones meeting
     /// the same demand. This is the shape MIR exists for, and rounding the integer part
     /// of the row is exactly what the relaxation cannot do for itself.
@@ -1696,6 +1992,99 @@ mod tests {
             );
         }
         cuts.len()
+    }
+
+    /// A set partitioning model, which is the shape mod-2 exists for: rows whose
+    /// coefficients are all one, where halving a pair of them is what the relaxation
+    /// cannot do for itself.
+    fn partitioning(rows: &[&[usize]], n: usize) -> Problem {
+        let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+        let columns: Vec<usize> = (0..n).map(|j| model.binary(&format!("x{j}"))).collect();
+        model.objective(&columns.iter().map(|&j| (j, 1.0)).collect::<Vec<_>>());
+        for r in rows {
+            model.row(
+                &r.iter().map(|&j| (columns[j], 1.0)).collect::<Vec<_>>(),
+                crate::model::RowSense::Eq,
+                1.0,
+            );
+        }
+        model.build()
+    }
+
+    #[test]
+    fn mod2_cuts_hold_at_every_feasible_point() {
+        // Odd cycles, which is where a half-integral relaxation and an integral optimum
+        // come apart, and where combining rows is the only thing that closes the gap.
+        let mut total = 0;
+        for rows in [
+            vec![vec![0, 1], vec![1, 2], vec![0, 2]],
+            vec![vec![0, 1], vec![1, 2], vec![2, 3], vec![3, 4], vec![0, 4]],
+            vec![vec![0, 1, 2], vec![2, 3], vec![3, 4], vec![0, 4], vec![1, 3]],
+        ] {
+            let slices: Vec<&[usize]> = rows.iter().map(|r| r.as_slice()).collect();
+            let n = rows.iter().flatten().copied().max().unwrap() + 1;
+            total += assert_mod2_is_valid(&partitioning(&slices, n), "partitioning");
+        }
+        // A test that never separates anything proves nothing at all.
+        assert!(total > 0, "no mod-2 cut was generated, so nothing was checked");
+    }
+
+    #[test]
+    fn mod2_cuts_hold_on_random_models_with_signs_and_complements() {
+        // Partitioning rows alone do not exercise the halving, because their
+        // coefficients are all positive and rounding towards zero and rounding down
+        // agree. Mixed signs and a relaxation that parks some column at one, so the
+        // separator complements it, are what tell the two apart: with negative
+        // aggregated coefficients, `a / 2` rounds *up* where `a.div_euclid(2)` rounds
+        // down, and the cut stops being valid without looking any different.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut total = 0;
+        let mut checked = 0;
+        for _ in 0..200 {
+            let n = 6 + (next() % 3) as usize;
+            let m = 3 + (next() % 4) as usize;
+            let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+            let columns: Vec<usize> =
+                (0..n).map(|j| model.binary(&format!("x{j}"))).collect();
+            let objective: Vec<(usize, f64)> = columns
+                .iter()
+                .map(|&j| (j, (next() % 9) as f64 - 4.0))
+                .collect();
+            model.objective(&objective);
+            for _ in 0..m {
+                let mut terms: Vec<(usize, f64)> = Vec::new();
+                for &j in &columns {
+                    if next() % 2 == 0 {
+                        terms.push((j, (next() % 7) as f64 - 3.0));
+                    }
+                }
+                if terms.is_empty() {
+                    continue;
+                }
+                let span: f64 = terms.iter().map(|&(_, a)| a.abs()).sum();
+                let bound = (next() % (2 * span as u64 + 1)) as f64 - span;
+                let sense = match next() % 3 {
+                    0 => crate::model::RowSense::Le,
+                    1 => crate::model::RowSense::Ge,
+                    _ => crate::model::RowSense::Eq,
+                };
+                model.row(&terms, sense, bound);
+            }
+            let problem = model.build();
+            if problem.n_rows() == 0 {
+                continue;
+            }
+            checked += 1;
+            total += assert_mod2_is_valid(&problem, "random");
+        }
+        assert!(checked > 100, "only {checked} models were built");
+        assert!(total > 0, "no mod-2 cut was generated, so nothing was checked");
     }
 
     #[test]

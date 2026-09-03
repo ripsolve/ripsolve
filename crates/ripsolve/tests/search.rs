@@ -114,6 +114,48 @@ fn a_node_limit_stops_early_without_claiming_optimality() {
 }
 
 #[test]
+fn a_search_that_skipped_a_node_only_claims_optimality_when_it_holds() {
+    // A node whose LP runs out of iterations leaves its subtree unexamined, which
+    // normally forfeits the optimality claim. It does not forfeit it when the incumbent
+    // has since overtaken the bound that node inherited, because that bound holds over
+    // the whole subtree and the search prunes on exactly that test everywhere else.
+    //
+    // Squeezing the per-node iteration limit is what makes nodes run out. Whatever the
+    // search then reports, `Optimal` has to mean the reference optimum: relaxing the
+    // rule to say "optimal" more often is only safe if it is never saying it wrongly.
+    let data = fixtures();
+    let mut claimed = 0;
+    for entry in data["samples"].as_array().unwrap() {
+        let file = entry["file"].as_str().unwrap();
+        let problem = Problem::from_file(&samples_dir().join(file)).unwrap();
+        let expected = entry["mip_optimum"].as_f64().unwrap();
+        for limit in [1usize, 4, 16, 64] {
+            let solution = search::solve(
+                &problem,
+                Options {
+                    max_iterations_per_node: limit,
+                    ..Options::default()
+                },
+            );
+            if solution.status != Status::Optimal {
+                continue;
+            }
+            claimed += 1;
+            let got = solution.objective.unwrap_or(f64::NAN);
+            let scale = expected.abs().max(1.0);
+            assert!(
+                (got - expected).abs() <= 1e-6 * scale,
+                "{file} at {limit} iterations per node: claimed optimal {got},                  reference {expected}"
+            );
+        }
+    }
+    assert!(
+        claimed > 0,
+        "no run claimed optimality, so the claim was never checked"
+    );
+}
+
+#[test]
 fn reduced_cost_fixing_does_not_change_any_optimum() {
     // Reduced cost fixing narrows columns on the strength of a proof about the whole
     // tree: that no solution better than the incumbent has them anywhere else. A proof
