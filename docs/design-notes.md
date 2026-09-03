@@ -2140,6 +2140,49 @@ same claim: here the bound demonstrably does move, four times, and the differenc
 those two had nothing to fix and this one has three quarters of its columns to fix. A
 restart is worth what the fixing before it was worth.
 
+### The sub-MIP for `neos-820879`, and four ways it does not work
+
+The instance needs a point near 25500 within a few seconds, which a reference solver gets
+from a sub-MIP at 4.7 seconds. Four constructions were built and measured, and the
+negative results are worth more than the attempt.
+
+**RENS, fixing the relaxation's integral columns.** 9260 of `neos-820879`'s 9522 integer
+columns sit exactly on an integer in the relaxation. Fixing all of them leaves a model
+whose **LP is feasible and whose MIP is not**, and the same holds at every rate tried from
+30% to 90%. Fixing fewer does not help, because the infeasibility is not caused by the
+last few fixings; it is the shape of the neighbourhood.
+
+**RENS with propagation.** Fixing them one at a time, propagating each through the
+conflict graph and row activities and skipping any whose consequences contradict what is
+known — which is the expensive, careful version — reaches 3333 of 9522 decided and the
+sub-MIP is *still* infeasible. Propagation sees what one row can prove about another and
+that is not what is wrong here.
+
+**RENS with the LP as the oracle.** Bisecting on the number fixed and asking the LP after
+each attempt finds that the largest feasible fixing is *all of them*: the LP stays optimal
+with 9260 columns pinned. The neighbourhood is LP-feasible and integer-infeasible, which
+is exactly the case an LP cannot detect and the reason the careful version above did not
+help either.
+
+**The dive's leftovers.** A dive that dead-ends has fixed columns that each survived an LP
+solve, which is a stronger statement than propagation makes, and it throws them away when
+it reports failure. Keeping them as a neighbourhood is nearly free to build. It reaches
+200 columns of 9522, because that is the dive's step budget, and two per cent of a model
+is not a neighbourhood.
+
+What is left is RINS, which this solver has and runs every 500 nodes. Giving its
+sub-search a feasibility search of its own — it is disabled there, on the reasoning that a
+search starting from an incumbent is not looking for feasibility — does help: `neos-820879`
+goes from no incumbent at all to 25860 and `air05` from 47030 to 45318, and `eil33-2`, the
+instance that reasoning came from, is unchanged. It also costs `neos-3045796-mogo` three
+closes in three, dropping it to one in four, because the feasibility search inside every
+neighbourhood spends the budget `mogo` needs. Reverted on that.
+
+So the thing the reference solver does in four seconds is not any of: fixing what the
+relaxation is sure of, fixing it carefully, fixing as much as the LP allows, or keeping
+what a dive has already paid for. That is a real narrowing of the search space and the
+next attempt should start from it rather than from the same four ideas.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
