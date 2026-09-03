@@ -87,6 +87,9 @@ pub struct Options {
     /// is worth being able to turn off and compare against: the test that keeps it
     /// honest solves every sample both ways and requires the same answer.
     pub fix_by_reduced_cost: bool,
+    /// What percentage of a pass's free integer columns must become decided before the
+    /// solve starts over on the model those fixings leave behind. Zero never restarts.
+    pub restart_share: usize,
     /// Flips the LP-free feasibility search may make per column, per attempt, before
     /// giving up.
     ///
@@ -202,6 +205,7 @@ impl Default for Options {
             jump_moves: 200,
             perturb_stalled_root: true,
             fix_by_reduced_cost: true,
+            restart_share: 25,
             cut_rounds: 50,
             cuts_per_round: 64,
             refactor_interval: 200,
@@ -439,9 +443,46 @@ struct Worker<'a> {
     /// The spacing of the objective values this model can take; see
     /// [`objective_granularity`].
     granularity: Option<f64>,
+    /// Integer columns this pass arrived with still free, which is what a restart's
+    /// worth is measured against.
+    free_at_entry: usize,
 }
 
 impl<'a> Worker<'a> {
+    /// Has the incumbent decided enough of the model to be worth starting over on?
+    ///
+    /// The lurking table already knows: the entries in force at a cutoff are a prefix,
+    /// so the count is a binary search and costs nothing to ask on every node. What it
+    /// measures is what a fresh pass would find *already fixed* before it did anything,
+    /// which is exactly what a restart is buying.
+    ///
+    /// Against the columns this pass started with, not against the original model. A
+    /// pass that arrives on a model three quarters fixed and fixes another tenth has
+    /// found a tenth, and it is that tenth which decides whether presolving and cutting
+    /// again is worth the time it takes.
+    fn wants_restart(&self, incumbent: f64, options: &Options) -> bool {
+        if self.lurking.is_empty() || !incumbent.is_finite() {
+            return false;
+        }
+        let cutoff = match self.granularity {
+            Some(g) => lift_to_granularity(incumbent, self.granularity) - g,
+            None => incumbent,
+        };
+        let free = self.free_at_entry;
+        if free == 0 {
+            return false;
+        }
+        let entries = &self.lurking.entries[..self.lurking.in_force(cutoff)];
+        let decided = entries
+            .iter()
+            .filter(|entry| {
+                let j = entry.column as usize;
+                entry.lo >= entry.hi && self.problem.col_lb[j] < self.problem.col_ub[j]
+            })
+            .count();
+        decided * 100 >= free * options.restart_share
+    }
+
     fn new(problem: &'a Problem, lp: Lp, options: Options, lurking: &'a Lurking) -> Self {
         let n = problem.n_cols();
         Self {
@@ -456,6 +497,10 @@ impl<'a> Worker<'a> {
             in_force: 0,
             priced_at: f64::INFINITY,
             granularity: objective_granularity(problem),
+            free_at_entry: problem
+                .integer_columns()
+                .filter(|&j| problem.col_lb[j] < problem.col_ub[j])
+                .count(),
         }
     }
 
@@ -728,6 +773,8 @@ struct TreeResult {
     heuristic_hits: usize,
     /// The weakest bound left open, or infinity if the tree was exhausted.
     open_bound: f64,
+    /// The search stopped because starting over is worth more than continuing.
+    wants_restart: bool,
 }
 
 /// The open node set and the count of workers currently holding a node.
@@ -782,6 +829,8 @@ const CUT_SLACK_TOLERANCE: f64 = 1e-7;
 const STOP_NONE: usize = 0;
 const STOP_NODES: usize = 1;
 const STOP_TIME: usize = 2;
+/// The incumbent has decided enough of the model to be worth starting over on.
+const STOP_RESTART: usize = 3;
 
 impl Shared {
     fn incumbent(&self) -> f64 {
@@ -926,6 +975,13 @@ fn run_parallel(
                         shared.give_back(vec![node]);
                         continue;
                     }
+                    // Whatever the incumbent has proved since this pass began is worth
+                    // more spent on a smaller model than on this one; see `solve`.
+                    if worker.wants_restart(shared.incumbent(), &options) {
+                        shared.stopped.store(STOP_RESTART, Ordering::Relaxed);
+                        shared.give_back(vec![node]);
+                        continue;
+                    }
 
                     let best = shared.incumbent();
                     if !improves(node.bound, best, options.gap_tolerance) {
@@ -988,6 +1044,9 @@ fn run_parallel(
     let status = match shared.stopped.load(Ordering::Relaxed) {
         STOP_NODES => Status::NodeLimit,
         STOP_TIME => Status::TimeLimit,
+        // Not an answer, and not reported as one: the caller starts over and the status
+        // that matters is whatever the pass after this one arrives at.
+        STOP_RESTART => Status::NodeLimit,
         // A tree exhausted apart from a skipped node proves nothing, unless the
         // skipped node could not have held anything better anyway; see `improves`.
         _ if shared.unresolved.load(Ordering::Relaxed) > 0
@@ -1014,6 +1073,7 @@ fn run_parallel(
         } else {
             pool.open.best_bound()
         },
+        wants_restart: shared.stopped.load(Ordering::Relaxed) == STOP_RESTART,
     }
 }
 
@@ -1228,8 +1288,74 @@ fn separate_at_root(
     }
 }
 
+/// What one pass at a model produced, and whether it is worth starting over.
+struct Attempt {
+    solution: Solution,
+    /// The model to restart on: the one just searched, with everything the incumbent
+    /// has since proved about it written in. `None` when nothing was proved, or when
+    /// there is no time to spend on a fresh start.
+    restart: Option<Problem>,
+}
+
+/// Solve, restarting on the model the search has narrowed while it ran.
+///
+/// A pass fixes columns as the incumbent improves, through reduced cost fixing and the
+/// lurking table, but it fixes them *in the tree it is already walking*: the model that
+/// was presolved, cut and branched on is the one that arrived, and none of the work that
+/// shaped it is redone on the smaller model those fixings leave behind. Starting over is
+/// how that work gets redone, and on a model where three quarters of the columns have
+/// gone it is a different problem.
 pub fn solve(problem: &Problem, options: Options) -> Solution {
     let started = Instant::now();
+    let mut model: Option<Problem> = None;
+    let mut seed: Option<(f64, Vec<f64>)> = None;
+    let (mut nodes, mut iterations, mut heuristics) = (0usize, 0usize, 0usize);
+    for _ in 0..=MAX_RESTARTS {
+        let current = model.as_ref().unwrap_or(problem);
+        let attempt = solve_once(current, options, started, seed.take());
+        // The counters belong to the whole solve, not to the last pass of it.
+        nodes += attempt.solution.nodes;
+        iterations += attempt.solution.simplex_iterations;
+        heuristics += attempt.solution.heuristic_solutions;
+        let mut solution = attempt.solution;
+        solution.nodes = nodes;
+        solution.simplex_iterations = iterations;
+        solution.heuristic_solutions = heuristics;
+        let out_of_time = options
+            .time_limit
+            .is_some_and(|limit| started.elapsed() >= limit);
+        let Some(narrowed) = attempt.restart.filter(|_| !out_of_time) else {
+            return solution;
+        };
+        // Nothing carries over but the point, which is still feasible: the narrowed
+        // model only ever has tighter bounds, and every fixing written into it was
+        // proved against this incumbent or a worse one.
+        seed = (!solution.x.is_empty()).then(|| {
+            let internal = objective_at(problem, &solution.x);
+            (internal, solution.x.clone())
+        });
+        model = Some(narrowed);
+    }
+    // Out of restarts. One more pass, and whatever it says is the answer.
+    let attempt = solve_once(
+        model.as_ref().unwrap_or(problem),
+        options,
+        started,
+        seed,
+    );
+    let mut solution = attempt.solution;
+    solution.nodes += nodes;
+    solution.simplex_iterations += iterations;
+    solution.heuristic_solutions += heuristics;
+    solution
+}
+
+fn solve_once(
+    problem: &Problem,
+    options: Options,
+    started: Instant,
+    seed: Option<(f64, Vec<f64>)>,
+) -> Attempt {
 
     // Presolve reduces in place and introduces no renumbering, so the reduced
     // model's solution vector is directly the original's, there is no postsolve.
@@ -1245,7 +1371,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
         match presolve::presolve_until(&mut reduced, 20, presolve_deadline) {
             Outcome::Infeasible => {
-                return Solution::without_solution(Status::Infeasible, 0, 0, None);
+                return Attempt {
+                    solution: Solution::without_solution(Status::Infeasible, 0, 0, None),
+                    restart: None,
+                };
             }
             Outcome::Reduced(stats) => (&reduced, Some(stats)),
         }
@@ -1268,8 +1397,15 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     let mut iterations = 0usize;
     // Everything below is in the internal minimization form; conversion to the
     // user's sense happens once, on the way out.
-    let mut incumbent = f64::INFINITY;
-    let mut incumbent_x: Option<Vec<f64>> = None;
+    // A restart begins with the point the pass before it ended on. That point is still
+    // feasible for this model, whose bounds are only tighter, and having it from the
+    // first node is most of what a restart is for: reduced cost fixing and the lurking
+    // table both read the incumbent, and a fresh pass that had to find one again would
+    // spend the run re-earning what it already knew.
+    let (mut incumbent, mut incumbent_x) = match seed {
+        Some((objective, x)) => (objective, Some(x)),
+        None => (f64::INFINITY, None),
+    };
 
     // Run only where it is needed, which is the two places nothing else reaches: when
     // the relaxation does not finish, and when it does and every heuristic built on it
@@ -1384,7 +1520,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         solution.root_bound_after_cuts = value;
         solution.x = found.x;
         solution.heuristic_solutions = 1;
-        return solution;
+        return Attempt {
+            solution,
+            restart: None,
+        };
     }
 
     // The relaxation gets a first attempt on a share of the run. Most models finish it
@@ -1487,7 +1626,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         } else {
             jump(None, JUMP_SHARE)
         };
-        return match rescued {
+        let solution = match rescued {
             Some(found) if status != Status::Infeasible => {
                 let mut solution =
                     Solution::without_solution(status, nodes, iterations, presolve_stats);
@@ -1497,6 +1636,10 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
                 solution
             }
             _ => Solution::without_solution(status, nodes, iterations, presolve_stats),
+        };
+        return Attempt {
+            solution,
+            restart: None,
         };
     }
 
@@ -1651,9 +1794,19 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
     if let Some(x) = integral_solution(problem, &root.x, options.integrality_tolerance) {
         // Scored from the rounded point, not the relaxation value; see
         // `objective_at`.
-        incumbent = objective_at(problem, &x);
-        incumbent_x = Some(x);
-        open = OpenNodes::new(options.plunge_limit);
+        //
+        // Compared rather than assigned. This used to take the relaxation's point
+        // outright, which was safe while every solve began with no incumbent at all and
+        // is not now: a restart begins holding the point the pass before it found, and
+        // an integral relaxation on the narrowed model can be worse than it. On
+        // `samples/simple.lp` it is — the restarted root is integral at 7 against a
+        // seed of 10 — and assigning threw the answer away.
+        let objective = objective_at(problem, &x);
+        if objective < incumbent {
+            incumbent = objective;
+            incumbent_x = Some(x);
+            open = OpenNodes::new(options.plunge_limit);
+        }
     }
 
     // With a proven bound and a point in hand, some columns are already decided.
@@ -1763,7 +1916,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             (Status::Optimal, None) => Status::Infeasible,
             (other, _) => other,
         };
-        return Solution {
+        let solution = Solution {
             status,
             objective: result
                 .incumbent_x
@@ -1779,9 +1932,15 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             root_bound: problem.objective_value(first_bound),
             root_bound_after_cuts: problem.objective_value(root_bound),
         };
+        let restart = result
+            .wants_restart
+            .then(|| narrow_for_restart(problem, &lurking, result.incumbent))
+            .flatten();
+        return Attempt { solution, restart };
     }
 
     let mut worker = Worker::new(problem, lp, options, &lurking);
+    let mut restart_wanted = false;
 
     while let Some(node) = open.pop() {
         if nodes >= options.max_nodes {
@@ -1794,6 +1953,11 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             .is_some_and(|limit| started.elapsed() >= limit)
         {
             status = Status::TimeLimit;
+            open.push(node);
+            break;
+        }
+        if worker.wants_restart(incumbent, &options) {
+            restart_wanted = true;
             open.push(node);
             break;
         }
@@ -1880,7 +2044,7 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         (other, _) => other,
     };
 
-    Solution {
+    let solution = Solution {
         status,
         objective: incumbent_x
             .as_ref()
@@ -1894,7 +2058,41 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         heuristic_solutions,
         root_bound: problem.objective_value(first_bound),
         root_bound_after_cuts: problem.objective_value(root_bound),
+    };
+    let restart = restart_wanted
+        .then(|| narrow_for_restart(problem, &lurking, incumbent))
+        .flatten();
+    Attempt { solution, restart }
+}
+
+/// The model a restart should begin from: this one, with everything the incumbent has
+/// proved written into its bounds.
+///
+/// Only bounds the lurking table has *earned* at this incumbent, so every one of them is
+/// a proof rather than a supposition, and the narrowed model has the same optimum as the
+/// one handed in wherever that optimum beats the incumbent. Returns `None` when nothing
+/// was earned, which makes starting over pointless.
+fn narrow_for_restart(problem: &Problem, lurking: &Lurking, incumbent: f64) -> Option<Problem> {
+    if !incumbent.is_finite() {
+        return None;
     }
+    let granularity = objective_granularity(problem);
+    let cutoff = match granularity {
+        Some(g) => lift_to_granularity(incumbent, granularity) - g,
+        None => incumbent,
+    };
+    let mut narrowed = problem.clone();
+    let mut changed = 0usize;
+    for entry in &lurking.entries[..lurking.in_force(cutoff)] {
+        let j = entry.column as usize;
+        let (lo, hi) = (narrowed.col_lb[j], narrowed.col_ub[j]);
+        narrowed.col_lb[j] = entry.lo.max(lo);
+        narrowed.col_ub[j] = entry.hi.min(hi);
+        if narrowed.col_lb[j] != lo || narrowed.col_ub[j] != hi {
+            changed += 1;
+        }
+    }
+    (changed > 0).then_some(narrowed)
 }
 
 /// The share of a run the root cut loop may spend before the search takes over.
@@ -2272,6 +2470,14 @@ const JUMP_SHARE: f64 = 0.05;
 /// seventeen starts and nine seconds, and a model that is never going to yield spends
 /// exactly the same budget either way.
 const JUMP_RESTARTS: usize = 200;
+
+/// How many times a solve may start over on the model its own search narrowed.
+///
+/// Each one repeats presolve, the root relaxation and the cut loop, so it is only worth
+/// taking when what has been fixed since the last start is a large part of the model.
+/// The count is a backstop; what actually ends the sequence is running out of columns
+/// to fix or time to spend.
+const MAX_RESTARTS: usize = 3;
 
 /// How much of the model the reduced cost neighbourhood may decide, as a percentage.
 ///
