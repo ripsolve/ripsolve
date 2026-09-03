@@ -87,12 +87,13 @@ pub struct Options {
     /// is worth being able to turn off and compare against: the test that keeps it
     /// honest solves every sample both ways and requires the same answer.
     pub fix_by_reduced_cost: bool,
-    /// Flips the LP-free feasibility search may make before giving up.
+    /// Flips the LP-free feasibility search may make per column, per attempt, before
+    /// giving up.
     ///
-    /// It runs ahead of the root relaxation, so this is the one heuristic budget that
-    /// is spent whether or not the relaxation is ever solved, and the models where that
-    /// matters most are the large ones. Two hundred thousand is a few seconds on the
-    /// largest instance in the pure binary set and well under a second on most.
+    /// Per column because a flip is a column: an absolute count is a different budget
+    /// on every model, and on the large ones it is no budget at all. What bounds a run
+    /// that is going nowhere is the stall cutoff inside the search, and what bounds the
+    /// whole of it is the deadline.
     pub jump_moves: usize,
     /// Rounds of cut separation at the root. Zero disables cuts.
     ///
@@ -198,7 +199,7 @@ impl Default for Options {
             presolve: true,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
-            jump_moves: 25_000,
+            jump_moves: 200,
             perturb_stalled_root: true,
             fix_by_reduced_cost: true,
             cut_rounds: 50,
@@ -1308,14 +1309,83 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             (Some(own), Some(hard)) => Some(own.min(hard)),
             (own, hard) => own.or(hard),
         };
-        heuristic::feasibility_jump(
-            problem,
-            &start,
-            &options.heuristic_limits,
-            options.jump_moves,
-            jump_deadline,
-        )
+        // Restarted from randomised corners when the first attempt fails, which is what
+        // the search stopping is for: a run that has settled has settled, and the
+        // weights that got it there are the reason it will not move again. Where it
+        // begins decides which local minimum it has to climb out of, and it is cheaper
+        // to begin somewhere else than to keep climbing.
+        //
+        // `neos-3226448-wkra` is the case: nothing from the model's own bounds however
+        // long it is given, and a feasible point on the seventeenth random start. The
+        // budget is the same either way, so a model this does not help pays only the
+        // scheduling.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for attempt in 0..JUMP_RESTARTS {
+            let from: Vec<f64> = if attempt == 0 {
+                start.clone()
+            } else {
+                (0..problem.n_cols())
+                    .map(|j| {
+                        let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+                        let pick = if next() & 1 == 0 { lo } else { hi };
+                        if pick.is_finite() { pick } else { start[j] }
+                    })
+                    .collect()
+            };
+            let found = heuristic::feasibility_jump(
+                problem,
+                &from,
+                &options.heuristic_limits,
+                // Per attempt, and per *column*: an absolute count of flips is a
+                // budget of two and a half flips a column on a model of ten thousand
+                // and two hundred and fifty on a model of a hundred, which is the same
+                // mistake this file complains about elsewhere. What actually bounds a
+                // run that is going nowhere is the stall cutoff inside the search, and
+                // what bounds the whole of it is the deadline; this is the third guard
+                // and it should not be the binding one. `neos-3226448-wkra` closes at
+                // two hundred flips a column and does not at two and a half.
+                options.jump_moves.saturating_mul(problem.n_cols().max(1)),
+                jump_deadline,
+            );
+            if found.is_some() {
+                return found;
+            }
+            if jump_deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+        }
+        None
     };
+
+    // A model with nothing to optimise is asking for a feasible point, and the whole
+    // apparatus above the feasibility search exists to find a *good* point. So it goes
+    // first here and gets the run rather than a twentieth of it, because there is
+    // nothing else for the run to be spent on: the bound is a constant that needs no
+    // relaxation to establish, and any point at all attains it.
+    //
+    // `neos-3226448-wkra` is the case. Its objective is empty, HiGHS answers it in two
+    // tenths of a second without solving a single LP, and this solver spent sixty
+    // seconds on a relaxation whose value it could have written down.
+    if objective_is_constant(problem)
+        && let Some(found) = jump(None, CONSTANT_OBJECTIVE_SHARE)
+    {
+        let value = problem.objective_value(constant_objective(problem));
+        let mut solution =
+            Solution::without_solution(Status::Optimal, nodes, iterations, presolve_stats);
+        solution.objective = Some(value);
+        solution.bound = value;
+        solution.root_bound = value;
+        solution.root_bound_after_cuts = value;
+        solution.x = found.x;
+        solution.heuristic_solutions = 1;
+        return solution;
+    }
 
     // The relaxation gets a first attempt on a share of the run. Most models finish it
     // and pay nothing more.
@@ -1523,20 +1593,24 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
             // agrees it is a good one. Where this heuristic wins it wins outright, its
             // point landing on the optimum with the bound already there to prove it:
             // `acc-tight2`, `disctom` and `neos-913984` all close in two nodes from a
-            // point at zero gap. Where its point is poor it is worse than none, having
-            // been installed early enough to steer the search and too loose to prune
-            // with: `eil33-2` at 37% off the bound went from solved in 96 seconds to
-            // unsolved in 150. The threshold sits far from both.
+            // point at zero gap.
+            //
+            // Its point used to be thrown away when it sat more than a tenth off the
+            // root bound, because a poor one had cost `eil33-2` its solve, 96 seconds
+            // to unsolved in 150. That is no longer true of any instance in the set,
+            // and a point is worth more than it was when the threshold was measured:
+            // reduced cost fixing reads the incumbent, so a poor point that prunes
+            // nothing by itself still decides columns. Every one of these arrives where
+            // the search would otherwise report no incumbent at all, and accepting
+            // them all costs none of the 31 its solve while `neos-820879` goes from no
+            // bound to a gap of 1.27%.
             .or_else(|| {
                 // From the bounds rather than from the relaxation, which is measured
                 // rather than assumed: rounding the relaxation looks like the better
                 // start and is not, losing `acc-tight2`, `disctom` and `neos-913984`
                 // outright. The weights are what find the point, and where they start
                 // from decides which local minimum they have to climb out of first.
-                jump(None, JUMP_SHARE).filter(|found| {
-                    let scale = found.objective.abs().max(1.0);
-                    found.objective - root.objective <= JUMP_QUALITY * scale
-                })
+                jump(None, JUMP_SHARE)
             })
             // Last of all, and cheapest of all. A corner of the box is usually a poor
             // point and is not offered ahead of anything: put in front of diving, a
@@ -1941,6 +2015,28 @@ fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+/// Does every feasible point of this model score the same?
+///
+/// A model whose objective is empty, or whose only objective coefficients sit on columns
+/// the model has already pinned, is asking for a feasible point rather than a good one.
+/// Two of the instances this solver misses are exactly that, `neos-3226448-wkra` and
+/// `supportcase4`, and on both of them it spends the whole run on a relaxation whose
+/// value it could have written down: the bound is that constant, no search can improve
+/// on it, and the first feasible point is optimal.
+fn objective_is_constant(problem: &Problem) -> bool {
+    (0..problem.n_cols()).all(|j| {
+        problem.obj[j].abs() <= 1e-12 || problem.col_lb[j] >= problem.col_ub[j] - 1e-12
+    })
+}
+
+/// What every feasible point scores, where they all score the same.
+fn constant_objective(problem: &Problem) -> f64 {
+    (0..problem.n_cols())
+        .filter(|&j| problem.obj[j].abs() > 1e-12)
+        .map(|j| problem.obj[j] * problem.col_lb[j])
+        .sum()
+}
+
 /// Lift a bound to the next objective value the model can actually take.
 ///
 /// Sound because every feasible point of every subtree scores a multiple of `g`, so the
@@ -2140,12 +2236,20 @@ fn fix_by_reduced_cost(
 /// is what actually bounds it; this is the backstop.
 const JUMP_SHARE: f64 = 0.05;
 
-/// How far from the root bound a jumped point may sit and still be worth installing.
+/// Randomised starts the feasibility search may take before giving up.
 ///
-/// Measured rather than chosen: the three instances this heuristic closes arrive at a
-/// gap of zero, and the one it cost arrives at 37%. Anything in between is untested, so
-/// this is set near the winners rather than midway.
-const JUMP_QUALITY: f64 = 0.10;
+/// It stops when it has settled, and where it settles is decided by where it began, so
+/// beginning somewhere else is the cheapest thing to try next. The count is generous
+/// because the deadline is what actually stops this: `neos-3226448-wkra` needs
+/// seventeen starts and nine seconds, and a model that is never going to yield spends
+/// exactly the same budget either way.
+const JUMP_RESTARTS: usize = 200;
+
+/// The share of the run a model with nothing to optimise gives its feasibility search.
+///
+/// Most of it, because there is nothing else to spend it on. What is left over goes to
+/// the ordinary path, which can still prove the model infeasible where this cannot.
+const CONSTANT_OBJECTIVE_SHARE: f64 = 0.75;
 
 /// What is left of a time limit that started at `started`, or `None` for no limit.
 fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {

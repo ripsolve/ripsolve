@@ -75,8 +75,8 @@ enum Command {
         /// Worker threads; defaults to the machine's parallelism.
         #[arg(short, long)]
         threads: Option<usize>,
-        /// Flips the LP-free feasibility search may make. 0 disables it.
-        #[arg(long, default_value_t = 25_000)]
+        /// Flips per column the LP-free feasibility search may make. 0 disables it.
+        #[arg(long, default_value_t = 200)]
         jump_moves: usize,
     },
     /// Solve a model's LP relaxation and report the bound.
