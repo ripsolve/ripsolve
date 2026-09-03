@@ -3,6 +3,33 @@
 Written at the end of a long session so the next one does not start by re-deriving it.
 The reasoning behind every claim here is in `design-notes.md`; this is the index.
 
+## Where the dual work had got to when it stopped
+
+Nothing uncommitted; this is a note on the last measurement so it is not re-run. The
+primal side is settled and answered — see "The primal side is not the gap" in
+`design-notes.md` — and what is left on the three closest instances is bound. Running
+each cut family alone against the same relaxation, with `cargo run --release --example
+cutfamilies`:
+
+```text
+neos-953928     root -99.9200   cover 19, mir 65, clique 62, gomory 12, mod2 0
+                                158 cuts between them and the bound does not move at all
+neos-820879     root 24874.27   gomory 82 -> 24959.6, mod2 6 -> 24887, all -> 24969.8
+                                optimum 25468
+air05           root 25877.61   gomory generates *nothing*, clique 17 -> 25906.4
+                                optimum 26374
+```
+
+Three different problems. `neos-953928` is the `n2seq36f` situation again — a face large
+enough that 158 violated cuts move the bound by nothing — except that mod-2, which was the
+answer there, finds no cut at all here. `neos-820879` responds to cuts and needs about
+twenty times more of that response. `air05` produces no Gomory cut whatsoever from a
+fractional relaxation, which on the evidence of the density filter is worth understanding
+before anything is built: last time that symptom meant a filter was discarding them
+silently, and it is the same shape of question.
+
+Start there, with `cutfamilies`, rather than with a new separator.
+
 ## Standing
 
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
