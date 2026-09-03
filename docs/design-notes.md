@@ -2095,6 +2095,51 @@ the circumstances look different: the guard the earlier attempt needed was descr
 that note, and adding it afterwards cost a round of measurement that reading it would
 have saved.
 
+### What `neos-820879` needs, which is two things and neither of them small
+
+The closest instance in the set at 0.5%, and worth writing down in full because the chain
+that closes it is visible in a reference solver's log and only one link of it is missing
+here.
+
+```text
+HiGHS       root LP 24874, same as this solver
+ J   0.5s   a point, 39392
+ L   4.7s   sub-MIP finds 25505, bound moves to 25140
+     ...    74.0% inactive integer columns, restarting
+            9522 columns -> 2476
+            bound 25150 -> 25229 -> 25236, restarting twice more
+```
+
+Everything after the first line depends on the second. A point of 25505 against a bound
+of 24874 leaves a room of 631, and at that room reduced cost fixing decides three quarters
+of the model; restarting on what is left re-presolves and re-cuts a model a quarter the
+size, and *that* is what walks the bound from 25140 to the optimum of 25468.
+
+This solver has the fixing and the lurking table and gets no benefit from either here,
+because it has no point until the run is nearly over. Its first incumbent arrives after 45
+seconds of a 60 second limit; the ordering that produces that is deliberate and is
+explained above, the chain being ordered by what its points are worth rather than by what
+they cost. On this model nothing above the feasibility search finds anything at all, so
+the chain runs to the end before reaching the one thing that would.
+
+Running the feasibility search early was tried and is not the answer either. It reaches a
+point in 2.5 seconds, but the point is 38973, which leaves a room of 4000 and fixes
+**nothing**. What matters is not having a point early but having a *good* one, which is
+what the sub-MIP gives HiGHS and what nothing here produces in time.
+
+It costs, too, and the cost falls where this file has recorded it falling before:
+`f2gap401600` 0.25 seconds to 1.8 and `mod010` 0.53 to 4.5. Bounding it by flips per
+column rather than by a share of the clock, which is the correction this file applies
+everywhere else, changes nothing: the cost *is* the flips, and 200 per column on a model
+of 2655 is four seconds. Reverted.
+
+So the two missing pieces are a sub-MIP good enough to reach 25500 within a few seconds,
+and restarts to spend what it earns. The second was measured earlier against `n2seq36f`
+and `neos-1516309` and found not to move their bounds, which is still true and is not the
+same claim: here the bound demonstrably does move, four times, and the difference is that
+those two had nothing to fix and this one has three quarters of its columns to fix. A
+restart is worth what the fixing before it was worth.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
