@@ -1706,6 +1706,34 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
         }
     };
 
+    // With the table in hand, the cheapest thing to try next is what it would prove if
+    // the answer were better than anything found so far; see
+    // `reduced_cost_neighbourhood`. This is where the instances whose bound is already
+    // exact are waiting: they need a point, not a bound.
+    // Not when the incumbent already matches the bound. A search asked to beat a point
+    // the bound has already matched cannot succeed and does not stop trying, and the
+    // instances in that state are the ones that need what is left of the run to
+    // certify what they are holding: `acc-tight2`, `disctom` and `neos-913984` each
+    // hold their optimum after one node, and an unguarded improvement search at the
+    // root takes all three from optimal to a timeout reporting a gap of zero. This is
+    // the same trap recorded against the earlier attempt at root improvement, and it
+    // was walked into again by assuming the situation had changed.
+    if options.improvement_frequency > 0
+        && improves(root_bound, incumbent, options.gap_tolerance)
+        && let Some((objective, x)) = reduced_cost_neighbourhood(
+            problem,
+            &lurking,
+            root_bound,
+            &options,
+            remaining_of(options.time_limit, started),
+        )
+        && objective < incumbent
+    {
+        incumbent = objective;
+        incumbent_x = Some(x);
+        heuristic_solutions += 1;
+    }
+
     let mut status = Status::Optimal;
 
     let threads = options.threads.max(1);
@@ -2245,6 +2273,14 @@ const JUMP_SHARE: f64 = 0.05;
 /// exactly the same budget either way.
 const JUMP_RESTARTS: usize = 200;
 
+/// The share of what is left that the reduced cost neighbourhood may spend.
+///
+/// Three tenths, and the window is narrow at both ends. At a twentieth
+/// `neos-3045796-mogo` comes back with an incumbent of 1380; at a fifth it reaches its
+/// optimum of -175 in two runs of four; at three tenths in three of three; at two fifths
+/// in none of three, the search having been left too little to certify what it holds.
+const NEIGHBOURHOOD_SHARE: f64 = 0.3;
+
 /// The share of the run a model with nothing to optimise gives its feasibility search.
 ///
 /// Most of it, because there is nothing else to spend it on. What is left over goes to
@@ -2271,6 +2307,98 @@ fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
 /// The sub-search runs with improvement off, which is what stops this recursing: a
 /// neighbourhood of a neighbourhood is the same idea applied to less and less, and the
 /// budget is better spent on the original.
+/// Search the neighbourhood the root's reduced costs would fix if the answer were
+/// better than anything yet found.
+///
+/// The lurking table already says, for every column, the bound it takes and the
+/// incumbent at which it takes it. Read in the other direction it is a construction:
+/// *suppose* the answer beats the weakest threshold in the table, and the entries at or
+/// above it are all true. Applying them leaves a much smaller model, and its optimum is
+/// either a better solution to the original or a proof that the supposition was wrong.
+/// Nothing about the sub-model is unsound -- its bounds are only tighter -- so any point
+/// it returns is a genuine solution to the original.
+///
+/// This is what the ordinary improvement search cannot do here. That one fixes columns
+/// where the incumbent and the relaxation agree, and where the incumbent came from a
+/// feasibility search rather than from the relaxation, they agree about nothing useful:
+/// on `neos-3045796-mogo` it walks an incumbent of 1180 down to 300 against an optimum
+/// of -175. This construction does not read the incumbent at all.
+fn reduced_cost_neighbourhood(
+    problem: &Problem,
+    lurking: &Lurking,
+    root_bound: f64,
+    options: &Options,
+    remaining: Option<Duration>,
+) -> Option<(f64, Vec<f64>)> {
+    if lurking.is_empty() || remaining.is_some_and(|left| left.is_zero()) {
+        return None;
+    }
+    let integers = problem.integer_columns().count();
+    if integers == 0 {
+        return None;
+    }
+    let mut narrowed = problem.clone();
+    let mut fixed = 0usize;
+    // Ordered by the incumbent each entry needs, so this walks from the entries a
+    // barely-better answer would justify towards the ones only a much better answer
+    // would, and stops as soon as enough of the model is decided.
+    for entry in &lurking.entries {
+        if entry.threshold <= root_bound {
+            break;
+        }
+        let j = entry.column as usize;
+        let (lo, hi) = (narrowed.col_lb[j], narrowed.col_ub[j]);
+        if lo >= hi {
+            continue;
+        }
+        narrowed.col_lb[j] = entry.lo.max(lo);
+        narrowed.col_ub[j] = entry.hi.min(hi);
+        if narrowed.col_lb[j] >= narrowed.col_ub[j] {
+            fixed += 1;
+            if fixed * 2 >= integers {
+                break;
+            }
+        }
+    }
+    // Too little of the model decided and this is the original problem again, which the
+    // caller is already searching.
+    // A tenth, not the third HiGHS uses for the same construction. Its neighbourhood is
+    // grown by propagation, which turns each fixed column into several; nothing here
+    // propagates, so the same share of the model needs far more entries to reach and
+    // the cases that pay do not reach it. `neos-3045796-mogo` fixes 17% and is worth
+    // searching: its incumbent goes from 1180 to -155 against an optimum of -175.
+    if fixed * 10 < integers {
+        return None;
+    }
+
+    let found = solve(
+        &narrowed,
+        Options {
+            improvement_frequency: 0,
+            max_nodes: options.improvement_nodes,
+            threads: 1,
+            // With its own feasibility search, unlike the improvement search next door.
+            // That one starts from an incumbent and is looking for a better point near
+            // it, so re-establishing feasibility is wasted; this one starts from no
+            // point at all, and finding one is the whole job. Inheriting the rule from
+            // the neighbour left `neos-3045796-mogo` at 150 where it reaches -155.
+            jump_moves: options.jump_moves,
+            // A share of what is left, not all of it. This runs before the tree opens,
+            // so whatever it spends the search never gets.
+            time_limit: remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
+            ..*options
+        },
+    );
+    let x = found.x;
+    if x.len() != problem.n_cols() {
+        return None;
+    }
+    // Feasible for the original by construction, but checked rather than assumed: the
+    // sub-search reports a point from whatever model it actually ran on.
+    let tolerance = options.heuristic_limits.feasibility_tolerance;
+    heuristic::is_feasible(problem, &x, tolerance).then(|| (objective_at(problem, &x), x))
+}
+
 fn improve(
     problem: &Problem,
     incumbent: &[f64],

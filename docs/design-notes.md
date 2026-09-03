@@ -2051,18 +2051,31 @@ neos-820879             25342         25468   a little of both
 Three instances hold an exact or near-exact bound and are waiting entirely on a good
 point, and in HiGHS's log all three are answered by a sub-MIP.
 
-### The sub-MIP construction that did not pay, and the trap next to it
+### The sub-MIP construction that does pay, and the trap next to it
 
 HiGHS's `rootReducedCost` builds a neighbourhood out of the lurking bounds this solver
 already computes: *suppose* the answer beats the weakest threshold in the table, apply
-every entry at or above it, and search what is left. It is a genuinely nice idea -- the
-table read backwards is a construction rather than a filter -- and it was built here
-because the table was already in hand.
+every entry at or above it, and search what is left. The table read backwards is a
+construction rather than a filter, and it was built here because the table was in hand.
 
-It works, and it is not worth having. `neos-3045796-mogo` goes from an incumbent of 930
-to -155 against an optimum of -175, which is the largest primal improvement anything here
-has produced on that instance. It closes nothing, and it costs `irp` its solve, three runs
-in three. A change that converts nothing and loses one is a change that loses one.
+`neos-3045796-mogo` closes. Its incumbent goes from 930 to its optimum of -175, where the
+ordinary improvement search walks it to 930 and stops: that one fixes columns where the
+incumbent and the relaxation agree, and where the incumbent came from a feasibility search
+rather than from the relaxation they agree about nothing useful. This construction does
+not read the incumbent at all.
+
+The share of the remaining budget it may spend has a narrow window at both ends, which is
+the whole of the tuning: at a twentieth `mogo` comes back with 1380, at a fifth it reaches
+-175 in two runs of four, at three tenths in three of three, and at two fifths in none of
+three, the search having been left too little time to certify what it holds.
+
+**This was nearly discarded on a confounded measurement, which is worth more than the
+result.** It was built at the same time as an unrelated change, root improvement, and when
+`irp` stopped closing the two were separated by an environment switch that turned this one
+off. `irp` still failed, so this was written up as costing `irp` its solve and reverted.
+The switch was being read by a binary that had not been rebuilt; the culprit was the other
+change, and reverting the pair discarded a working one. **One change at a time, and a
+switch that disables something is a claim to be verified like any other.**
 
 The trap beside it is worth recording more than the construction is. The ordinary
 improvement search was also moved to the root, on the reasoning that "Searching the
