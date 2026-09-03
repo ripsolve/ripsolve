@@ -8,14 +8,14 @@ The reasoning behind every claim here is in `design-notes.md`; this is the index
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     31        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     32        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Confirmed by a full run, `docs/baselines/binary-2026-09-05.json`, which gained
-`n2seq36f` against the previous one and lost nothing. Ahead of CBC, and fifteen behind
-HiGHS.
+Confirmed by a full run, `docs/baselines/binary-2026-09-06.json`, which gained
+`neos-3226448-wkra` against the previous one and lost nothing. Ahead of CBC, and
+fourteen behind HiGHS.
 
-The 31 all close on every run, with no instance left sitting on the sixty second line.
+The 32 all close on every run, with no instance left sitting on the sixty second line.
 That matters, because for a long stretch two of them were: quote the set that closes
 every time rather than one run's count, and check a new one against repeated runs before
 believing it.
@@ -30,9 +30,10 @@ irp             those fixings collected as the incumbent earns them
 neos-1516309    the Gomory density filter
 neos-1599274    the same, plus not forfeiting optimality to a prunable skipped node
 n2seq36f        mod-2 cuts
+neos-3226448-wkra  four budgets between the feasibility search and a point it could reach
 ```
 
-Five of the 31 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
+Five of the 32 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
 `nw04` and `neos-4754521-awarau`.
 
 ## Speed, on the instances both solvers close
@@ -267,7 +268,8 @@ pump, fixing with propagation and the LP-free jump all running and all returning
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-05.json`, with the run before mod-2 cuts kept as
+  `docs/baselines/binary-2026-09-06.json`, with the run before the feasibility work kept
+  as `binary-2026-09-05.json`, the one before mod-2 cuts as
   `binary-2026-09-04.json`, the one before the cut density fix as
   `binary-2026-09-03.json`, the one before this round's reduced cost work as
   `binary-2026-09-02c.json`, the one before the root work as `binary-2026-09-02.json` and
