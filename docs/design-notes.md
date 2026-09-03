@@ -2001,6 +2001,87 @@ wrongly, so the test squeezes the per-node iteration limit until nodes are actua
 skipped, and requires every run that says `Optimal` to match the reference optimum.
 Without the guard, `v064c064` claims 165 against a true 137.
 
+### Four budgets between a feasibility search and the point it could reach
+
+`neos-3226448-wkra` closes in 8.7 seconds and no simplex iterations at all, having
+previously spent sixty seconds on a relaxation. HiGHS answers it in two tenths the same
+way. Nothing about the search changed; four separate guards had each stopped meaning what
+they were written to mean, and all four had to go before the point was reachable.
+
+**Its objective is empty**, and so is `supportcase4`'s. Every feasible point scores the
+same, the bound is a constant that no relaxation is needed to establish, and the first
+point found is optimal. Such a model is asking for a feasible point, and the whole
+apparatus above the feasibility search exists to find a *good* one. It now goes first and
+gets the run rather than a twentieth of it.
+
+**The move budget was an absolute count.** Twenty-five thousand flips is two and a half
+per column on a model of ten thousand columns and two hundred and fifty on a model of a
+hundred. A flip is a column, so the budget is per column now. What bounds a run going
+nowhere is the stall cutoff, and what bounds the whole of it is the deadline; this was
+the third guard and should never have been the binding one.
+
+**It never restarted.** The search stops when it has settled, and the weights that got it
+there are why it will not move again, so where it begins decides where it ends. From this
+model's own bounds it yields nothing however long it is given, and yields a point on the
+seventeenth random start.
+
+**Its point would have been discarded anyway.** A jumped point more than a tenth off the
+root bound was thrown away, because a poor one had cost `eil33-2` its solve. Re-measured,
+that costs nothing now on any instance in the set, and a point is worth more than it was
+when the threshold was set: reduced cost fixing reads the incumbent, so a point that
+prunes nothing by itself still decides columns. Every point the filter rejected arrived
+where the search reports no incumbent at all. `neos-820879` goes from no bound to a gap
+of 1.03%, `neos-3045796-mogo` to a bound already equal to its optimum.
+
+### Where the remaining instances actually are, primal against dual
+
+Worth doing before building anything, and it takes one run of a reference solver per
+instance. Comparing this solver's bound and incumbent against the true optimum splits the
+set cleanly, and the two halves want opposite work:
+
+```text
+                    our bound      optimum    waiting on
+neos-3045796-mogo       -175          -175    a point
+neos-953928           -99.920       -99.904   a point
+air05                   26297         26374   a point, and 0.3% of bound
+chromaticindex32-8          3             4   a bound; the incumbent is already exact
+neos-820879             25342         25468   a little of both
+```
+
+Three instances hold an exact or near-exact bound and are waiting entirely on a good
+point, and in HiGHS's log all three are answered by a sub-MIP.
+
+### The sub-MIP construction that did not pay, and the trap next to it
+
+HiGHS's `rootReducedCost` builds a neighbourhood out of the lurking bounds this solver
+already computes: *suppose* the answer beats the weakest threshold in the table, apply
+every entry at or above it, and search what is left. It is a genuinely nice idea -- the
+table read backwards is a construction rather than a filter -- and it was built here
+because the table was already in hand.
+
+It works, and it is not worth having. `neos-3045796-mogo` goes from an incumbent of 930
+to -155 against an optimum of -175, which is the largest primal improvement anything here
+has produced on that instance. It closes nothing, and it costs `irp` its solve, three runs
+in three. A change that converts nothing and loses one is a change that loses one.
+
+The trap beside it is worth recording more than the construction is. The ordinary
+improvement search was also moved to the root, on the reasoning that "Searching the
+neighbourhood at the root, which did not work" above had been measured when these
+instances had no incumbent to improve, and that keeping the jumped points changed the
+situation. The situation had changed; the failure had not. `acc-tight2`, `disctom` and
+`neos-913984` each hold their optimum after one node and need what is left of the run to
+*certify* it, and an improvement search asked to beat a point the bound has already
+matched cannot succeed and does not stop trying. All three went from optimal to a timeout
+reporting a gap of zero -- which is exactly what the earlier note says happened, in the
+same words.
+
+The lesson is not "do not retry reverted work". Retrying it is how `JUMP_QUALITY` was
+found to be costing five instances. It is that a note saying *why* something failed
+deserves to be read as a prediction and tested against, rather than treated as spent once
+the circumstances look different: the guard the earlier attempt needed was described in
+that note, and adding it afterwards cost a round of measurement that reading it would
+have saved.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
