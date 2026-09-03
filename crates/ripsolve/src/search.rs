@@ -2273,6 +2273,14 @@ const JUMP_SHARE: f64 = 0.05;
 /// exactly the same budget either way.
 const JUMP_RESTARTS: usize = 200;
 
+/// How much of the model the reduced cost neighbourhood may decide, as a percentage.
+///
+/// Supposing a better answer is a supposition, and the further it is pushed the less
+/// likely the neighbourhood is to hold anything at all. With half the model decided,
+/// `air05` and `neos-820879` come back with no point at all; with three tenths, `air05`
+/// returns 26827 against an optimum of 26374 and `neos-820879` 26348 against 25468.
+const NEIGHBOURHOOD_CEILING: usize = 30;
+
 /// The share of what is left that the reduced cost neighbourhood may spend.
 ///
 /// Three tenths, and the window is narrow at both ends. At a twentieth
@@ -2355,7 +2363,7 @@ fn reduced_cost_neighbourhood(
         narrowed.col_ub[j] = entry.hi.min(hi);
         if narrowed.col_lb[j] >= narrowed.col_ub[j] {
             fixed += 1;
-            if fixed * 2 >= integers {
+            if fixed * 100 >= integers * NEIGHBOURHOOD_CEILING {
                 break;
             }
         }
