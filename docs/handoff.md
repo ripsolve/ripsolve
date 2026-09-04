@@ -33,9 +33,19 @@ five hundred of bound and the families here argue about thirty.
 `neos-953928` moves by nothing at any density, across every family. Large optimal face,
 and mod-2 — which answered that on `n2seq36f` — finds no cut on it at all.
 
-`neos-820879` is the one still worth trying: it *responds* to cuts, 24874 to 24970 at the
-root, and needs about six times that response to reach 25468. It is the only instance in
-the set where more of what already works would be enough.
+`neos-820879` is answered too, and the answer is no — see "`neos-820879`: the cut families
+are exhausted" in `design-notes.md`. Its cut loop converges in three rounds and then no
+family finds a violated cut at all, at 25114 against a needed 25468, and raising the round
+limit from 10 to 200 changes nothing. Two real defects were found and reverted on the way
+(the restart trigger cannot see the root's own fixing; every root budget is a share
+measured from the solve's start, so a restarted pass gets none of it), because with both
+fixed the restarted pass offers zero cuts at the same bound: the families are exhausted
+whatever the model's size.
+
+The one lead left on it is that a reference solver *physically shrinks* the model on
+restart, 9522 columns to 2476, where this solver keeps every fixed column in the matrix by
+the deliberate choice recorded under "Presolve" not to renumber. Whether a compacted model
+yields cuts the uncompacted one does not is untested and is the only remaining question.
 
 ## Standing
 

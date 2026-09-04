@@ -2267,6 +2267,54 @@ So neither instance is short of a filter setting. `air05` wants a bound five hun
 better than any family here produces, and `neos-953928` wants a family that can cut a face
 it has no cut for.
 
+### `neos-820879`: the cut families are exhausted, and restarting does not refill them
+
+The one instance left where more of what already works looked like it would be enough. It
+is not, and the reason is worth having because it closes the line of enquiry.
+
+The root cut loop **converges in three rounds** and then no family finds a violated cut at
+all:
+
+```text
+round 1   70 offered, 31 kept    bound 24874.27
+round 2   66 offered, 20 kept          24969.21
+round 3   18 offered,  7 kept          25067.83
+round 4    0 offered                   25113.87
+```
+
+Raising the round limit from 10 to 200 changes nothing: 58 cuts and 25114 every time. The
+five families here are exhausted at 25114 and the bound needs 25468.
+
+Handed its own optimum, the search reaches 25258 in a minute from that root, which is 144
+of the 354 it needs. So neither the bound nor the point is the whole story; the root is
+short and the search closes less than half of what remains.
+
+**Two defects were found chasing this and neither is worth its cost.** Recorded so the
+next attempt does not rediscover them and does not reapply them without a reason:
+
+- The restart trigger measures columns decided *since the pass began*, and a pass begins
+  after the root's own reduced cost fixing. On `neos-820879` handed its optimum that
+  fixing decides 6871 columns of 9522 — 72%, against the 74% a reference solver reports at
+  exactly this point before restarting — and the trigger saw 2651 free and nothing newly
+  decided. Firing on the root's own fixing instead makes the restart happen.
+- Every root budget that is a share of the run is a share measured from the *solve's*
+  start, so on any pass after the first they are all already spent. With the restart
+  firing, the second pass separated not one cut, because the cut loop's third of the run
+  had ended twenty seconds earlier. A restart that cannot redo the root work is a restart
+  for nothing.
+
+Both were built, and with both in place the restarted pass runs its cut loop on a model
+72% fixed and offers **zero cuts at the same bound of 25113.87**. The families are
+exhausted whatever the size of the model, so the restart has nothing to refill them with.
+The pair also cost `irp` four closes in five, dropping it to one, and were reverted on
+that: two fixes to machinery that does not pay, for an instance they do not convert.
+
+What a reference solver does differently at this point is not only restart but *physically
+shrink* — 9522 columns to 2476 — where this solver keeps every fixed column in the matrix,
+by the deliberate choice recorded under "Presolve" not to renumber. A restart is the
+moment that choice costs something, and testing whether a compacted model yields cuts the
+uncompacted one does not is the only remaining lead on this instance.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.
