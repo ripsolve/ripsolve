@@ -2628,17 +2628,37 @@ against a two-term clique; on this model the two-term cliques win, move the boun
 general -- a short cut really is cheaper to carry at every node below -- so the family
 gets a reserved quarter of the round rather than a thumb on the scale.
 
-**And `neos-787933` still does not close.** The bound is exact and the incumbent stalls at
-64 after 600 seconds, so what was a bound failure is now purely a primal one. The fix is
-visible and unbuilt: any `y` feasible for the aggregated rows yields a feasible point of
-the whole model by setting `x_j := y_{k(j)}`, since the capacity rows hold when
-`M >= |S_k|` and the covering rows are what the aggregated rows assert. That is a sub-MIP
-over 1764 columns, which is the model this solver already closes in 22 seconds.
+With the bound exact the incumbent still stalled at 64 after 600 seconds, so what was a
+bound failure became purely a primal one, and the answer was the other half of the same
+observation. Where `x_j <= y` holds, the model rewritten with every member replaced by its
+gate is a *restriction* of the original: every point of it maps to a point of the model,
+so it can be searched and the point it returns checked rather than trusted. `neos-787933`
+rewrites to 1764 columns and 133 rows, which this solver closes in **a fifth of a second**.
 
-Neither change moves the benchmark: 34 before and after, the same 34, nothing gained and
-nothing lost. They are kept because the extraction was a defect against its own recorded
-caution, and because a family that takes a root bound from 9 to the optimum is worth
-having before the primal side that would use it.
+One thing had to be chained on. Substitution leaves every column presolve has already
+decided sitting in the model at its fixed value -- 172668 of the 174432 that come out of
+it -- so the rewritten model *looks* almost as big as the original and the guard against
+searching the same question again rejects it. Compaction is what turns that back into the
+1764 the model is about, and this is the first thing in the solver to call it. It was
+committed as a tested capability nothing used, on the argument that it was the
+prerequisite for work that had not been done yet; this is that work.
+
+`neos-787933` closes: **objective 30, optimal, 39 seconds**, where HiGHS does not close it
+at all.
+
+### What a marginal instance costs a count, and `neos-3045796-mogo`
+
+The run that gained `neos-787933` lost `neos-3045796-mogo`, so the count stayed at 34.
+That is not what it looks like. `mogo` has closed at 38 to 41 seconds of a 60 second
+budget in every baseline since it was gained, and it is now a coin flip: three runs of the
+current build close one, and four runs with the aggregated search *removed* close two. It
+is marginal on its own account and was already sitting on the line.
+
+The claim in `handoff.md` that "the 34 all close on every run, with no instance left
+sitting on the sixty second line" is therefore wrong, and was wrong when written. The
+discipline it states is right and was not applied to `mogo`: quote the set that closes
+every time. That set is 34, and `neos-787933` -- three runs, three optimal -- is in it
+while `mogo` is not.
 
 ### One seed in a thousand generated no model at all
 

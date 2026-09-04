@@ -66,18 +66,22 @@ Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Confirmed by a full run, `docs/baselines/binary-2026-09-08.json`, which gained `ex9`
-against the previous one and lost nothing. Ahead of CBC, and twelve behind HiGHS.
+Confirmed by a full run, `docs/baselines/binary-2026-09-10.json`, which gained
+`neos-787933` and lost the coin flip on `neos-3045796-mogo`. Ahead of CBC, and twelve
+behind HiGHS. Six of the 34 are instances HiGHS does not close.
 
 `ex9` is the widest margin of the 34: 24.9 seconds against HiGHS's 3.5 and SCIP's 23.1,
 with CBC not closing it at all. The instances the probing budgets were most likely to
 cost -- `mitre` at 27.5s, `eil33-2` at 32.3s, `irp` at 40.7s, `nw04` at 56.2s, `air03` at
 1.5s -- all still close, and `irp` has more room than the note above credits it with.
 
-The 34 all close on every run, with no instance left sitting on the sixty second line.
-That matters, because for a long stretch two of them were: quote the set that closes
-every time rather than one run's count, and check a new one against repeated runs before
-believing it.
+**`neos-3045796-mogo` is a coin flip and this file used to claim otherwise.** It has
+closed at 38 to 41 seconds of a 60 second budget in every baseline since it was gained,
+and three runs of the current build close one of three, four runs without the newest
+heuristic two of four. It is marginal on its own account. The rule this file states --
+quote the set that closes every time rather than one run's count -- is right, and was not
+applied to `mogo` when it was written. `neos-787933` was checked that way: three runs,
+three optimal.
 
 Against the start of these sessions, **25 every run, with `nw04` never closing in any run
 of any version and `irp` a coin flip**. The nine gained:
@@ -92,6 +96,7 @@ n2seq36f        mod-2 cuts
 neos-3226448-wkra  four budgets between the feasibility search and a point it could reach
 neos-3045796-mogo  the neighbourhood the root's reduced costs would fix
 ex9             probing, once it was allowed to finish
+neos-787933     every implication a big-M row states, aggregated and then rewritten
 ```
 
 Five of the 34 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
@@ -240,17 +245,13 @@ tanglegram6                nothing in particular
 column, so no cheap detection reaches it. Note also that turning SCIP's cuts *off* makes
 both faster, `cod105` 57.7s to 11.5. Cuts are not what that group wants.
 
-**`neos-787933` is now a primal problem and was a bound problem.** Its relaxation is weak
-by construction: 1764 big-M linking rows, LP 3.0 against an optimum of 30. The conflict
-graph recorded one implication per row where each row states 133, and a new cut family
-aggregates `>=` rows through those implied bounds. Root bound 9 -> 30, which is exact. It
-still does not close: the incumbent stalls at 64 after 600 seconds.
-
-The next step on it is written down and unbuilt. Any `y` feasible for the aggregated rows
-gives a feasible point of the whole model by `x_j := y_{k(j)}` -- the capacity rows hold
-because `M >= |S_k|`, and the covering rows are what the aggregated rows assert. That is a
-sub-MIP over 1764 columns, and this solver closes that model in 22 seconds when handed it.
-It is the clearest single conversion left.
+**`neos-787933` closes, and HiGHS does not close it.** Its relaxation was weak by
+construction: 1764 big-M linking rows, LP 3.0 against an optimum of 30. Three things
+between them: the conflict graph now reads all 133 implications a linking row states
+rather than one, a cut family aggregates `>=` rows through those implied bounds (root
+bound 9 -> 30, exact), and the model rewritten over the gates is a restriction small
+enough to answer outright -- 1764 columns, a fifth of a second. Compaction is chained
+into that rewriting and is the first thing in the solver to use it.
 
 ## The one place the remaining conversions are
 

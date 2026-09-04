@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::branch::{self, Pseudocosts};
 use crate::cuts;
+use crate::compact;
 use crate::heuristic::{self, Limits, Schedule};
 use crate::lp::{BasisState, Lp, LpSolution, LpStatus};
 use crate::model::Problem;
@@ -1934,6 +1935,23 @@ fn solve_once(
         heuristic_solutions += 1;
     }
 
+    // A model built on implied bounds is a much smaller model with the same answer, and
+    // this is the search for it. See `aggregate_by_implied_bounds`.
+    if options.improvement_frequency > 0
+        && improves(root_bound, incumbent, options.gap_tolerance)
+        && let Some((objective, x)) = aggregated_search(
+            problem,
+            &root.x,
+            &options,
+            remaining_of(options.time_limit, started),
+        )
+        && objective < incumbent
+    {
+        incumbent = objective;
+        incumbent_x = Some(x);
+        heuristic_solutions += 1;
+    }
+
     let mut status = Status::Optimal;
 
     let threads = options.threads.max(1);
@@ -2164,6 +2182,13 @@ const ROOT_LP_FIRST_SHARE: f64 = 0.40;
 /// `n2seq36f` in two rounds. Taken at a quarter they crowd the node LPs on a model with
 /// few, wide rows, and `irp`, 39 rows against 20315 columns, stops closing at all.
 const MOD2_SHARE: usize = 8;
+
+/// How much smaller the model rewritten over implied bounds has to be to be worth it.
+///
+/// Four times. Below that the rewriting is the same question again and searching it is
+/// a second search of the model the caller is already in. `neos-787933` shrinks by a
+/// factor of 134.
+const AGGREGATED_REDUCTION: usize = 4;
 
 /// The share of a round's cuts reserved for rows aggregated through implied bounds.
 ///
@@ -2599,6 +2624,78 @@ fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
 /// feasibility search rather than from the relaxation, they agree about nothing useful:
 /// on `neos-3045796-mogo` it walks an incumbent of 1180 down to 300 against an optimum
 /// of -175. This construction does not read the incumbent at all.
+/// Search the model rewritten over the variables its implied bounds bound everything to.
+///
+/// A big-M linking row, `sum_{j in S} x_j <= M y`, says `x_j <= y` for every member, and
+/// a model made of those says far less than it looks: once the gates are decided the
+/// members follow. `neos-787933` is 236376 columns of which 1764 are gates, and the model
+/// rewritten over the gates alone is 1764 columns and 133 rows, which closes in a fifth
+/// of a second. The model as written does not close in ten minutes.
+///
+/// The rewriting is a restriction -- it holds each member at its gate -- so what comes
+/// back is a point of the original model, and it is checked rather than trusted. What the
+/// restriction can cost is optimality, never correctness.
+fn aggregated_search(
+    problem: &Problem,
+    relaxation: &[f64],
+    options: &Options,
+    remaining: Option<Duration>,
+) -> Option<(f64, Vec<f64>)> {
+    if remaining.is_some_and(|left| left.is_zero()) {
+        return None;
+    }
+    let conflicts = cuts::Conflicts::of(problem);
+    let (smaller, column_of) = cuts::aggregate_by_implied_bounds(problem, &conflicts, relaxation)?;
+    // Substitution leaves every column presolve has already decided sitting in the model
+    // at its fixed value, and on `neos-787933` those are 172668 of the 174432 that come
+    // out of it. Compaction is what turns that back into the 1764 the model is actually
+    // about, and this is the first thing to call it.
+    let compacted = match compact::compact(&smaller, options.integrality_tolerance) {
+        Ok(pair) => pair,
+        // The rewriting contradicts the model, which says only that these bounds cannot
+        // all be held at once; the model itself is untouched.
+        Err(compact::Infeasible) => return None,
+    };
+    let (searched, compaction) = match &compacted {
+        Some((model, map)) => (model, Some(map)),
+        None => (&smaller, None),
+    };
+    // Rewriting a model to almost its own size buys nothing and costs a second search of
+    // it. The gain here is a model small enough to answer outright.
+    if searched.n_cols() * AGGREGATED_REDUCTION > problem.n_cols() {
+        return None;
+    }
+
+    let found = solve(
+        searched,
+        Options {
+            // The rewritten model has no implied bounds of its own left to find, but a
+            // search of it must not be able to start this one again in any case.
+            improvement_frequency: 0,
+            max_nodes: options.improvement_nodes,
+            threads: 1,
+            jump_moves: options.jump_moves,
+            time_limit: remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
+            ..*options
+        },
+    );
+    if found.x.len() != searched.n_cols() {
+        return None;
+    }
+    let aggregated = match compaction {
+        Some(map) => map.expand(&found.x),
+        None => found.x,
+    };
+    if aggregated.len() != smaller.n_cols() {
+        return None;
+    }
+    let x: Vec<f64> = (0..problem.n_cols())
+        .map(|j| aggregated[column_of[j]])
+        .collect();
+    let tolerance = options.heuristic_limits.feasibility_tolerance;
+    heuristic::is_feasible(problem, &x, tolerance).then(|| (objective_at(problem, &x), x))
+}
+
 fn reduced_cost_neighbourhood(
     problem: &Problem,
     lurking: &Lurking,
