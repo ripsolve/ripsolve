@@ -2146,7 +2146,14 @@ const ROOT_LP_FIRST_SHARE: f64 = 0.40;
 const MOD2_SHARE: usize = 8;
 
 /// A backstop on presolve's expensive half, not its budget.
-const PRESOLVE_SHARE: f64 = 0.25;
+///
+/// A quarter until probing was given a budget it could finish on: `ex9` wants 22 of its
+/// 60 seconds in presolve and then closes in three more, so a quarter was refusing it
+/// the reduction rather than capping a runaway. Probing's own guards are what stop the
+/// models that should be stopped, and they leave every model the solver closes under a
+/// second here, so this only has to be wide enough not to cut off a model that is still
+/// paying its way.
+const PRESOLVE_SHARE: f64 = 0.4;
 
 /// How far the bounds are moved when a relaxation has stalled.
 ///

@@ -96,7 +96,18 @@ impl Spec {
         // A witness point, drawn only for `Signed`, so the other kinds' instances are
         // unaffected by its position in the random stream.
         let witness: Vec<i64> = if self.kind == Kind::Signed {
-            (0..n).map(|_| rng.range(0, 1)).collect()
+            // Every `Signed` row redraws its coefficients until `a'x*` is nonzero, and
+            // an all-zero witness makes that sum zero for *every* draw, so the redraw
+            // never ends. One witness in `2^n_cols` is all zeros -- `signed_c10_r8_s56`
+            // is the first such seed at ten columns -- and generating it hung outright
+            // rather than failing. Drawing again is the whole fix: it only changes the
+            // seeds that produced no model at all.
+            loop {
+                let draw: Vec<i64> = (0..n).map(|_| rng.range(0, 1)).collect();
+                if draw.iter().any(|&w| w != 0) {
+                    break draw;
+                }
+            }
         } else {
             Vec::new()
         };
@@ -341,5 +352,35 @@ mod tests {
         }
         // A degenerate range must return its single value, not panic or wrap.
         assert_eq!(rng.range(3, 3), 3);
+    }
+}
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+
+    /// Every seed produces a model, rather than some seed producing none forever.
+    ///
+    /// `Signed` rows redraw their coefficients until `a'x*` is nonzero against a shared
+    /// witness `x*`, so an all-zero witness spins that redraw for ever. It is one seed
+    /// in `2^n_cols`, which at ten columns is rare enough to sit unnoticed and common
+    /// enough for a sweep over a couple of hundred seeds to hit: `signed_c10_r8_s56` is
+    /// the first. This fails by not finishing, which is what the bug did.
+    #[test]
+    fn every_signed_seed_generates_a_model() {
+        for n_cols in [8usize, 10, 12] {
+            for seed in 0..256u64 {
+                let spec = Spec {
+                    kind: Kind::Signed,
+                    n_cols,
+                    n_rows: 8,
+                    seed,
+                };
+                assert!(
+                    !spec.to_lp().is_empty(),
+                    "{} generated nothing",
+                    spec.name()
+                );
+            }
+        }
     }
 }

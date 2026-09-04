@@ -2363,6 +2363,152 @@ deliberate breakage -- expanding by position instead of through the map, and dro
 fixed columns' contribution to the objective -- and each fails on the first seed that
 compacts.
 
+### The losses re-derived from node counts, which points at presolve and then away again
+
+Every cut section above works on the three instances closest on the bound. Counting nodes
+across all eighteen that HiGHS closes and this solver does not says those three are not
+the largest group. Seven of the eighteen reach **one or two nodes in a minute**: their
+root relaxation, or the loop around it, spends the whole budget, and nothing built above
+the LP can reach them.
+
+Comparing presolved sizes says where that comes from, and it is not subtle. HiGHS's
+presolve leaves `ex9` at **0 rows and 0 columns**, `ex10` at 14 x 6, `bley_xl1` at 9.7%
+of its rows, `neos-780889` at 33%, `neos-633273` at 25%, `neos18` at 23% of its columns.
+The instances it *cannot* reduce -- `neos-820879`, `chromaticindex32-8`, `ab71-20-100`
+and `neos-953928`, all at 97% or more -- are exactly the ones already answered here as
+bound-limited. The two groups do not overlap at all.
+
+That is a strong enough signal to check before building anything, and checking it mostly
+refuted it. Dumping HiGHS's presolved models and handing them to this solver:
+
+```text
+ex10           optimal in 1ms          (presolved to 14 x 6)
+neos18         531 nodes, gap 52%      (127 nodes and 66% on the original)
+supportcase4   2 nodes                 (4370 x 1112)
+neos-633273    2 nodes                 (5520 x 5541)
+bley_xl1       1 node                  (17039 x 751)
+```
+
+Four of the five still reach one or two nodes on a model a fifth the size, so for them
+presolve was never the obstacle. `bley_xl1` is the sharpest: 17039 rows, **751 columns**,
+57327 nonzeros, and its root relaxation alone takes 337 seconds over 83581 iterations at
+247 a second. That is an LP defect, not a presolve one, and it is the same shape the
+hyper-sparse experiment above was rejected on -- but rejected against models with many
+columns, where `B^-1 a_q` is 12-33% dense. A basis of 17039 rows holding at most 751
+structural columns is nearly all logical, which is the case that measurement did not
+cover. Entering through the dual instead does not finish it in ten minutes either.
+
+So the presolve lead survives on `ex9` and `ex10` alone, and those two were the pair the
+note above retired as needing "presolve well beyond what probing reached".
+
+### Which rule collapses `ex9`, asked of the solver that does it
+
+HiGHS takes a `presolve_rule_off` bitmask, so the question can be put to it directly
+rather than guessed at from names -- the mistake the mod-2 section records. Turning each
+rule off in turn changes nothing: `ex9` still collapses to nothing, so no rule is
+necessary. Turning every rule off *but* one is the question worth asking:
+
+```text
+only (none)                     33846 x 8560
+only Probing                      394 x 17
+only Enumeration                  548 x 87
+every other rule alone          33846 x 8560
+```
+
+Two things fall out. Probing alone does essentially the whole of it. And "no rules at
+all" leaves 33846 x 8560, which is **exactly what this solver's own cheap presolve
+already reaches** -- 7116 rows and 1848 columns removed from 40962 x 10404. The gap on
+`ex9` was never the reductions this solver is missing. It was probing, which it has.
+
+### What probing costs, which is one of its two directions
+
+Instrumenting the two sweeps of each probe separately gives the shape of it on `ex9`:
+
+```text
+zero sweeps   1612 fixings for      99,496 work
+one  sweeps   2,714,582 fixings for 915,722,433 work
+```
+
+Supposing `x_j = 0` costs 62 entries and derives *nothing at all* -- one fixing per
+probe, which is the probed column itself. Supposing `x_j = 1` costs 568,000 and fixes
+1684 columns, a fifth of the model. In a set packing row a one excludes everything beside
+it and a zero excludes nothing, so all the cost and all the information sit on one side.
+
+The information is then thrown away. Unless the *other* sweep is refuted, the loop
+rewinds and moves on, so 1684 implications per probe are re-derived and discarded, and
+only the 158 refutations of 1612 probes are kept.
+
+### A column both suppositions force is forced
+
+The model takes one of the two values, so a column both sweeps fix to the same value is
+fixed outright, whichever way the probed column goes. Both sweeps have been paid for
+already, and the second one's fixings are already listed on the trail, so the rule costs
+one lookup table and a pass over what the sweeps touched.
+
+It is not more *powerful* than probing: a column it decides could also have been decided
+by probing that column directly. What it has is reach. Probing starts only from a binary
+the conflict graph has an edge for, and decides the column it started from, so a column
+with no edge of its own is never the subject of a probe. On `ex9` the rule fires 28 times
+and decides 2920 columns, and the difference it makes is **8244 columns fixed against
+10076** -- which is the difference between timing out and closing.
+
+It cannot reach a general integer, because row propagation here only forces binaries, and
+that is worth knowing before reaching for it on a mixed model.
+
+### What was actually stopping `ex9`, which was not what the budget note said
+
+Given budgets it can finish on, probing fixes 10076 of `ex9`'s 10404 columns in 22
+seconds, and the whole model then closes at 25 seconds against a 60 second limit,
+objective 81, in two nodes. `ex10` reaches 17272 of 17680 but wants 86 seconds, which no
+60 second limit affords.
+
+Three separate caps were in the way, and only one of them was the one the notes blamed.
+
+`PROBE_TOTAL`, the total work cap, was **not** it: raising it alone changes nothing
+anywhere. `PROBE_PATIENCE`, the work allowed without proving anything, was. `ex9`'s
+proofs are front-loaded -- four in its first eighteen probes -- and it then goes 57.8
+million entries between two proofs before finding another 2600. Thirty million cut it off
+inside that gap, at 63 probes of 8560, and what has been recorded here twice as a model
+probing could not reduce was a model probing was not allowed to finish reducing.
+
+Raising patience is what the old note warned costs `irp` two seconds, and it does: at 200
+times, `irp`, `nw04`, `air03` and `eil33-2` spend 9, 23, 10 and 9 seconds each and prove
+**nothing whatever**. But the reason is visible once the sweeps are counted rather than
+the work, and it separates the set exactly:
+
+| | sweeps abandoned | proofs |
+|---|---:|---:|
+| `irp`, `nw04`, `air03`, `eil33-2` | **every one** | 0 |
+| `ex9` | 0 of 7548 | 2636 |
+| `ex10` | 45 of 15170 | 3888 |
+| every other model in the set | 0 | -- |
+
+Those four abandon every sweep they start: each runs into `PROBE_REACH` and gives up. A
+sweep that did not finish has not said the column has nothing to give, only that it was
+not allowed to look, and a run of sixteen of them says the model is out of probing's
+reach. That is `ABANDON_RUN`, and it is what `irp` needed all along -- a guard on the
+shape of the failure rather than on the size of the bill. It costs the models that pay
+nothing at all, because they abandon nothing.
+
+With patience at 120 million, `ABANDON_RUN` at sixteen, and `PRESOLVE_SHARE` widened from
+a quarter to two fifths so a 22 second presolve fits inside a 60 second run, `ex9` closes.
+
+### One seed in a thousand generated no model at all
+
+Sweeping the model generator for a shape that reaches the agreement rule hung it.
+`Kind::Signed` draws a binary witness `x*` and then redraws each row's coefficients until
+`a'x*` is nonzero, so an all-zero witness makes that sum zero for every draw and the
+redraw never ends. It is one witness in `2^n_cols`: at ten columns, `signed_c10_r8_s56`
+is the first seed to hit it, which is rare enough to have sat unnoticed and common enough
+for any sweep over a couple of hundred seeds to find. Drawing the witness again when it
+comes up empty is the whole fix, and it changes only the seeds that produced nothing.
+
+Worth recording for the method rather than the bug: this took an hour to find because the
+symptom appeared inside presolve's probe loop, three layers from the cause, and two
+rounds of instrumentation went into presolve before the trace showed the last probe
+completing and nothing after it. The print that would have found it immediately was the
+one naming the *next* model, and it was sitting after the parse rather than before it.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

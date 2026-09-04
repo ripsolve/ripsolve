@@ -1210,6 +1210,16 @@ impl<'a> Propagator<'a> {
         self.propagate(max_work)
     }
 
+    /// Assert `j = value` without sweeping, so several assertions share one sweep.
+    ///
+    /// `probe` propagates each supposition on its own because each is a separate
+    /// question. A caller that has already *proved* a batch of values is not asking
+    /// anything, and paying for one sweep per column would price a proof like a guess.
+    /// Returns false when the assertion contradicts the bounds already held.
+    pub(crate) fn assert_value(&mut self, j: usize, value: f64) -> bool {
+        self.fix(j, value)
+    }
+
     /// Force everything that follows from the columns already queued.
     ///
     /// Two inferences run to a common fixed point. The conflict graph gives the logical

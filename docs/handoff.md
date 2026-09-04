@@ -63,20 +63,24 @@ family, and there is no evidence here about which.
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     33        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-Confirmed by a full run, `docs/baselines/binary-2026-09-07.json`, which gained
-`neos-3045796-mogo` against the previous one and lost nothing. Ahead of CBC, and
-thirteen behind HiGHS.
+Confirmed by a full run, `docs/baselines/binary-2026-09-08.json`, which gained `ex9`
+against the previous one and lost nothing. Ahead of CBC, and twelve behind HiGHS.
 
-The 33 all close on every run, with no instance left sitting on the sixty second line.
+`ex9` is the widest margin of the 34: 24.9 seconds against HiGHS's 3.5 and SCIP's 23.1,
+with CBC not closing it at all. The instances the probing budgets were most likely to
+cost -- `mitre` at 27.5s, `eil33-2` at 32.3s, `irp` at 40.7s, `nw04` at 56.2s, `air03` at
+1.5s -- all still close, and `irp` has more room than the note above credits it with.
+
+The 34 all close on every run, with no instance left sitting on the sixty second line.
 That matters, because for a long stretch two of them were: quote the set that closes
 every time rather than one run's count, and check a new one against repeated runs before
 believing it.
 
 Against the start of these sessions, **25 every run, with `nw04` never closing in any run
-of any version and `irp` a coin flip**. The six gained:
+of any version and `irp` a coin flip**. The nine gained:
 
 ```text
 mitre           presolve probing, once the propagator stopped rebuilding itself
@@ -87,9 +91,10 @@ neos-1599274    the same, plus not forfeiting optimality to a prunable skipped n
 n2seq36f        mod-2 cuts
 neos-3226448-wkra  four budgets between the feasibility search and a point it could reach
 neos-3045796-mogo  the neighbourhood the root's reduced costs would fix
+ex9             probing, once it was allowed to finish
 ```
 
-Five of the 33 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
+Five of the 34 are instances HiGHS does not close: `disctom`, `eil33-2`, `decomp2`,
 `nw04` and `neos-4754521-awarau`.
 
 ## Speed, on the instances both solvers close
@@ -189,6 +194,44 @@ answered at 25 seconds. But do not go straight at `ROOT_LP_FIRST_SHARE`. `air04`
 well over 60 seconds even from a free root — the branch reached a 0.62% gap only at 120
 seconds — and `tanglegram6`'s bound is 0 against an incumbent of 8856. This group is not
 where the next conversion is.
+
+## Where the presolve work got to, and where it goes next
+
+**`ex9` closes.** It is the first instance gained from presolve rather than from cuts,
+heuristics or fixing, and the reasoning is in "What was actually stopping `ex9`" in
+`design-notes.md`. The short version is that nothing needed building: probing already
+reduces `ex9` from 10404 columns to 328 and the model then closes in 25 seconds against
+a 60 second limit. What stopped it was `PROBE_PATIENCE`, which cut probing off inside a
+57.8 million entry gap between two proofs at 63 probes of 8560. Twice in this history
+`ex9` has been recorded as a model presolve could not reduce; it was a model presolve was
+not allowed to finish reducing.
+
+Two changes went with it. A column that *both* of a probe's suppositions force is forced
+outright -- worth 8244 columns against 10076 on `ex9` -- and `ABANDON_RUN` stops probing
+on a model whose sweeps never finish, which is what `irp`, `nw04`, `air03` and `eil33-2`
+needed and what raising the patience alone would otherwise have cost them 9 to 23 seconds
+each to discover.
+
+Three things to know before pulling on this further.
+
+**The presolve lead is otherwise closed.** HiGHS's presolve collapses `bley_xl1` to 9.7%
+of its rows, `neos-780889` to 33%, `neos-633273` to 25%, `neos18` to 23% of its columns.
+Handing this solver those presolved models directly converts **only `ex10`**; the others
+still reach one or two nodes on a fifth of the model. Do not build presolve reductions
+for that group on the strength of the size comparison -- the experiment has been run.
+
+**`ex10` is the same instance as `ex9` and wants 86 seconds of probing against `ex9`'s
+22.** It reaches 17272 columns of 17680 and would close if it got there. Nothing here
+makes probing cheaper: the cost is one direction of it (supposing `x_j = 1` fixes 1684
+columns for 568,000 entries, where supposing zero costs 62 and derives nothing), and it
+is real work rather than overhead. Making probing cheaper is the single change that would
+convert `ex10`, and it is not a budget question.
+
+**`bley_xl1` is an LP problem wearing a presolve problem's clothes.** Presolved it is
+17039 rows by **751 columns**, and this solver's root relaxation on it takes 337 seconds.
+A basis that is almost entirely logical columns is exactly the shape the hyper-sparse
+triangular solve was rejected on -- and it was rejected against models with many columns,
+where the reachable set really is dense. That measurement does not cover this case.
 
 ## Where the cut work got to
 

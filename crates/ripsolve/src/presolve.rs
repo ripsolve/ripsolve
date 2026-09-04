@@ -37,6 +37,10 @@ pub struct Stats {
     pub fixed_columns: usize,
     pub redundant_rows: usize,
     pub tightened_coefficients: usize,
+    /// Columns decided because both of a probe's suppositions forced the same value,
+    /// rather than because one of them was refuted. Reported so a test can require the
+    /// rule to still be reached rather than only to still be sound.
+    pub agreed_columns: usize,
 }
 
 /// The result of presolving.
@@ -506,7 +510,29 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
 const PROBE_REACH: usize = 4_000_000;
 
 /// Matrix entries probing may read without proving anything, before it gives up.
-const PROBE_PATIENCE: usize = 30_000_000;
+///
+/// Raised from thirty million once it was measured rather than guessed. `ex9`'s proofs
+/// are front-loaded -- four in its first eighteen probes -- and then it goes 57.8
+/// million entries between two of them before finding another 2600. Thirty million cut
+/// it off in that gap, at 63 probes of 8560 and 1848 columns of the 10076 that are
+/// there, so what looked like a model probing could not reduce was a model probing was
+/// not allowed to finish reducing. This is the longest dry stretch on any model in the
+/// set, with a little room over it.
+const PROBE_PATIENCE: usize = 120_000_000;
+
+/// Probes in a row that prove nothing and do not finish, before probing stops.
+///
+/// The patience above prices a probe by what it reads, which is right for a model
+/// probing can reason about and wrong for one it cannot. `irp`, `nw04`, `air03` and
+/// `eil33-2` abandon **every** sweep they start: each one runs into `PROBE_REACH` and
+/// gives up, and across fifteen hundred probes they prove nothing whatever. Under the
+/// patience alone they spend nine to twenty-three seconds finding that out. A sweep
+/// that did not finish has not said the column has nothing to give, only that it was
+/// not allowed to look, and a run of those says the model is out of reach.
+///
+/// It separates the set exactly. Those four abandon everything; `ex9` abandons nothing
+/// at all, `ex10` 45 sweeps of 15170, and every other model in the benchmark zero.
+const ABANDON_RUN: usize = 16;
 
 /// Matrix entries probing may read in all, whether or not it is proving anything.
 ///
@@ -514,15 +540,19 @@ const PROBE_PATIENCE: usize = 30_000_000;
 /// this against how long someone happens to be willing to wait, and rather than a
 /// number of passes over the matrix, which lets a model with eight million nonzeros
 /// spend a hundred times what a model with eighty thousand does for the same reduction.
-/// The number is a judgement about how much reasoning about a model is worth doing
-/// before solving it, calibrated on the pure binary set: at this figure the worst model
-/// in it spends a second and a half, the twenty-four hardest average a third of a
-/// second between them, and every model the solver currently closes pays under half a
-/// second, while `mitre` still gets the whole of the 3677 column reduction that closes
-/// it. Roughly ten times this buys another few thousand fixings on models that do not
-/// close either way, and costs `irp`, which closes with two seconds to spare, more than
-/// two seconds.
-const PROBE_TOTAL: usize = 100_000_000;
+///
+/// It was a hundred million, and the note here argued that ten times that "buys another
+/// few thousand fixings on models that do not close either way, and costs `irp` more
+/// than two seconds". The first half was measured on a budget that was stopping probing
+/// for the wrong reason. `ex9` needs four thousand million and, given them, goes from
+/// 1848 columns fixed to 10076 and from timing out to optimal in 25 seconds. The second
+/// half is now `ABANDON_RUN`'s job, which is what `irp` actually needed: it costs `irp`
+/// nothing, because `irp` never finishes a sweep and is stopped for that.
+///
+/// So this is a backstop against a model that keeps earning its budget for longer than
+/// any answer is worth waiting for -- `ex10` would spend sixteen thousand million and
+/// eighty-six seconds -- and the models that pay are stopped well short of it.
+const PROBE_TOTAL: usize = 5_000_000_000;
 
 /// Fix the columns for which only one of the two values survives its own consequences.
 ///
@@ -551,7 +581,12 @@ fn probe_columns(
     deadline: Option<std::time::Instant>,
 ) -> bool {
     use crate::heuristic::Sweep;
-    const CLOCK_STRIDE: usize = 64;
+    // Matrix entries between two readings of the clock. Counting probes instead prices
+    // a model whose probes cost a thousand entries the same as one whose probes cost
+    // half a million, and on the second a stride of 64 probes is half a minute of
+    // overshoot past a deadline the caller was promised. Counting work bounds the
+    // overshoot by the work rather than by the model.
+    const CLOCK_STRIDE: usize = 1_000_000;
     let conflicts = crate::cuts::Conflicts::of(problem);
     if conflicts.is_empty() {
         return true;
@@ -586,20 +621,47 @@ fn probe_columns(
     // earned and affordable, that would otherwise go on finding them for two minutes.
     let mut idle_since = state.work();
     let mut settled: Vec<usize> = Vec::new();
-    for (position, &(j, reach)) in candidates.iter().enumerate() {
+    // What supposing zero forced, kept across the rewind that makes room for the other
+    // supposition. Indexed by column so the second sweep can ask about a column in
+    // constant time; `NAN` means the first sweep said nothing about it, and no
+    // comparison against `NAN` succeeds, so untouched columns need no separate guard.
+    let mut under_zero: Vec<f64> = vec![f64::NAN; n];
+    let mut touched: Vec<usize> = Vec::new();
+    let mut agreed: Vec<(usize, f64)> = Vec::new();
+    // Consecutive probes that proved nothing and did not finish. A sweep cut off by
+    // `PROBE_REACH` has not said the column has nothing to give, only that it was not
+    // allowed to look, so a run of them is a model this reasoning cannot reach at all.
+    let mut abandoned_run = 0usize;
+    let mut last_clock = 0usize;
+    for &(j, reach) in &candidates {
         if state.work() - idle_since > PROBE_PATIENCE || state.work() > PROBE_TOTAL {
             break;
         }
-        if position.is_multiple_of(CLOCK_STRIDE)
-            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
-        {
-            break;
+        if state.work() - last_clock >= CLOCK_STRIDE {
+            last_clock = state.work();
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                break;
+            }
         }
         if reach == 0 || state.fixed(j) {
             continue;
         }
+        if abandoned_run >= ABANDON_RUN {
+            break;
+        }
         let mark = state.mark();
         let zero = state.probe(j, 0.0, PROBE_REACH);
+        if zero != Sweep::Refuted {
+            state.fixed_since(mark, &mut settled);
+            for &k in &settled {
+                if state.fixed(k) {
+                    if !under_zero[k].is_finite() {
+                        touched.push(k);
+                    }
+                    under_zero[k] = state.value(k);
+                }
+            }
+        }
         state.rewind(mark);
         let one = state.probe(j, 1.0, PROBE_REACH);
         // A value refuted means the other one holds, and so does everything its own
@@ -612,22 +674,54 @@ fn probe_columns(
             // Neither value survives its own consequences, so neither does the model.
             (Sweep::Refuted, Sweep::Refuted) => return false,
             // Zero is refuted, and the sweep that proved one is the live state already.
-            (Sweep::Refuted, _) => {}
+            (Sweep::Refuted, _) => abandoned_run = 0,
             // One is refuted, but the sweep for zero was rewound to make room for it.
             // Only a proof pays for this, so it is re-run rather than held onto.
             (_, Sweep::Refuted) => {
+                abandoned_run = 0;
                 state.rewind(mark);
                 if state.probe(j, 0.0, PROBE_REACH) == Sweep::Refuted {
                     return false;
                 }
             }
-            // Nothing proved. Only a sweep that finished says the column has nothing to
-            // give; one that ran out says only that it was not allowed to look.
+            // Neither value is refuted, so the column itself is not decided. What the
+            // two suppositions *agree* on still is: the model takes one of them, so a
+            // column both force to the same value is forced outright, whether or not
+            // either sweep finished. That is where the reduction on these models comes
+            // from -- refutation decides the probed column alone, and agreement decides
+            // the columns around it -- and both sweeps have been paid for already.
             _ => {
+                agreed.clear();
+                state.fixed_since(mark, &mut settled);
+                for &k in &settled {
+                    let held = under_zero[k];
+                    if state.fixed(k) && (held - state.value(k)).abs() <= TOL {
+                        agreed.push((k, held));
+                    }
+                }
                 state.rewind(mark);
-                continue;
+                if agreed.is_empty() {
+                    if zero == Sweep::Abandoned || one == Sweep::Abandoned {
+                        abandoned_run += 1;
+                    }
+                    clear(&mut under_zero, &mut touched);
+                    continue;
+                }
+                abandoned_run = 0;
+                stats.agreed_columns += agreed.len();
+                // Proved, not supposed, so the whole batch is asserted before the one
+                // sweep that works out what follows from all of it.
+                for &(k, value) in &agreed {
+                    if !state.assert_value(k, value) {
+                        return false;
+                    }
+                }
+                if state.propagate(PROBE_REACH) == Sweep::Refuted {
+                    return false;
+                }
             }
         }
+        clear(&mut under_zero, &mut touched);
         state.fixed_since(mark, &mut settled);
         for &k in &settled {
             if !fix_column(problem, k, state.value(k), stats) {
@@ -638,6 +732,17 @@ fn probe_columns(
         idle_since = state.work();
     }
     true
+}
+
+/// Reset the columns `touched` names, leaving the rest of `slots` alone.
+///
+/// The table is one entry per column and is read once per probe, so clearing it whole
+/// would cost the model's width on every probe and swamp what a probe itself costs.
+fn clear(slots: &mut [f64], touched: &mut Vec<usize>) {
+    for &k in touched.iter() {
+        slots[k] = f64::NAN;
+    }
+    touched.clear();
 }
 
 #[cfg(test)]
@@ -684,6 +789,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The agreement rule fires on generated models, and never costs a feasible point.
+    ///
+    /// A column both of a probe's suppositions force is forced, since the model takes
+    /// one supposition or the other. What makes that worth taking rather than redundant
+    /// is which columns it reaches: probing starts only from a binary the conflict graph
+    /// has an edge for and decides the column it started from, so a column with no edge
+    /// of its own is never the subject of a probe and is only ever decided as a
+    /// by-product like this. On `ex9` it is the difference between 8244 columns fixed
+    /// and 10076, which is the difference between timing out and closing.
+    ///
+    /// Soundness is the real hazard -- a rule that fixes a column to a value some
+    /// feasible point disagrees with loses that point silently -- so this enumerates the
+    /// feasible set before and after and requires it unchanged. The firing count is
+    /// asserted too, so that a change which stops reaching the rule fails here rather
+    /// than passing vacuously.
+    #[test]
+    fn agreement_fires_on_generated_models_and_keeps_every_feasible_point() {
+        let mut agreed = 0;
+        for n_rows in [4usize, 6] {
+            for seed in 0..60u64 {
+                let spec = Spec {
+                    kind: Kind::Signed,
+                    n_cols: 10,
+                    n_rows,
+                    seed,
+                };
+                let parsed = LpProblem::parse(&spec.to_lp()).unwrap();
+                let p = Problem::from_lp(&parsed).unwrap();
+                agreed += assert_presolve_is_sound(&p, &spec.name()).agreed_columns;
+            }
+        }
+        assert!(
+            agreed > 0,
+            "no generated model reached the agreement rule, so nothing here tested it"
+        );
     }
 
     fn problem(obj: &[f64], rows: &[(&[f64], RowSense, f64)]) -> Problem {
