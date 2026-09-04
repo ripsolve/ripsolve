@@ -42,10 +42,21 @@ measured from the solve's start, so a restarted pass gets none of it), because w
 fixed the restarted pass offers zero cuts at the same bound: the families are exhausted
 whatever the model's size.
 
-The one lead left on it is that a reference solver *physically shrinks* the model on
-restart, 9522 columns to 2476, where this solver keeps every fixed column in the matrix by
-the deliberate choice recorded under "Presolve" not to renumber. Whether a compacted model
-yields cuts the uncompacted one does not is untested and is the only remaining question.
+That lead is now closed too. `compact` is built and tested — see "Compaction, and the
+question it finally answers" — and simulating the restart sequence round by round shrinks
+`neos-820879` to 2638 columns, within a couple of hundred of what a reference solver
+restarts on, with the bound converging to 25108: the same place the uncompacted loop
+stops, and no family finding a single cut from the third round on. The exhaustion is a
+property of the families, not of the representation.
+
+The module is kept and nothing calls it. It is the prerequisite for any restart that does
+pay, and the general version was measured before as "correct, and 14% slower for nothing",
+so wiring it in without a reason would repeat that.
+
+**Three explanations for `neos-820879` — restarts, sub-MIPs, compaction — have each been
+built and each turned out to be downstream of the same thing: cut families that stop
+finding anything at 25114 against a needed 25468.** The next attempt on it should be a cut
+family, and there is no evidence here about which.
 
 ## Standing
 

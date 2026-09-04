@@ -2315,6 +2315,54 @@ by the deliberate choice recorded under "Presolve" not to renumber. A restart is
 moment that choice costs something, and testing whether a compacted model yields cuts the
 uncompacted one does not is the only remaining lead on this instance.
 
+### Compaction, and the question it finally answers
+
+"Physical removal is a later optimization, worth doing when instance sizes make the wasted
+rows matter" has stood under "Presolve" since the beginning, and a reference solver does
+exactly that on restart, taking `neos-820879` from 9522 columns to 2476 where this solver
+keeps every fixed column in the matrix. That is the last untested explanation for why its
+cut families run dry.
+
+`compact` is built, and the answer is no.
+
+Simulated round by round -- cut, fix against the incumbent on the cut model's own reduced
+costs, compact, repeat -- which is the sequence a restart performs:
+
+```text
+uncompacted   9522 cols, 82 cuts, bound 24958.02
+round 0       3934 cols, 86 cuts, 24874.27 -> 24968.23
+round 1       3404 cols, 110 cuts,          -> 25032.53
+round 2       3058 cols, 87 cuts,           -> 25108.20
+round 3       2665 cols, 0 cuts             -> 25108.20
+round 4       2647 cols, 0 cuts             -> 25108.20
+```
+
+The model shrinks to within a couple of hundred columns of what the reference solver
+restarts on, and the bound converges to 25108, which is where the *uncompacted* loop also
+stops. From round three no family finds a single violated cut. So the exhaustion is a
+property of the families, not of the representation, and a reference solver reaching 25468
+does it with cuts this one does not have rather than with a model shape this one cannot
+build.
+
+That is worth knowing beyond this instance: three separate explanations for `neos-820879`
+-- restarts, sub-MIPs, and now compaction -- have each been built and each turned out to
+be downstream of the same thing.
+
+**The module is kept and nothing calls it.** It is the tested answer to a question this
+file has carried from the start, it is the prerequisite for any restart that does pay, and
+the general version was measured before and found "correct, and 14% slower for nothing",
+so wiring it in without a reason would repeat that. Its own cost is a module and its tests.
+
+The tests are the part worth reading. A postsolve that renumbers wrongly returns a
+plausible vector for the wrong columns, which scores as a valid objective and is not one,
+so correctness is checked by solving both models and comparing rather than by reading the
+map: the compacted optimum against the original's, *and* the expanded point scored on the
+original against what the compacted search claimed for it. Only the second catches a
+permutation, since a permuted vector still scores something. Both were checked against
+deliberate breakage -- expanding by position instead of through the map, and dropping the
+fixed columns' contribution to the objective -- and each fails on the first seed that
+compacts.
+
 ## Measuring the search
 
 The parallel search is not deterministic, and single runs of it are not evidence.

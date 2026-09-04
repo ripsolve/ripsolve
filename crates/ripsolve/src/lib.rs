@@ -100,6 +100,7 @@
 //! rejected, is in [design-notes.md](https://github.com/ripsolve/ripsolve/blob/main/docs/design-notes.md).
 
 pub mod branch;
+pub mod compact;
 pub mod cuts;
 pub mod generate;
 pub mod heuristic;
