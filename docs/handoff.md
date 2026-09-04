@@ -220,18 +220,35 @@ Handing this solver those presolved models directly converts **only `ex10`**; th
 still reach one or two nodes on a fifth of the model. Do not build presolve reductions
 for that group on the strength of the size comparison -- the experiment has been run.
 
-**`ex10` is the same instance as `ex9` and wants 86 seconds of probing against `ex9`'s
-22.** It reaches 17272 columns of 17680 and would close if it got there. Nothing here
-makes probing cheaper: the cost is one direction of it (supposing `x_j = 1` fixes 1684
-columns for 568,000 entries, where supposing zero costs 62 and derives nothing), and it
-is real work rather than overhead. Making probing cheaper is the single change that would
-convert `ex10`, and it is not a budget question.
+**`ex10` is not the second half of `ex9`.** Given the patience it wants it does close --
+objective 100, two nodes -- but in **161 seconds**, of which 78 are probing and 83 are one
+root relaxation. Compacting it to 16760 rows by 408 columns changes that 83 by two
+seconds. Parallelising probing would buy the 78 and leave the 119. Do not start there.
 
-**`bley_xl1` is an LP problem wearing a presolve problem's clothes.** Presolved it is
-17039 rows by **751 columns**, and this solver's root relaxation on it takes 337 seconds.
-A basis that is almost entirely logical columns is exactly the shape the hyper-sparse
-triangular solve was rejected on -- and it was rejected against models with many columns,
-where the reachable set really is dense. That measurement does not cover this case.
+## The one place the remaining conversions are
+
+After everything above, the sixty-second losses that are neither bound-limited nor
+already answered come down to a single cause, and all four are many rows against few
+columns:
+
+```text
+ex10           root relaxation 119s on 16760 x 408 after everything
+bley_xl1       root relaxation 337s on 17039 x 751, 83581 iterations at 247/s
+supportcase4   root relaxation does not finish in 600s
+neos-633273    two nodes in sixty seconds
+```
+
+Presolve has been tested against this group and converts `ex9` alone; compaction converts
+none of it; cut families do not apply, since a bound needs a relaxation to bound. **The
+next conversion at this limit is a faster relaxation on a row-heavy model.**
+
+The specific hypothesis worth testing first, and it is a hypothesis: the hyper-sparse
+triangular solve was implemented and reverted on the measured grounds that `B^-1 a_q`
+runs 12 to 33% dense, and that was measured on column-rich models. A basis of 17039 rows
+holding at most 751 structural columns is nearly all logicals, which is the shape that
+measurement did not cover. One attempt at measuring it here was wasted by counting every
+`ftran` including the dense `B^-1 b` -- it read 95% everywhere, which means nothing. The
+measurement has to isolate the entering column's solve.
 
 ## Where the cut work got to
 

@@ -2493,6 +2493,78 @@ nothing at all, because they abandon nothing.
 With patience at 120 million, `ABANDON_RUN` at sixteen, and `PRESOLVE_SHARE` widened from
 a quarter to two fifths so a 22 second presolve fits inside a 60 second run, `ex9` closes.
 
+### `ex10` is `ex9` with the bill four times over, and the second half is not the model
+
+`ex9` and `ex10` are the same instance family and answer differently. Given patience of
+1200 million rather than 120 -- `ex10`'s dry stretch is between 600 million and that,
+where `ex9`'s is 57.8 -- `ex10` closes: objective 100, two nodes, **161 seconds**. So it
+is winnable, and not at sixty.
+
+The 161 splits into 78 seconds of probing and 83 of everything after it, and the second
+half is the surprise. After probing, `ex10` has 408 free columns of 17680 and still
+carries all 69608 rows and every fixed column into the basis, which is exactly the case
+compaction was built for and has never been tried on. Compacting it reaches **16760 rows
+by 408 columns**, a fortieth of the nonzeros, and:
+
+```text
+compacted      Optimal in 119.0s, 2 nodes
+as presolved   Optimal in 121.0s, 2 nodes
+```
+
+Two seconds of 120. The cost was never the rows being carried; it is one root relaxation
+that takes two minutes whatever shape the model is written in. That is the second time
+compaction has been measured against a case that looked made for it and returned nothing,
+and the two together are a fair summary of it: it is correct, it is cheap, and the models
+where the size looks like the problem are models where the size is not the problem.
+
+Parallel probing would take the 78 seconds to perhaps ten. It would not touch the 119.
+
+### `supportcase4`, and why better presolve is not its answer either
+
+Its objective is zero, so the whole model is a feasibility question and the
+constant-objective path already gives the feasibility search three quarters of the run.
+Feasibility Jump takes the violation from 1558 to about 300 and stops there, restart after
+restart. Nothing else finds a point either: at a **600 second** limit it reaches one node
+and no incumbent, because on this solver's own presolve the root relaxation does not
+finish in ten minutes.
+
+HiGHS's presolve reaches 4370 x 1112 where this one reaches 6418 x 2136, and asking which
+rule does it says **Parallel rows and columns** -- alone, it is the whole reduction, as
+are Probing and Enumeration alone. Parallel row merging is in this history, built and
+reverted because freeing a row did not remove it, with the note that compaction was the
+prerequisite it needed. Compaction now exists, so that is a coherent piece of work.
+
+It is also not worth doing for this instance, and the experiment that says so was already
+run: handed HiGHS's presolved `supportcase4` directly, this solver still reaches **two
+nodes**. The root relaxation on 4370 x 1112 takes 10.8 seconds and the run then goes
+nowhere. Presolve is not what `supportcase4` is short of.
+
+### Where the remaining conversions actually are, which is one place
+
+Putting the sixty-second losses together after all of the above, the instances that are
+neither bound-limited nor already answered come down to one cause:
+
+```text
+ex10           root relaxation 119s on 16760 x 408 after everything
+bley_xl1       root relaxation 337s on 17039 x 751, 83581 iterations at 247/s
+supportcase4   root relaxation does not finish in 600s on 6418 x 2136
+neos-633273    two nodes in sixty seconds
+```
+
+All four are many rows against few columns, and all four are LP throughput and nothing
+else. Presolve has been tested against them and converts one instance, `ex9`; compaction
+has been tested against them and converts none; the cut families do not apply, because a
+bound needs a relaxation to bound. The next conversion at this limit is a faster
+relaxation on a row-heavy model, and the rest of the machinery is waiting on it.
+
+One caution before starting there. The hyper-sparse triangular solve was implemented and
+reverted, on the measured grounds that `B^-1 a_q` runs 12 to 33% dense; a basis of 17039
+rows holding at most 751 structural columns is nearly all logicals and is the shape that
+measurement did not cover. That is a hypothesis and not a finding: an attempt to measure
+it here counted every `ftran`, including the dense `B^-1 b`, and came out at 95% on all
+three models tried, which says only that the measurement has to isolate the entering
+column's solve to mean anything.
+
 ### One seed in a thousand generated no model at all
 
 Sweeping the model generator for a shape that reaches the agreement rule hung it.
