@@ -225,6 +225,33 @@ objective 100, two nodes -- but in **161 seconds**, of which 78 are probing and 
 root relaxation. Compacting it to 16760 rows by 408 columns changes that 83 by two
 seconds. Parallelising probing would buy the 78 and leave the 119. Do not start there.
 
+## What SCIP and CBC close that HiGHS does not
+
+A better-posed question than "what does HiGHS do", and it was worth asking. Ten of the 140
+qualify; four this solver already closes. Putting the other six to SCIP's own parameters:
+
+```text
+cod105, graph20-20-1rand   symmetry      (SCIP times out without it)
+neos-787933                presolve
+tanglegram6                nothing in particular
+```
+
+**The symmetric pair needs a real automorphism group** -- neither has a single duplicate
+column, so no cheap detection reaches it. Note also that turning SCIP's cuts *off* makes
+both faster, `cod105` 57.7s to 11.5. Cuts are not what that group wants.
+
+**`neos-787933` is now a primal problem and was a bound problem.** Its relaxation is weak
+by construction: 1764 big-M linking rows, LP 3.0 against an optimum of 30. The conflict
+graph recorded one implication per row where each row states 133, and a new cut family
+aggregates `>=` rows through those implied bounds. Root bound 9 -> 30, which is exact. It
+still does not close: the incumbent stalls at 64 after 600 seconds.
+
+The next step on it is written down and unbuilt. Any `y` feasible for the aggregated rows
+gives a feasible point of the whole model by `x_j := y_{k(j)}` -- the capacity rows hold
+because `M >= |S_k|`, and the covering rows are what the aggregated rows assert. That is a
+sub-MIP over 1764 columns, and this solver closes that model in 22 seconds when handed it.
+It is the clearest single conversion left.
+
 ## The one place the remaining conversions are
 
 After everything above, the sixty-second losses that are neither bound-limited nor

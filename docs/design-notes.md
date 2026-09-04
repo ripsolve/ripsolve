@@ -2565,6 +2565,81 @@ it here counted every `ftran`, including the dense `B^-1 b`, and came out at 95%
 three models tried, which says only that the measurement has to isolate the entering
 column's solve to mean anything.
 
+### Asking the other two solvers what they know that the first one does not
+
+Every comparison here has been against HiGHS. Ten of the 140 are closed by SCIP or CBC
+and missed by HiGHS, which is a different question and a better-posed one: whatever does
+those is a technique HiGHS lacks. Four of the ten this solver already closes -- `disctom`,
+`decomp2`, `nw04`, `neos-4754521-awarau`. SCIP takes parameters for its own families, so
+the remaining six can be put to it directly rather than guessed at:
+
+```text
+cod105             baseline 57.7s   no symmetry -> timeout, gap 1.03
+graph20-20-1rand   baseline  6.1s   no symmetry -> timeout, gap 4.61
+neos-787933        baseline  1.2s   no presolve -> timeout, gap 23.1
+tanglegram6        baseline 19.0s   nothing changes it
+```
+
+Two answers. `cod105` and `graph20-20-1rand` are **symmetry**, and neither has a single
+duplicate column, so it is a real automorphism group rather than interchangeable columns
+-- nauty-class machinery, and nothing smaller will do. `tanglegram6` is nothing in
+particular; every knob off, still nineteen seconds.
+
+Worth noting for both of the symmetric ones: turning SCIP's *cuts* off makes them
+**faster**, `cod105` 57.7s to 11.5 and `graph20-20-1rand` 6.1 to 2.3. Cuts are not what
+that group wants.
+
+### A relaxation that is weak by construction, and the family for it
+
+`neos-787933` is presolve, and narrowing it further is worth the detail. Disabling SCIP's
+constraint-handler presolving leaves 63708 columns -- which is exactly where HiGHS's
+presolve lands, and exactly where this solver's own lands. All three agree; SCIP then goes
+to 1764 columns and 439 rows, and handed that model this solver closes it in 22 seconds.
+
+The model is 1764 big-M linking rows, `sum_{j in S_k} x_j - 133 y_k <= 0` with
+`|S_k| = 133`, minimising `sum_k y_k`, over covering rows wanting three of a set. Its LP
+relaxation is **3.0** against an integer optimum of **30**. That is not a relaxation that
+happens to be weak; `y_k` is free to sit at a hundred-and-thirty-third of what any one
+member of its group holds, and no amount of separating from single rows repairs it.
+
+Each such row says `x_j <= y_k` for all 133 members. The conflict graph took each row's
+longest overshooting prefix and stopped, which for this row is `{not y_k, x_1}` -- **one
+implication of the 133**. The caution recorded under "Reading conflicts out of long rows"
+said exactly this ("leaves cliques behind on general knapsack rows") without anything
+depending on it. Sorted by weight, a literal's conflicting partners are a prefix of the
+list, so all of them come out in one walk: the graph on `neos-787933` goes from about 1764
+edges to 234612.
+
+Then the family. For a row `sum a_j x_j >= b` with `a_j > 0`, every term obeys
+`a_j x_j <= a_j y_j`, so
+
+```text
+    sum_j a_j y_j  >=  sum_j a_j x_j  >=  b
+```
+
+is valid, and columns sharing a bounding variable collect onto it. Measured before any
+Rust: 133 such rows take the LP from 3.0 to **30.0**, the integer optimum, on the nose.
+Built, it is 77 cuts and the root bound goes 9 -> 30.
+
+One thing had to change for it to reach the LP at all. `select` ranks by efficacy, which
+divides violation by the cut's norm and so prices a six-hundred-term aggregated row
+against a two-term clique; on this model the two-term cliques win, move the bound from
+8.07 to 8.16, and crowd out the rows that move it to 30. The ranking is not wrong in
+general -- a short cut really is cheaper to carry at every node below -- so the family
+gets a reserved quarter of the round rather than a thumb on the scale.
+
+**And `neos-787933` still does not close.** The bound is exact and the incumbent stalls at
+64 after 600 seconds, so what was a bound failure is now purely a primal one. The fix is
+visible and unbuilt: any `y` feasible for the aggregated rows yields a feasible point of
+the whole model by setting `x_j := y_{k(j)}`, since the capacity rows hold when
+`M >= |S_k|` and the covering rows are what the aggregated rows assert. That is a sub-MIP
+over 1764 columns, which is the model this solver already closes in 22 seconds.
+
+Neither change moves the benchmark: 34 before and after, the same 34, nothing gained and
+nothing lost. They are kept because the extraction was a defect against its own recorded
+caution, and because a family that takes a root bound from 9 to the optimum is worth
+having before the primal side that would use it.
+
 ### One seed in a thousand generated no model at all
 
 Sweeping the model generator for a shape that reaches the agreement rule hung it.

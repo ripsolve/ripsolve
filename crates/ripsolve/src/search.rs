@@ -1195,7 +1195,7 @@ fn separate_at_root(
             &root.x,
             options.cuts_per_round,
         ));
-        // Fifth family, and the only one that combines rows. The four above each read a
+        // Sixth family, and the only one that combines rows. The four above each read a
         // single row or a single tableau row, and on a model whose optimal face is large
         // that removes one vertex of it and the relaxation steps to the next one worth
         // the same. See `separate_mod2`.
@@ -1210,7 +1210,27 @@ fn separate_at_root(
         // actually decided. Ranking by efficacy and dropping near-parallel duplicates
         // keeps the rows that move the bound and discards the ones that only cost an
         // LP column scan at every node below.
-        let found = cuts::select(found, &root.x, options.cuts_per_round);
+        let mut found = cuts::select(found, &root.x, options.cuts_per_round);
+
+        // A row aggregated through the variable upper bounds the model implies, and it
+        // is selected on its own rather than against the families above. Efficacy
+        // divides violation by the cut's norm, which prices an aggregated row of six
+        // hundred terms against a two-term clique and loses every time; on
+        // `neos-787933` the two-term cliques win that ranking, move the bound from 8.07
+        // to 8.16, and crowd out the 77 aggregated rows that move it to 30, which is
+        // the optimum. The ranking is not wrong in general -- a short cut really is
+        // cheaper to carry -- so this family gets its own budget instead of a thumb on
+        // the scale. See `separate_implied_aggregations`.
+        found.extend(cuts::select(
+            cuts::separate_implied_aggregations(
+                problem,
+                &conflicts,
+                &root.x,
+                options.cuts_per_round,
+            ),
+            &root.x,
+            options.cuts_per_round / AGGREGATION_SHARE,
+        ));
         if found.is_empty() {
             break;
         }
@@ -2144,6 +2164,14 @@ const ROOT_LP_FIRST_SHARE: f64 = 0.40;
 /// `n2seq36f` in two rounds. Taken at a quarter they crowd the node LPs on a model with
 /// few, wide rows, and `irp`, 39 rows against 20315 columns, stops closing at all.
 const MOD2_SHARE: usize = 8;
+
+/// The share of a round's cuts reserved for rows aggregated through implied bounds.
+///
+/// A quarter. They are the whole answer where they apply, so the share only has to be
+/// wide enough to carry a model's covering rows over a few rounds -- `neos-787933` wants
+/// 77 of them and has 133 in all -- and narrow enough that a model where they are merely
+/// valid does not spend its round on them.
+const AGGREGATION_SHARE: usize = 4;
 
 /// A backstop on presolve's expensive half, not its budget.
 ///

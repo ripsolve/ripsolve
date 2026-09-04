@@ -1134,12 +1134,34 @@ fn literal(j: usize, value: bool) -> u32 {
 /// that no prefix covers, and finding them means more passes over the weights. The
 /// prefix is taken alone because it is exactly what set packing and set partitioning
 /// rows need, and those are the rows this exists to read.
-fn clique_from_row(
+/// Extra conflicting pairs a row implies beyond its longest overshooting prefix.
+///
+/// A single row is allowed this many; a row of `n` literals can imply `n^2 / 2` pairs
+/// and writing those out is the blowup the clique representation exists to avoid. What
+/// the cap has to admit is the *star*, one heavy literal against many light ones, which
+/// is linear in the row and is where the big-M models live.
+const MAX_ROW_PAIRS: usize = 4_096;
+
+/// Extra pairs the whole model is allowed, as a multiple of its nonzeros.
+///
+/// The per-row cap bounds one row; this bounds a model with a great many rows that each
+/// contribute a little. Eight times the matrix keeps the graph proportional to the model
+/// it describes. Measured on the pure binary set, nothing comes near it: the largest
+/// graphs built here peak at 216MB and under a second, and the star a big-M row emits is
+/// linear in the row rather than quadratic.
+const MAX_TOTAL_PAIRS: usize = 8;
+
+/// The row as `sum w_l [literal l] <= capacity` with every weight positive.
+///
+/// Two literals conflict exactly when their weights overshoot the capacity together,
+/// so this is the whole conflict structure of the row in a form that can be read for
+/// cliques and for pairs alike.
+fn row_literals(
     problem: &Problem,
     live: &[(usize, f64)],
     bound: f64,
     sign: f64,
-) -> Option<Vec<u32>> {
+) -> Option<(Vec<(f64, u32)>, f64)> {
     // Written `sum a_j x_j <= capacity`, negating a `>=` row to get there. The caller
     // negates the bound along with the sign, so it arrives ready to use.
     let mut capacity = bound;
@@ -1167,8 +1189,14 @@ fn clique_from_row(
         return None;
     }
     weights.sort_by(|a, b| b.0.total_cmp(&a.0));
-    // The two smallest weights of a prefix shrink as it grows, so the overshooting
-    // prefixes are themselves a prefix and the longest is found by walking out.
+    Some((weights, capacity))
+}
+
+/// The longest prefix of `weights` whose literals pairwise overshoot `capacity`.
+///
+/// The two smallest weights of a prefix shrink as it grows, so the overshooting
+/// prefixes are themselves a prefix and the longest is found by walking out.
+fn prefix_clique(weights: &[(f64, u32)], capacity: f64) -> Vec<u32> {
     let mut held = 0usize;
     for t in 2..=weights.len() {
         if weights[t - 2].0 + weights[t - 1].0 > capacity + TOL {
@@ -1177,7 +1205,42 @@ fn clique_from_row(
             break;
         }
     }
-    (held >= 2).then(|| weights[..held].iter().map(|&(_, node)| node).collect())
+    weights[..held].iter().map(|&(_, node)| node).collect()
+}
+
+/// Every conflicting pair the row implies that its prefix clique does not already say.
+///
+/// The clique covers the pairs inside it. What it misses is a literal heavy enough to
+/// overshoot on its own against literals too light to overshoot each other, which the
+/// prefix stops at the moment two light ones fit together. In a big-M linking row,
+/// `sum_{j in S} x_j <= M y` with `M >= |S|`, that is the whole content of the row: the
+/// complement of `y` overshoots against every `x_j`, so the row says `x_j <= y` for each
+/// of them, and the prefix reports one of those and stops.
+///
+/// `weights` must be sorted descending, which makes each literal's conflicting partners
+/// a prefix of the list and the whole set readable in one walk.
+fn extra_pairs(weights: &[(f64, u32)], capacity: f64, held: usize, out: &mut Vec<(u32, u32)>) {
+    // No pair overshoots at all unless the heaviest two do, and those are the prefix.
+    if held < 2 {
+        return;
+    }
+    // Partner ranges shrink as the weight does, so one pointer sweeps them all.
+    let mut last = weights.len();
+    for &(weight, node) in &weights[..held] {
+        while last > held && weight + weights[last - 1].0 <= capacity + TOL {
+            last -= 1;
+        }
+        for &(_, other) in &weights[held..last] {
+            // Both literals of one column exclude each other whatever the row says.
+            if node / 2 == other / 2 {
+                continue;
+            }
+            out.push((node, other));
+            if out.len() >= MAX_ROW_PAIRS {
+                return;
+            }
+        }
+    }
 }
 
 impl Conflicts {
@@ -1193,6 +1256,8 @@ impl Conflicts {
         let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); 2 * n];
         let mut cliques: Vec<Vec<u32>> = Vec::new();
         let mut membership: Vec<Vec<u32>> = vec![Vec::new(); 2 * n];
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut budget = MAX_TOTAL_PAIRS * problem.matrix.nnz();
         let csr = problem.matrix.to_csr();
         for i in 0..problem.n_rows() {
             let (cols, vals) = csr.column(i);
@@ -1230,20 +1295,36 @@ impl Conflicts {
                 if !bound.is_finite() {
                     continue;
                 }
-                let Some(clique) = clique_from_row(problem, &live, bound, sign) else {
+                let Some((weights, capacity)) = row_literals(problem, &live, bound, sign)
+                else {
                     continue;
                 };
+                let clique = prefix_clique(&weights, capacity);
+                let held = clique.len();
                 // A pair says no more than the row it came from, so it goes in as an
                 // edge; only a set of three or more is worth holding as a clique.
                 if clique.len() == 2 {
                     neighbours[clique[0] as usize].push(clique[1]);
                     neighbours[clique[1] as usize].push(clique[0]);
-                } else {
+                } else if clique.len() > 2 {
                     let id = cliques.len() as u32;
                     for &node in &clique {
                         membership[node as usize].push(id);
                     }
                     cliques.push(clique);
+                }
+                // The prefix stops where two light literals first fit together, which
+                // leaves every pair a heavy literal makes with a light one unsaid. See
+                // `extra_pairs`.
+                pairs.clear();
+                if budget > 0 {
+                    extra_pairs(&weights, capacity, held, &mut pairs);
+                    pairs.truncate(budget);
+                    budget -= pairs.len();
+                }
+                for &(p, q) in &pairs {
+                    neighbours[p as usize].push(q);
+                    neighbours[q as usize].push(p);
                 }
             }
         }
@@ -1427,6 +1508,143 @@ fn is_binary(problem: &Problem, j: usize) -> bool {
 /// heaviest candidate excluded by everything already held. Greedy gives no guarantee of
 /// the largest clique, which is NP-hard to want; it gives a clique, and one the
 /// relaxation violates is worth adding whether or not something bigger existed.
+/// For each binary column, a binary the model forces to one whenever the column is.
+///
+/// `x_j = 1` conflicting with `y = 0` is exactly the statement `x_j <= y`, so the
+/// conflict graph already holds every variable upper bound the rows imply and this only
+/// has to read them off. Where a column has several, the one standing lowest in the
+/// relaxation is kept, since that is the one a row aggregated through these bounds is
+/// most violated at.
+fn implied_upper_bounds(problem: &Problem, conflicts: &Conflicts, x: &[f64]) -> Vec<Option<usize>> {
+    let mut bounds: Vec<Option<usize>> = vec![None; problem.n_cols()];
+    for (j, slot) in bounds.iter_mut().enumerate() {
+        if !is_binary(problem, j) {
+            continue;
+        }
+        let mut best: Option<usize> = None;
+        conflicts.for_each_adjacent(literal(j, true), |node| {
+            // An odd node is the literal `y = 0`, so conflicting with it means `y = 1`.
+            if !node.is_multiple_of(2) {
+                let y = node as usize / 2;
+                if y != j && best.is_none_or(|held| x[y] < x[held]) {
+                    best = Some(y);
+                }
+            }
+            true
+        });
+        *slot = best;
+    }
+    bounds
+}
+
+/// Separate rows aggregated through the variable upper bounds the model implies.
+///
+/// A big-M linking row, `sum_{j in S} x_j <= M y` with `M >= |S|`, says `x_j <= y` for
+/// every `j`, and says it so weakly that the relaxation can hold `y` at `1/|S|` of what
+/// any one `x_j` is. Separating those bounds one at a time is sound and hopeless: on
+/// `neos-787933` there are 1764 such groups, each cut lifts one of them, and the
+/// relaxation answers by moving its weight to another group. Three thousand cuts move
+/// the bound from 9 to 10 against an optimum of 30.
+///
+/// Aggregating instead puts the whole model in one place. For a row `sum a_j x_j >= b`
+/// with `a_j > 0`, every term obeys `a_j x_j <= a_j y_j`, so
+///
+/// ```text
+///     sum_j a_j y_j  >=  sum_j a_j x_j  >=  b
+/// ```
+///
+/// holds for every feasible point, and columns sharing a bounding variable collect onto
+/// it. A term with `a_j < 0` contributes at most zero and is dropped, which needs the
+/// column's lower bound to be zero and is why that is checked. On `neos-787933` this is
+/// 133 cuts, one per covering row, and it takes the relaxation from 3 to **30**, which
+/// is the integer optimum.
+pub fn separate_implied_aggregations(
+    problem: &Problem,
+    conflicts: &Conflicts,
+    x: &[f64],
+    limit: usize,
+) -> Vec<Cut> {
+    if conflicts.is_empty() {
+        return Vec::new();
+    }
+    let bounds = implied_upper_bounds(problem, conflicts, x);
+    if bounds.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    let csr = problem.matrix.to_csr();
+    let mut found: Vec<Cut> = Vec::new();
+    let mut accumulated: Vec<(usize, f64)> = Vec::new();
+
+    for i in 0..problem.n_rows() {
+        let (cols, vals) = csr.column(i);
+        if cols.len() < 2 {
+            continue;
+        }
+        // Both sides of a range row are a `>=` row, one of them after negating.
+        for &(sign, bound) in &[(1.0f64, problem.row_lb[i]), (-1.0, -problem.row_ub[i])] {
+            if !bound.is_finite() || found.len() >= limit {
+                continue;
+            }
+            accumulated.clear();
+            let mut substituted = false;
+            let mut usable = true;
+            for (&j, &v) in cols.iter().zip(vals) {
+                let a = sign * v;
+                if a == 0.0 {
+                    continue;
+                }
+                if a < 0.0 {
+                    // Dropped, which replaces the term by zero and so needs zero to be
+                    // an upper bound on it: `a x <= 0` for every value the column can
+                    // take. With `a < 0` that is exactly the column not going negative.
+                    // A column that can go negative makes the term positive, and
+                    // dropping it would claim the rest of the row carries a bound the
+                    // model never asked it to.
+                    if problem.col_lb[j] < 0.0 {
+                        usable = false;
+                        break;
+                    }
+                    continue;
+                }
+                match bounds[j] {
+                    Some(y) => {
+                        substituted = true;
+                        accumulated.push((y, a));
+                    }
+                    None => accumulated.push((j, a)),
+                }
+            }
+            if !usable || !substituted || accumulated.is_empty() {
+                continue;
+            }
+            accumulated.sort_by_key(|&(j, _)| j);
+            let mut coefficients: Vec<(usize, f64)> = Vec::with_capacity(accumulated.len());
+            for &(j, a) in &accumulated {
+                match coefficients.last_mut() {
+                    Some(last) if last.0 == j => last.1 += a,
+                    _ => coefficients.push((j, a)),
+                }
+            }
+            let cut = Cut {
+                coefficients,
+                lb: bound,
+                ub: f64::INFINITY,
+            };
+            if cut.violation(x) > MIN_VIOLATION {
+                found.push(cut);
+            }
+        }
+    }
+
+    found.sort_by(|a, b| {
+        b.violation(x)
+            .partial_cmp(&a.violation(x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    found.truncate(limit);
+    found
+}
+
 pub fn separate_cliques(
     problem: &Problem,
     conflicts: &Conflicts,
@@ -1867,6 +2085,251 @@ mod tests {
     /// nonnegative integers; a sign slip in the halving, or rounding a negative
     /// coefficient towards zero instead of down, produces a cut that looks perfectly
     /// ordinary and quietly removes the optimum.
+    /// Every implied-aggregation cut of `p` holds at every feasible binary point.
+    fn assert_aggregation_is_valid(p: &Problem, label: &str) -> usize {
+        let relaxed = Lp::relaxation(p).solve();
+        if relaxed.status != LpStatus::Optimal {
+            return 0;
+        }
+        let conflicts = Conflicts::of(p);
+        let cuts = separate_implied_aggregations(p, &conflicts, &relaxed.x, 32);
+        let n = p.n_cols();
+        assert!(n <= 16);
+        let csr = p.matrix.to_csr();
+        for mask in 0u32..(1u32 << n) {
+            let point: Vec<f64> = (0..n).map(|j| f64::from((mask >> j) & 1)).collect();
+            let feasible = (0..p.n_rows()).all(|i| {
+                let (cols, values) = csr.column(i);
+                let activity: f64 = cols.iter().zip(values).map(|(&j, &a)| a * point[j]).sum();
+                activity >= p.row_lb[i] - 1e-9 && activity <= p.row_ub[i] + 1e-9
+            });
+            if !feasible {
+                continue;
+            }
+            for cut in &cuts {
+                let activity = cut.activity(&point);
+                assert!(
+                    activity >= cut.lb - 1e-6 && activity <= cut.ub + 1e-6,
+                    "{label}: cut {:?} in [{}, {}] cuts off the feasible point {point:?}",
+                    cut.coefficients,
+                    cut.lb,
+                    cut.ub
+                );
+            }
+        }
+        cuts.len()
+    }
+
+    /// A linking row says `x_j <= y`, and a covering row over the `x` says it over `y`.
+    ///
+    /// Three groups of two, each gated by its own binary, and a covering row taking one
+    /// member from each group and wanting two of them. The relaxation spreads the three
+    /// members over two thirds each, which satisfies the covering row while holding
+    /// every gate at a third, and scores 1. Aggregating the covering row through the
+    /// gates says two gates must be open, which is the integer optimum.
+    ///
+    /// The covering row taking one member per group is what makes it bite. Two members
+    /// of the same group collapse onto one gate with coefficient two, and the
+    /// aggregated row is then no stronger than the relaxation already was -- which is
+    /// the first version of this test, and it generated no violated cut at all.
+    #[test]
+    fn an_aggregated_covering_row_holds_and_lifts_the_bound() {
+        let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+        let members: Vec<(usize, usize, usize)> = ["a", "b", "c"]
+            .iter()
+            .map(|g| {
+                let first = model.binary(&format!("{g}1"));
+                let second = model.binary(&format!("{g}2"));
+                let gate = model.binary(&format!("y{g}"));
+                (first, second, gate)
+            })
+            .collect();
+        model.objective(&members.iter().map(|&(_, _, y)| (y, 1.0)).collect::<Vec<_>>());
+        for &(first, second, gate) in &members {
+            model.row(
+                &[(first, 1.0), (second, 1.0), (gate, -2.0)],
+                crate::model::RowSense::Le,
+                0.0,
+            );
+        }
+        model.row(
+            &members.iter().map(|&(f, _, _)| (f, 1.0)).collect::<Vec<_>>(),
+            crate::model::RowSense::Ge,
+            2.0,
+        );
+        let problem = model.build();
+
+        let relaxed = Lp::relaxation(&problem).solve();
+        assert_eq!(relaxed.status, LpStatus::Optimal);
+        assert!(
+            relaxed.objective < 1.5,
+            "the relaxation should be weak here, and scored {}",
+            relaxed.objective
+        );
+        let found = assert_aggregation_is_valid(&problem, "three gated pairs");
+        assert!(found > 0, "no aggregated row was separated from a gated model");
+
+        let mut with = problem.clone();
+        with.add_cuts(&separate_implied_aggregations(
+            &problem,
+            &Conflicts::of(&problem),
+            &relaxed.x,
+            32,
+        ));
+        let lifted = Lp::relaxation(&with).solve();
+        assert!(
+            lifted.objective > 1.99,
+            "the aggregated row left the bound at {}, where the optimum is 2",
+            lifted.objective
+        );
+    }
+
+    /// A term that can turn positive is not droppable, and dropping it loses a point.
+    ///
+    /// The aggregation drops a negative-coefficient term from a `>=` row by replacing it
+    /// with zero, which needs zero to be an upper bound on the term. For a column that
+    /// cannot go below zero it is. For one that can, `-z` with `z = -1` is worth `+1`,
+    /// and the row is satisfied by that alone while the aggregated row demands the rest
+    /// of it carry the whole right-hand side.
+    ///
+    /// The random models cannot reach this: every column in them is binary, so a
+    /// negative coefficient really is bounded above by zero and the guard never fires.
+    #[test]
+    fn a_column_that_can_go_negative_stops_the_aggregation() {
+        let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+        let a1 = model.binary("a1");
+        let a2 = model.binary("a2");
+        let gate = model.binary("y");
+        let z = model.integer("z", -1.0, 1.0);
+        model.objective(&[(gate, 1.0)]);
+        model.row(
+            &[(a1, 1.0), (a2, 1.0), (gate, -2.0)],
+            crate::model::RowSense::Le,
+            0.0,
+        );
+        // `a1 - z >= 1` is satisfied by `a1 = 0, z = -1`, which needs no gate at all.
+        model.row(&[(a1, 1.0), (z, -1.0)], crate::model::RowSense::Ge, 1.0);
+        let problem = model.build();
+
+        let relaxed = Lp::relaxation(&problem).solve();
+        assert_eq!(relaxed.status, LpStatus::Optimal);
+        let cuts = separate_implied_aggregations(
+            &problem,
+            &Conflicts::of(&problem),
+            &relaxed.x,
+            32,
+        );
+        let csr = problem.matrix.to_csr();
+        for mask in 0u32..8 {
+            for zv in [-1.0f64, 0.0, 1.0] {
+                let point = vec![
+                    f64::from(mask & 1),
+                    f64::from((mask >> 1) & 1),
+                    f64::from((mask >> 2) & 1),
+                    zv,
+                ];
+                let feasible = (0..problem.n_rows()).all(|i| {
+                    let (cols, values) = csr.column(i);
+                    let activity: f64 =
+                        cols.iter().zip(values).map(|(&j, &a)| a * point[j]).sum();
+                    activity >= problem.row_lb[i] - 1e-9 && activity <= problem.row_ub[i] + 1e-9
+                });
+                if !feasible {
+                    continue;
+                }
+                for cut in &cuts {
+                    let activity = cut.activity(&point);
+                    assert!(
+                        activity >= cut.lb - 1e-6 && activity <= cut.ub + 1e-6,
+                        "cut {:?} in [{}, {}] cuts off the feasible point {point:?}",
+                        cut.coefficients,
+                        cut.lb,
+                        cut.ub
+                    );
+                }
+            }
+        }
+    }
+
+    /// The aggregation never loses a feasible point, over models built to trip it.
+    ///
+    /// Signs are what makes this delicate. A term with a negative coefficient in a
+    /// `>=` row is dropped, which is only valid while the column cannot go below zero,
+    /// and the `<=` side of a range row is aggregated after negating, which swaps which
+    /// terms are dropped. Enumeration is the only check that notices either mistake.
+    #[test]
+    fn aggregated_rows_hold_on_random_gated_models() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut total, mut checked) = (0usize, 0usize);
+        for _ in 0..300 {
+            let groups = 2 + (next() % 2) as usize;
+            let per = 2 + (next() % 2) as usize;
+            let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+            let mut members: Vec<Vec<usize>> = Vec::new();
+            let mut gates: Vec<usize> = Vec::new();
+            for g in 0..groups {
+                let cols: Vec<usize> = (0..per)
+                    .map(|k| model.binary(&format!("x{g}_{k}")))
+                    .collect();
+                gates.push(model.binary(&format!("y{g}")));
+                members.push(cols);
+            }
+            let objective: Vec<(usize, f64)> = gates
+                .iter()
+                .map(|&y| (y, 1.0 + (next() % 3) as f64))
+                .collect();
+            model.objective(&objective);
+            for (g, cols) in members.iter().enumerate() {
+                // `M` at or above the group size is what makes the gate a pure link.
+                let big = per as f64 + (next() % 2) as f64;
+                let mut terms: Vec<(usize, f64)> =
+                    cols.iter().map(|&j| (j, 1.0)).collect();
+                terms.push((gates[g], -big));
+                model.row(&terms, crate::model::RowSense::Le, 0.0);
+            }
+            // Covering rows over the members, with an occasional negative coefficient
+            // and an occasional range, which is where the sign handling is tested.
+            for _ in 0..(1 + next() % 3) {
+                let mut terms: Vec<(usize, f64)> = Vec::new();
+                for cols in &members {
+                    for &j in cols {
+                        if next() % 2 == 0 {
+                            let a = (next() % 3) as f64 - 1.0;
+                            if a != 0.0 {
+                                terms.push((j, a));
+                            }
+                        }
+                    }
+                }
+                if terms.len() < 2 {
+                    continue;
+                }
+                let span: f64 = terms.iter().map(|&(_, a)| a.abs()).sum();
+                let bound = (next() % (span as u64 + 1)) as f64;
+                let sense = if next() % 4 == 0 {
+                    crate::model::RowSense::Le
+                } else {
+                    crate::model::RowSense::Ge
+                };
+                model.row(&terms, sense, bound);
+            }
+            let problem = model.build();
+            if problem.n_cols() > 16 || problem.n_rows() == 0 {
+                continue;
+            }
+            checked += 1;
+            total += assert_aggregation_is_valid(&problem, "random gated");
+        }
+        assert!(checked > 100, "only {checked} models were built");
+        assert!(total > 0, "no aggregated row was generated, so nothing was checked");
+    }
+
     fn assert_mod2_is_valid(p: &Problem, label: &str) -> usize {
         let relaxed = Lp::relaxation(p).solve();
         if relaxed.status != LpStatus::Optimal {

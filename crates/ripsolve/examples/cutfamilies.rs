@@ -58,6 +58,10 @@ fn main() {
             cuts::separate_cliques(&problem, &conflicts, &root.x, per_family),
         ),
         (
+            "implagg",
+            cuts::separate_implied_aggregations(&problem, &conflicts, &root.x, per_family),
+        ),
+        (
             "gomory",
             cuts::separate_gomory(&lp, &root.basis, &root.x, per_family),
         ),
