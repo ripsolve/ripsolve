@@ -3,6 +3,81 @@
 Written at the end of a long session so the next one does not start by re-deriving it.
 The reasoning behind every claim here is in `design-notes.md`; this is the index.
 
+## Start here: the automorphism group
+
+**This is the next build, and it is the largest one this file has ever proposed.**
+
+The instances are `cod105` and `graph20-20-1rand`. Both are closed by SCIP, missed by
+HiGHS, and missed here, which is why they are worth the trouble: whatever does them is a
+technique HiGHS does not have either, so it is not a case of catching up. The evidence
+that symmetry is what does them is direct rather than inferred -- SCIP was asked, by
+turning its own families off one at a time:
+
+```text
+cod105             baseline 57.7s   misc/usesymmetry off -> timeout, gap 1.03
+graph20-20-1rand   baseline  6.1s   misc/usesymmetry off -> timeout, gap 4.61
+```
+
+Nothing else SCIP has moves either one. Where they stand here now: `cod105` reaches **one
+node and proves no bound at all** in sixty seconds, on 1024 rows by 1024 columns;
+`graph20-20-1rand` reaches 45 nodes and a bound of -37 on 5587 by 2183.
+
+### Why the cheap version will not do
+
+The obvious first attempt is interchangeable columns -- two columns identical in the
+matrix and the objective, which can be ordered against each other or merged. **Both models
+have exactly zero duplicate columns.** That was measured, not assumed:
+
+```text
+cod105             1024 x 1024   duplicate columns 0   duplicate rows 0
+graph20-20-1rand   5587 x 2183   duplicate columns 0   duplicate rows 0
+neos-787933        1897 x 236376 duplicate columns 170904 (72.3%)
+```
+
+`neos-787933` is in that table as the contrast: it is 72% duplicate columns and it is
+*not* a symmetry instance, it was closed by implied bounds. So duplicate-column detection
+is neither necessary nor sufficient here, and the symmetry in these two is a genuine
+automorphism group of the coefficient matrix. Nothing smaller reaches it.
+
+### What the build actually is
+
+Three parts, and the middle one is the reason this has not been started:
+
+1. **Build the coloured graph.** Rows and columns become vertices, nonzeros become edges,
+   and the colouring has to keep apart anything an automorphism must not exchange:
+   coefficient value, objective coefficient, bounds, row sense and right-hand side. Get
+   the colouring wrong in the permissive direction and every reduction below is unsound.
+2. **Find the generators.** This is graph automorphism -- nauty, bliss, saucy. There is no
+   Rust implementation in this repository and **adding a dependency here is a departure
+   from a stated property of the project**: the README says "Nothing links against another
+   solver", and `Cargo.toml` carries no solver or combinatorics dependency. So this is
+   either a pure-Rust refinement-and-backtracking implementation, which is a real piece of
+   work in its own right, or an explicit decision to take a dependency. That choice should
+   be made deliberately and up front rather than discovered halfway in.
+3. **Use them.** Orbital fixing at a node, or symmetry-breaking constraints from a
+   Schreier-Sims tower, or orbitopal fixing where the group acts as column permutations of
+   a block. SCIP does all three; the first is the cheapest and is probably where to start.
+
+### Two things measured that will save time
+
+**Cuts are not what this group wants.** Turning SCIP's cuts *off* makes both models
+faster -- `cod105` 57.7s to 11.5, `graph20-20-1rand` 6.1 to 2.3. Do not spend a round on
+cut families for them, and if symmetry handling lands, check whether cutting should be
+turned down on models where a group is found.
+
+**`cod105` proves no bound at all**, so it is not only a search-size problem; its root is
+also going nowhere. Symmetry handling may not be sufficient on its own there even though
+it is necessary for SCIP.
+
+### Where it sits in the order
+
+The order asked for was LP throughput, then symmetry, then `neos-3045796-mogo`'s primal
+side. The first is done and is closed as a *conversion* lever -- it produced the largest
+throughput change in the project (see "The root cut loop was solving the model cold every
+round") and converted nothing, and the group behind it does not close at five times the
+time limit. So symmetry is next, and `mogo` after it, where the note to read first is that
+no cut budget moves it and it needs a primal idea.
+
 ## Where the dual work had got to when it stopped
 
 Nothing uncommitted; this is a note on the last measurement so it is not re-run. The
