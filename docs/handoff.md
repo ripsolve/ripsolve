@@ -63,8 +63,12 @@ family, and there is no evidence here about which.
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     35        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
+
+**Read that as 34.** The 35th is `neos-3045796-mogo`, which is a coin flip at about two in
+five and closed on this run; the set that closes every time is 34. See "35 that is really
+34" in `design-notes.md`.
 
 Confirmed by a full run, `docs/baselines/binary-2026-09-10.json`, which gained
 `neos-787933` and lost the coin flip on `neos-3045796-mogo`. Ahead of CBC, and twelve
@@ -260,6 +264,19 @@ bound 9 -> 30, exact), and the model rewritten over the gates is a restriction s
 enough to answer outright -- 1764 columns, a fifth of a second. Compaction is chained
 into that rewriting and is the first thing in the solver to use it.
 
+## The root cut loop was solving the model cold every round
+
+Fixed, and it is the largest throughput change here: `decomp1` 32.2s to 1.4, `decomp2`
+42.3 to 2.5, `mitre` 27.4 to 3.6, `f2gap801600` 7.0 to 1.0. Adding rows to a solved model
+is a dual warm start, `BasisState::extend_for_rows` already existed for it, and
+`Lp::solve_with_rows` was built on it for node-local cutting; the root loop rebuilt from
+scratch and solved cold instead. Ageing a cut out forces the rebuild, so it now happens
+when the pool passes the model's own row count rather than every round.
+
+**If you are looking for more of the same, look for cold solves.** This one was in plain
+sight behind a comment explaining why the rebuild was necessary, and the machinery to
+avoid it was two files away with a comment saying what it was for.
+
 ## The one place the remaining conversions are
 
 After everything above, the sixty-second losses that are neither bound-limited nor
@@ -272,6 +289,14 @@ bley_xl1       root relaxation 337s on 17039 x 751, 83581 iterations at 247/s
 supportcase4   root relaxation does not finish in 600s
 neos-633273    two nodes in sixty seconds
 ```
+
+**Since measured, and mostly closed as a lead.** Warm-starting the cut loop was found by
+chasing this group and is worth far more than the group is: `neos-633273` still reaches
+two nodes. Given 300 seconds instead of 60, *none* of `neos-633273`, `acc-tight4`,
+`neos-957143` or `neos-960392` closes, so LP speed is not what they are short of. And the
+hyper-sparse hypothesis is refuted -- the row-heavy models are the densest, not the
+sparsest. Node warm starts on `neos-633273` take 1 to 9 pivots and 0.04 seconds against a
+17 second cold solve, so the node LPs were never the problem either.
 
 Presolve has been tested against this group and converts `ex9` alone; compaction converts
 none of it; cut families do not apply, since a bound needs a relaxation to bound. **The

@@ -1163,6 +1163,9 @@ fn separate_at_root(
     // Cuts currently carried in the model, each with a count of consecutive resolves
     // it has sat slack through.
     let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
+    // Whether the last round's ageing removed a row, which is what decides between
+    // growing the model the last solve ran on and rebuilding it from `base`.
+    let mut dropped_a_cut = false;
 
     for _ in 0..options.cut_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d)
@@ -1236,15 +1239,46 @@ fn separate_at_root(
             break;
         }
         added += found.len();
-        active.extend(found.into_iter().map(|c| (c, 0)));
 
-        with_cuts = base.clone();
-        let rows: Vec<cuts::Cut> = active.iter().map(|(c, _)| c.clone()).collect();
-        with_cuts.add_cuts(&rows);
+        // Adding rows to a solved model is what the dual simplex is for: the point the
+        // basis describes violates the new rows, which is what makes them cuts, so the
+        // basis is primal infeasible and still dual feasible, and repairing it is a
+        // handful of pivots. Rebuilding from `base` and solving cold instead costs a
+        // fresh solve of the whole relaxation *every round*. On `neos-633273`, whose
+        // relaxation takes 17 seconds cold and 0.04 warm, that was the difference
+        // between two nodes in five minutes and a search: root, one cut round and the
+        // purge below came to 51 seconds of a 60 second budget before the tree opened.
+        //
+        // The rebuild is still needed when the ageing below has dropped a cut, since
+        // removing a row leaves the saved basis describing different rows than the
+        // model has. Growing is the common case and the only one that has to be quick.
+        let old_rows = problem.n_rows();
+        let warm = if dropped_a_cut {
+            with_cuts = base.clone();
+            let rows: Vec<cuts::Cut> = active
+                .iter()
+                .map(|(c, _)| c.clone())
+                .chain(found.iter().cloned())
+                .collect();
+            with_cuts.add_cuts(&rows);
+            None
+        } else {
+            with_cuts = problem.clone();
+            with_cuts.add_cuts(&found);
+            let mut state = root.basis.clone();
+            state.extend_for_rows(with_cuts.n_cols(), old_rows, found.len());
+            Some(state)
+        };
+        active.extend(found.into_iter().map(|c| (c, 0)));
 
         let mut candidate = Lp::relaxation(&with_cuts);
         candidate.set_deadline(deadline);
-        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        let resolved = match &warm {
+            Some(state) => {
+                candidate.solve_warm(state, None, options.max_iterations_per_node)
+            }
+            None => candidate.solve_with_limit(options.max_iterations_per_node),
+        };
         iterations += resolved.iterations;
         if resolved.status != LpStatus::Optimal {
             // Keep the model that is known to solve rather than pressing on with one
@@ -1262,7 +1296,19 @@ fn separate_at_root(
                 *age += 1;
             }
         }
-        active.retain(|&(_, age)| age < CUT_MAX_AGE);
+        // Dropping a cut costs a rebuild, and a rebuild costs a cold solve of the whole
+        // relaxation, so ageing is applied when the pool has grown enough to be worth
+        // that rather than every round. It was every round, against a loop that solved
+        // cold anyway; once the loop grows its model instead, the trade turns over.
+        // Measured at a 60 second limit: `mitre` 21.7s to 4.2, `n2seq36f` 20.0 to 12.7,
+        // `cap6000` 26.6 to 20.3, and `neos-633273`'s root bound from 5.060e9 to
+        // 5.755e9 on 389 cuts against 156. The final purge below is what actually keeps
+        // slack rows out of the search, and it is unchanged.
+        let carried = active.len();
+        if active.len() > base.n_rows() {
+            active.retain(|&(_, age)| age < CUT_MAX_AGE);
+        }
+        dropped_a_cut = active.len() != carried;
 
         model = Some(with_cuts);
         problem = model.as_ref().expect("just set");

@@ -2732,6 +2732,83 @@ reach two nodes, which is a node-throughput problem and not a root one; three do
 their root at all; and `neos-633273` is the one where the dual method is 4.5 times quicker
 than the primal on the same model and the same answer.
 
+### The root cut loop solved the model cold, every round
+
+The largest throughput defect in this history, and it was in plain sight. Every round of
+the root cut loop rebuilt the model from `base`, added the whole active set, and solved it
+**cold**:
+
+```rust
+with_cuts = base.clone();
+with_cuts.add_cuts(&rows);
+let mut candidate = Lp::relaxation(&with_cuts);
+let resolved = candidate.solve_with_limit(...);
+```
+
+Adding rows to a solved model is precisely what the dual simplex is for: the point the
+basis describes violates the new rows -- that is what makes them cuts -- so the basis is
+primal infeasible and still dual feasible, which is the dual method's entry condition.
+`BasisState::extend_for_rows` already existed for this and says so in its own comment, and
+`Lp::solve_with_rows` was built on it for node-local cutting, whose comment reads "without
+it, every call pays a cold factorization at the grown dimension, which is what put
+node-local cutting out of reach at any useful frequency". The root loop never adopted
+either.
+
+What it cost, measured on `neos-633273`, whose relaxation takes 17 seconds cold and 0.04
+warm from the parent basis:
+
+```text
+ROUND 0  separated 0.18s  resolved 0.46s     (warm)
+ROUND 1  separated 0.86s  resolved 0.99s     (warm)
+ROUND 2  separated 1.16s  resolved 44.10s    (rebuilt cold)
+```
+
+Round 2 is the first round in which the ageing dropped a cut, which forces the rebuild,
+which forces the cold solve. The root, one cut round and the final purge came to 51
+seconds of a 60 second budget before the tree opened at all, which is why that instance
+reached two nodes in *five minutes*.
+
+So ageing had to move too. Dropping a cut costs a rebuild and a rebuild costs a cold
+solve, so it is now applied when the pool has grown past the model's own row count rather
+than every round. The final purge before the tree opens is unchanged and is what actually
+keeps slack rows out of the search.
+
+Across the 140, nothing regressed and the instances that were paying for this stopped:
+
+```text
+decomp1     32.2s ->  1.4s   23x
+decomp2     42.3s ->  2.5s   17x
+mitre       27.4s ->  3.6s  7.6x
+f2gap801600  7.0s ->  1.0s  7.0x
+n2seq36f    18.4s -> 10.8s  1.7x
+cap6000     29.1s -> 18.7s  1.6x
+```
+
+`neos-633273` itself is still two nodes, and its root bound is now 5.755e9 on 389 cuts
+against 4.880e9 on 49, so what the loop buys it went up rather than down. The count goes
+to **35**, gaining `neos-3045796-mogo` -- which is the honest complication below.
+
+### 35 that is really 34, and why the difference is worth stating
+
+`mogo` came back because the whole search got quicker, not because anything was aimed at
+it, and it is still the coin flip the section above measured: one of three runs closes at
+39 seconds, the others time out at a gap of 6 to 13%. So the tally is 35 and the set that
+closes every time is 34. Quoting the tally would be the same mistake this file recorded
+two commits ago, and the fact that the tally moved *in the right direction* is exactly
+when it is tempting.
+
+What the throughput work did for `mogo` is shorten the run it needs, which raises its odds
+without settling them. That is worth something and it is not a conversion.
+
+### A time limit honoured as five times itself
+
+Noticed while reading the run rather than looked for, and it is not new: `pb-fit2d` has
+finished at 283 to 352 seconds against a 60 second limit in **every baseline in this
+repository**, including the first. Nothing else in the 140 exceeds 75 seconds. A limit the
+caller gave is a promise, and this one is out by a factor of five on one model; it is
+recorded here because it has been invisible in twelve benchmark runs, sitting in a column
+everyone reads for the status and not the seconds.
+
 ### Three of three that was one of six
 
 `neos-3045796-mogo` is the cheapest-looking instance left: its root bound is already the
