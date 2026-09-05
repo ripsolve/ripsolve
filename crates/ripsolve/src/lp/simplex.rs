@@ -1117,6 +1117,9 @@ impl<'a> Solver<'a> {
     /// Callers used to collapse any failure to `Infeasible`, which turned a repair that
     /// merely ran out of time into a false proof: hypothyroid-k1, which HiGHS solves in
     /// 16s, came back "Infeasible" in 65s.
+    ///
+    /// That invariant was stated here and broken at the bottom of this same function,
+    /// which is why the callers now assert it rather than trust it.
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
         for attempt in 0..lp.m + 1 {
@@ -1185,7 +1188,15 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        Err(LpStatus::Infeasible)
+        // Every repair attempt used up. Each one swaps a logical into a singular
+        // position, so `m + 1` of them should always be enough, and running out means
+        // the arithmetic is defeating the repair rather than that the model has no
+        // feasible point. Saying `Infeasible` here is the exact mistake this function's
+        // own comment describes and the other two bail-outs above avoid: on
+        // `supportcase4` it exhausted 9493 attempts and returned **infeasible for a
+        // relaxation whose optimum is 0**, which the primal method reaches in 146485
+        // iterations when it is not handed this basis.
+        Err(LpStatus::IterationLimit)
     }
 
     /// Current value of the internal minimization objective.
@@ -1428,6 +1439,7 @@ impl<'a> Solver<'a> {
             let mut best: Option<(usize, f64)> = None;
             let mut best_ratio = f64::INFINITY;
             let mut best_pivot = 0.0;
+            let mut rejected_small = false;
             for j in 0..self.lp.n_total() {
                 let Status::NonBasic(at) = self.status[j] else {
                     continue;
@@ -1444,9 +1456,6 @@ impl<'a> Solver<'a> {
                 } else {
                     -rho[j - self.lp.n_structural]
                 };
-                if arj.abs() <= pivot_tol {
-                    continue;
-                }
                 // Moving z_j by t moves the leaving variable by -arj * t. A column at
                 // its lower bound can only increase, one at its upper only decrease;
                 // keep those that push the leaving variable the way it needs to go.
@@ -1456,6 +1465,14 @@ impl<'a> Solver<'a> {
                     At::Zero => true,
                 };
                 if !usable {
+                    continue;
+                }
+                if arj.abs() <= pivot_tol {
+                    // It would serve; it is too small to pivot on safely. That is a
+                    // statement about this factorization, not about the model, and the
+                    // difference matters below: an empty candidate list is read as the
+                    // dual being unbounded.
+                    rejected_small = true;
                     continue;
                 }
                 let d = self.reduced_cost(j, false);
@@ -1481,10 +1498,21 @@ impl<'a> Solver<'a> {
 
             let Some((entering, _)) = best else {
                 // The dual is unbounded, so the primal has no feasible point. That
-                // reasoning also rests on the basis being dual feasible, and an
-                // infeasibility claim is the most expensive thing to get wrong, so a
-                // cold entry checks before making it.
+                // reasoning rests on two things, and an infeasibility claim is the most
+                // expensive thing in here to get wrong, so both are checked.
+                //
+                // The basis has to be dual feasible, which a cold entry verifies.
                 if self.dual_steepest && !self.is_dual_feasible() {
+                    return None;
+                }
+                // And the candidate list has to be empty because the model has no
+                // column to offer, not because this factorization cannot pivot on the
+                // ones it has. `supportcase4` reaches a row where every usable column
+                // prices under the pivot tolerance, and calling that dual unboundedness
+                // returned **infeasible for a relaxation whose optimum is 0**. Handing
+                // the basis to the primal loop instead is what the dual method already
+                // does wherever its own invariants have lapsed.
+                if rejected_small {
                     return None;
                 }
                 return Some(LpStatus::Infeasible);
@@ -1502,6 +1530,7 @@ impl<'a> Solver<'a> {
                 // The pivot row and column disagree about this element's magnitude,
                 // which means the inverse has drifted. Rebuild and try again.
                 if let Err(status) = self.refactorize() {
+                    debug_assert_ne!(status, LpStatus::Infeasible, "refactorize claimed infeasibility");
                     return Some(status);
                 }
                 *iterations += 1;
@@ -1979,6 +2008,7 @@ impl<'a> Solver<'a> {
                 || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT))
                 && let Err(status) = self.refactorize()
             {
+                debug_assert_ne!(status, LpStatus::Infeasible, "refactorize claimed infeasibility");
                 return self.done(status, iterations);
             }
         }

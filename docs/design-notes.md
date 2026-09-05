@@ -2660,6 +2660,78 @@ discipline it states is right and was not applied to `mogo`: quote the set that 
 every time. That set is 34, and `neos-787933` -- three runs, three optimal -- is in it
 while `mogo` is not.
 
+### A false proof of infeasibility, three comments below the one warning against it
+
+Chasing the row-heavy group turned this up, and it is the most serious thing in this
+history. `Lp::solve_cold_dual` on `supportcase4` returned **`Infeasible` for a relaxation
+whose optimum is 0.0**. HiGHS agrees the optimum is 0, and so does this solver's own
+primal method, which reaches it in 146485 iterations when it is not handed the dual's
+basis. Our presolve was checked separately and is not the cause: its output solves to 0.0.
+
+`refactorize` is where it came from, and its own doc comment says so:
+
+> The error carries the status to report, and it is never `Infeasible`: failing to
+> factorize a basis says nothing about whether the model has a feasible point. Callers
+> used to collapse any failure to `Infeasible`, which turned a repair that merely ran out
+> of time into a false proof.
+
+Two of its three bail-outs honour that and say so at length -- one names `neos-619167`,
+whose feasible model became "a confident Infeasible". The third is the bottom of the
+function, `Err(LpStatus::Infeasible)`, reached when all `m + 1` repair attempts are used
+up. On `supportcase4` that is 9493 attempts, and running out of them says the arithmetic
+is defeating the repair, not that the model has no feasible point. It now returns
+`IterationLimit`, and the callers `debug_assert` the invariant rather than trusting a
+comment that the function itself broke.
+
+Two things worth carrying from how long this took to find.
+
+The claim was reachable but not reached. `solve_cold_dual` is public, and the search's
+root rescue calls it -- but the rescue accepts only `Optimal`, so a wrong `Infeasible` was
+discarded before it could become a wrong answer. That is luck rather than design: nothing
+in the rescue says it is guarding against a bad verdict, and a second caller written
+against the published signature would have taken it at face value.
+
+And the first attempt at the fix looked like it had failed. `cargo build --release` does
+not rebuild examples, which this history already records, so the check ran against a stale
+`rootlp` and reported the old status. Two further sites were instrumented on the strength
+of that before the binary was rebuilt.
+
+### Where the row-heavy relaxations actually stand
+
+The hypothesis this file left open -- that a basis of 17039 rows holding 751 structural
+columns is nearly all logicals, so `B^-1 a_q` is hyper-sparse where the reverted
+experiment measured 12 to 33% -- is **wrong, and backwards**. Measuring the entering
+column's own solve rather than every `ftran`:
+
+```text
+bley_xl1      17039 x 751     95.6% dense
+supportcase4   4370 x 1112    90.8%
+neos-555001    3474 x 3855    15.1%
+piperout-27   18442 x 11659   24.1%
+```
+
+The row-heavy models are the *densest* of the four. A reachability-driven solve is deader
+there than where it was already rejected, and that lead is closed.
+
+What the group does look like, root relaxation only, on the models as this solver
+presolves them:
+
+```text
+neos-633273   primal 17.7s    dual 3.9s     both optimal, agreeing
+acc-tight4    primal 15.3s    dual  > 100s
+neos-957143   primal 11.7s    dual  > 100s
+neos-960392   primal 22.0s    dual  > 100s
+supportcase4  primal 342s     dual  > 100s
+neos-780889   both > 100s
+bley_xl1      both > 100s
+ex10          both > 100s
+```
+
+So it is not one group. Four of the eight solve their root in 12 to 22 seconds and then
+reach two nodes, which is a node-throughput problem and not a root one; three do not solve
+their root at all; and `neos-633273` is the one where the dual method is 4.5 times quicker
+than the primal on the same model and the same answer.
+
 ### Three of three that was one of six
 
 `neos-3045796-mogo` is the cheapest-looking instance left: its root bound is already the
