@@ -75,6 +75,13 @@ with CBC not closing it at all. The instances the probing budgets were most like
 cost -- `mitre` at 27.5s, `eil33-2` at 32.3s, `irp` at 40.7s, `nw04` at 56.2s, `air03` at
 1.5s -- all still close, and `irp` has more room than the note above credits it with.
 
+**`neos-3045796-mogo` is a coin flip at about two in five, and no cut budget changes
+that.** Its root bound is the optimum before any cut, so it is purely primal, and what
+decides it is whether the parallel search reaches -175. Three settings were measured over
+six runs each -- default 2 of 6, cut pool capped at half the model's rows 3 of 6,
+cut-rounds 5 **1 of 6** -- after a three-run sweep had made cut-rounds 5 look like three
+of three. Do not spend more on it without a plan for the primal side.
+
 **`neos-3045796-mogo` is a coin flip and this file used to claim otherwise.** It has
 closed at 38 to 41 seconds of a 60 second budget in every baseline since it was gained,
 and three runs of the current build close one of three, four runs without the newest

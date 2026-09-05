@@ -2660,6 +2660,48 @@ discipline it states is right and was not applied to `mogo`: quote the set that 
 every time. That set is 34, and `neos-787933` -- three runs, three optimal -- is in it
 while `mogo` is not.
 
+### Three of three that was one of six
+
+`neos-3045796-mogo` is the cheapest-looking instance left: its root bound is already the
+optimum before a single cut, so it is purely primal, and it closes at 38 to 41 seconds of
+a 60 second budget. Making it reliable is the 35th instance.
+
+Tracing the root cut loop on it says where the time goes. It adds 64 cuts a round for
+forty rounds, 2240 of them, and the bound does not move by a digit. They are not
+duplicates -- 2179 of the 2240 are distinct and 1837 are still carried -- so the
+separator keeps finding genuinely new violated cuts on a large optimal face, and the model
+the search then runs on has grown by **82% of its own row count**. `decomp1` reaches 10%
+and `decomp2` 5%, which looked like a clean discriminator and a principled rule: a pool
+that size is replacing the relaxation rather than strengthening it.
+
+Three settings, three runs each, said cut-rounds 5 closed **three of three** at 23 seconds
+against a default of two of four at 37. Six runs each says otherwise:
+
+```text
+default              closed 2 of 6
+cut pool <= rows/2   closed 3 of 6
+cut-rounds 5         closed 1 of 6
+```
+
+The three-of-three was luck, and reverses. None of the settings is distinguishable from
+the default or from each other; `mogo` is a coin flip at roughly two in five whatever the
+cut budget is, because what decides it is whether the parallel search stumbles onto -175,
+and the workers do not visit the tree in the same order twice.
+
+This history already says "repeated runs at sixteen threads spread by several points of
+final gap" and to quote the set that closes every time. What it did not have was a case
+where a three-of-three sweep reversed outright, and that is the useful part: three runs is
+not a measurement of anything on this set, and a change that looks like it converts an
+instance on three runs has not been measured at all. The experiment is reverted.
+
+Also worth keeping, because it retires a plausible-looking rule: flat root rounds are
+**not** waste. `decomp1` and `decomp2` never move their root bound during cutting either,
+and stopping early cost them 50 to 80% when it was tried. Cuts that do nothing at the root
+still bind at nodes below, where more columns are fixed. "The bound is not moving" is
+measuring the wrong thing, which is why the earlier attempt at this failed and why the
+cut-pool version was worth trying instead -- and it fails for a different reason, which is
+that there is nothing there to measure.
+
 ### One seed in a thousand generated no model at all
 
 Sweeping the model generator for a shape that reaches the agreement rule hung it.
