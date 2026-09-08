@@ -55,7 +55,44 @@ loses `neos-1599274` and `irp`, and taking the orbit *of the column pseudocosts 
 strictly better; and a group whose widest orbit is below the usable floor still cost
 `irp` its solve by being re-examined at every node, so it is now dropped once at the root.
 
-## So the next build is the root relaxation, and this is the second measurement saying so
+## The root relaxation was profiled, and it is not what this file predicted
+
+**`Lu::factor` is the largest single item on every model that spends sixty seconds inside
+its first relaxation.** 92% of `cod105`, 47% of `bley_xl1`, 32 to 40% of `ex10`,
+`neos-953928`, `neos-633273` and `cvs16r106-72`. The triangular solves this file has
+pointed at for three sessions are 7 to 11%.
+
+Inside it was a quadratic: the fill-in test searched the column it was updating instead of
+asking a marker, so it cost `|pivot column| * |updated column|` per column touched. On
+`cod105` that was **182 billion operations against 822 million** in the elimination it
+belongs to. Fixed, and the same 8000 iterations go from 57.8 seconds to 9.0. See "The
+fill-in test was quadratic" in `design-notes.md`.
+
+**It converts nothing at sixty seconds and it is in anyway**, on the same grounds the root
+cut loop's warm start was: it is a real fault in the hottest function in the profile.
+`cod105` still reaches one node.
+
+### And what that leaves is the iteration count
+
+`cod105`'s relaxation needs **more than 100,000 simplex iterations on 1024 rows**, and at
+823 a second that is still two minutes. The `cvs16r*` family is the same shape. That is a
+Dantzig pricing symptom, not a factorization one: `Solver::price` scans every column and
+takes the largest reduced cost, the dual method already carries steepest edge weights and
+the primal carries nothing.
+
+**Primal devex is the next build.** One obstacle to know before starting, and it is
+written in `price`'s own comment: Dantzig is doing double duty as a numerical safeguard
+there, because partial pricing was reverted for making the solver report `neos-619167`
+feasible-then-infeasible by entering a column nearly dependent on the basis. Devex keeps
+the full scan and so does not inherit that; a partial devex would. The cost is one extra
+BTRAN and a pass over the columns per iteration to get the pivot row, which is what the
+dual side already pays for its own weights.
+
+Measure it with `cargo run --release --example rootlp`, which runs presolve and the
+relaxation and nothing else, and read iterations per second *and* the iteration count. The
+two moved in opposite directions this session and only reading both showed it.
+
+## The order after that, and this is the second measurement saying so
 
 The order this file used to state was LP throughput, then symmetry, then `mogo`'s primal
 side. LP throughput was closed as a *conversion* lever and symmetry is now closed as one

@@ -286,6 +286,56 @@ The cache holds several entries rather than one, because best-bound selection do
 not visit the tree in an order that keeps a single entry warm. One entry measured an
 8 to 20% hit rate. What recurs is siblings, which share a parent's basis.
 
+### The fill-in test was quadratic, and on a basis that fills in it was everything
+
+Found by profiling the models that spend sixty seconds inside their first relaxation.
+`Lu::factor` is 92% of `cod105`'s, 47% of `bley_xl1`'s and 32 to 40% of `ex10`'s,
+`neos-953928`'s, `neos-633273`'s and `cvs16r106-72`'s. It is the largest single item on
+every one of them, which was not the expectation: the handoff going into this pointed at
+the hyper-sparse triangular solve, and the triangular solves are 7 to 11%.
+
+Inside `factor`, the elimination step asked, for each entry of the pivot column, whether
+the column being updated already held that row -- **by searching that column**. That is
+`|pivot column| * |updated column|` for every column the pivot row touches. It costs
+nothing while the basis stays sparse and everything once fill-in makes it dense, which is
+precisely the case where a factorization is expensive.
+
+Counted rather than guessed, over 8000 iterations:
+
+```text
+                 fill-in test    the elimination it belongs to
+cod105             182,602M            822M
+ex10                   101M           3,006M
+cvs16r106-72            70M              21M
+neos-953928             38M           1,161M
+```
+
+`cod105` is 1024 rows at 56 nonzeros a column and its basis fills in almost completely,
+so the test was 222 times the work of the elimination around it. Stamping the updated
+column's rows into a scratch array and asking that instead makes it linear: 182,602M
+becomes 689M, and the same 8000 iterations go from **57.8 seconds to 9.0**.
+
+The stamp is a `u32` bumped per column rather than a `bool` array cleared per column,
+because clearing is the same `O(m)` the fix exists to remove. Wrapping is safe: a wrap
+can only make a stale stamp collide with the live one, and every row of the live column
+is restamped immediately before it is read.
+
+**It converts nothing at sixty seconds, and it is in anyway.** `cod105` still reaches one
+node, because its relaxation needs more than 100,000 simplex iterations on 1024 rows and
+at 823 a second that is still two minutes. What the change buys is throughput --
+`neos-633273`'s relaxation finishes in 8.9 seconds where a node of it used to cost 17,
+`air04` reaches 100 nodes against 70 -- on the same grounds the root cut loop's warm start
+was taken: the fault was real, it was in the hottest function in the profile, and the
+model it most affects is the one this solver is furthest behind on.
+
+**What that leaves pointing at cod105 is the iteration count, not the iteration cost.**
+100,000 iterations on a 1024-row LP is a Dantzig pricing symptom. `price` scans every
+column and takes the largest reduced cost; the dual method here already has steepest edge
+weights and the primal has nothing. Devex on the primal is the next thing to try on this
+group, and the obstacle to know about first is in `price`'s own comment: Dantzig is doing
+double duty as a numerical safeguard there, and partial pricing was reverted for reporting
+a feasible model infeasible. Devex keeps the full scan, so it does not inherit that.
+
 ### Where the remaining throughput goes
 
 The MIPLIB instances that find no solution are not short of heuristics, they are short of
