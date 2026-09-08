@@ -3,80 +3,85 @@
 Written at the end of a long session so the next one does not start by re-deriving it.
 The reasoning behind every claim here is in `design-notes.md`; this is the index.
 
-## Start here: the automorphism group
+## The automorphism group is built, and it is answered
 
-**This is the next build, and it is the largest one this file has ever proposed.**
+**Do not start here. This was the previous file's "next build" and it is done, measured
+and closed.** `crates/ripsolve/src/symmetry.rs` finds generators of the automorphism
+group of the coefficient matrix, in pure Rust -- no dependency was taken and the README's
+"nothing links against another solver" still holds. `Options::symmetry` uses them when
+branching. It is **off by default because it converts nothing**, and the full reasoning
+is under "Symmetry" in `design-notes.md`.
 
-The instances are `cod105` and `graph20-20-1rand`. Both are closed by SCIP, missed by
-HiGHS, and missed here, which is why they are worth the trouble: whatever does them is a
-technique HiGHS does not have either, so it is not a case of catching up. The evidence
-that symmetry is what does them is direct rather than inferred -- SCIP was asked, by
-turning its own families off one at a time:
-
-```text
-cod105             baseline 57.7s   misc/usesymmetry off -> timeout, gap 1.03
-graph20-20-1rand   baseline  6.1s   misc/usesymmetry off -> timeout, gap 4.61
-```
-
-Nothing else SCIP has moves either one. Where they stand here now: `cod105` reaches **one
-node and proves no bound at all** in sixty seconds, on 1024 rows by 1024 columns;
-`graph20-20-1rand` reaches 45 nodes and a bound of -37 on 5587 by 2183.
-
-### Why the cheap version will not do
-
-The obvious first attempt is interchangeable columns -- two columns identical in the
-matrix and the objective, which can be ordered against each other or merged. **Both models
-have exactly zero duplicate columns.** That was measured, not assumed:
+The detection works and is not the problem:
 
 ```text
-cod105             1024 x 1024   duplicate columns 0   duplicate rows 0
-graph20-20-1rand   5587 x 2183   duplicate columns 0   duplicate rows 0
-neos-787933        1897 x 236376 duplicate columns 170904 (72.3%)
+cod105              11 generators, all 1024 columns in one orbit, 0.07s
+graph20-20-1rand    36 generators, 58 orbits, widest 37, 0.18s
+acc-tight2/4         7 generators, 90 orbits, widest 56, 0.02s
+drayage-25-23       78 generators, widest orbit 1600, 0.58s
 ```
 
-`neos-787933` is in that table as the contrast: it is 72% duplicate columns and it is
-*not* a symmetry instance, it was closed by implied bounds. So duplicate-column detection
-is neither necessary nor sufficient here, and the symmetry in these two is a genuine
-automorphism group of the coefficient matrix. Nothing smaller reaches it.
+33 of the 140 pure binary instances have an orbit at least four columns wide, so this is
+not a two-instance phenomenon either.
 
-### What the build actually is
+**What it ran into is that the models with the widest orbits never reach a second node.**
+`cod105`, whose entire column set is one orbit, reaches one node in sixty seconds and
+proves no bound. So do `neos-953928`, `neos-960392`, `neos-957143`, `neos-780889`,
+`ex10`, `cvs16r106-72`, `cvs16r128-89`, `cvs16r70-62` and `drayage-25-23`. Eight of the
+nine instances that have symmetry *and* that HiGHS closes and this does not are in that
+state. There is no symmetric subtree to collapse because there is no subtree.
 
-Three parts, and the middle one is the reason this has not been started:
+Over 33 symmetric instances at sixty seconds and one thread: nothing converted, nothing
+lost, and a detection cost of 0.1 to 2.6 seconds on every model. Where a tree does exist
+the mechanism does what it should -- `cvs16r89-60` reaches the same bound in 13 nodes
+against 193 -- which is what the option is kept for.
 
-1. **Build the coloured graph.** Rows and columns become vertices, nonzeros become edges,
-   and the colouring has to keep apart anything an automorphism must not exchange:
-   coefficient value, objective coefficient, bounds, row sense and right-hand side. Get
-   the colouring wrong in the permissive direction and every reduction below is unsound.
-2. **Find the generators.** This is graph automorphism -- nauty, bliss, saucy. There is no
-   Rust implementation in this repository and **adding a dependency here is a departure
-   from a stated property of the project**: the README says "Nothing links against another
-   solver", and `Cargo.toml` carries no solver or combinatorics dependency. So this is
-   either a pure-Rust refinement-and-backtracking implementation, which is a real piece of
-   work in its own right, or an explicit decision to take a dependency. That choice should
-   be made deliberately and up front rather than discovered halfway in.
-3. **Use them.** Orbital fixing at a node, or symmetry-breaking constraints from a
-   Schreier-Sims tower, or orbitopal fixing where the group acts as column permutations of
-   a block. SCIP does all three; the first is the cheapest and is probably where to start.
+**No full benchmark was run for this, and none was needed.** With the option off the
+search takes the same path it took before -- detection is not called, and the node depth
+that the open set's tie-break reads is the bound-change count it always was, because only
+an orbital branch appends more than one. The standing below is therefore still
+`binary-2026-09-11.json` and still means what it said.
 
-### Two things measured that will save time
+Three things it rules out, so they are not attempted again: a better automorphism search
+(the group is found in a tenth of a second and finding more of it changes nothing),
+orbitopal fixing or a Schreier-Sims tower on top of it (stronger versions of a reduction
+with nothing to reduce), and the idea that `cod105` and `graph20-20-1rand` are symmetry
+instances *for this solver*. They are root relaxation instances. SCIP needs symmetry for
+them because SCIP gets past the root.
 
-**Cuts are not what this group wants.** Turning SCIP's cuts *off* makes both models
-faster -- `cod105` 57.7s to 11.5, `graph20-20-1rand` 6.1 to 2.3. Do not spend a round on
-cut families for them, and if symmetry handling lands, check whether cutting should be
-turned down on models where a group is found.
+Two faults were found and fixed on the way and are worth knowing about, both in
+`design-notes.md`: the textbook orbital branching rule overrules pseudocost branching and
+loses `neos-1599274` and `irp`, and taking the orbit *of the column pseudocosts chose* is
+strictly better; and a group whose widest orbit is below the usable floor still cost
+`irp` its solve by being re-examined at every node, so it is now dropped once at the root.
 
-**`cod105` proves no bound at all**, so it is not only a search-size problem; its root is
-also going nowhere. Symmetry handling may not be sufficient on its own there even though
-it is necessary for SCIP.
+## So the next build is the root relaxation, and this is the second measurement saying so
 
-### Where it sits in the order
+The order this file used to state was LP throughput, then symmetry, then `mogo`'s primal
+side. LP throughput was closed as a *conversion* lever and symmetry is now closed as one
+too, and **both closed onto the same thing**: a group of instances that spend sixty
+seconds inside their first relaxation.
 
-The order asked for was LP throughput, then symmetry, then `neos-3045796-mogo`'s primal
-side. The first is done and is closed as a *conversion* lever -- it produced the largest
-throughput change in the project (see "The root cut loop was solving the model cold every
-round") and converted nothing, and the group behind it does not close at five times the
-time limit. So symmetry is next, and `mogo` after it, where the note to read first is that
-no cut budget moves it and it needs a primal idea.
+The specific hypothesis to test first is already written down at the bottom of this file
+under "The one place the remaining conversions are", and it has not been tried: the
+hyper-sparse triangular solve, reverted once on the measured grounds that `B^-1 a_q` runs
+12 to 33% dense, where that measurement was taken on column-rich models and the models
+that need it are row-heavy. The note there also records how the second attempt at
+measuring it was wasted -- by counting every `ftran` including the dense `B^-1 b`, which
+read 95% everywhere and means nothing. **The measurement has to isolate the entering
+column's solve.**
+
+What is new since that was written is the size of the group it would serve. It is not the
+four models named there. Adding the symmetric instances that stop at one node, the list
+of models whose sixty seconds go into a relaxation that does not finish is at least:
+
+```text
+cod105  ex10  neos-953928  neos-960392  neos-957143  neos-780889  cvs16r106-72
+cvs16r128-89  cvs16r70-62  drayage-25-23  drayage-100-23  chromaticindex128-5
+bley_xl1  supportcase4  neos-633273  air04  tanglegram6
+```
+
+Six of those are instances HiGHS closes and this does not.
 
 ## Where the dual work had got to when it stopped
 
@@ -328,8 +333,11 @@ tanglegram6                nothing in particular
 ```
 
 **The symmetric pair needs a real automorphism group** -- neither has a single duplicate
-column, so no cheap detection reaches it. Note also that turning SCIP's cuts *off* makes
-both faster, `cod105` 57.7s to 11.5. Cuts are not what that group wants.
+column, so no cheap detection reaches it. It was built and it is not the answer *here*;
+see the top of this file. `cod105`'s whole column set comes back as one orbit in 0.07
+seconds and the model still reaches one node in sixty. Note also that turning SCIP's cuts
+*off* makes both faster, `cod105` 57.7s to 11.5. Cuts are not what that group wants
+either, which is a second sign that what it wants is a relaxation it can finish.
 
 **`neos-787933` closes, and HiGHS does not close it.** Its relaxation was weak by
 construction: 1764 big-M linking rows, LP 3.0 against an optimum of 30. Three things
@@ -527,6 +535,10 @@ pump, fixing with propagation and the LP-free jump all running and all returning
   `binary-2026-09-02c.json`, the one before the root work as `binary-2026-09-02.json` and
   the one before probing as `binary-2026-09-01.json`. Diff against those rather than
   against a remembered number, and copy the current one aside before a run that matters.
+- `cargo run --release --example symmetry -- <models>` reports each model's automorphism
+  group and what finding it cost, with `--seconds=`, `--stall-work=` and
+  `--max-vertices=` setting the budget. Use it in preference to a solve for anything
+  about symmetry: the whole local set takes minutes and has no search noise on it.
 - `cargo run --release --example probecost -- <models>` times presolve with and without
   probing on the same model and reports both reductions. Use it in preference to a solve
   for anything about presolve: it is seconds rather than an hour, and it has no search

@@ -89,6 +89,7 @@ Useful flags for `solve`:
 | `--local-cut-frequency <n>` | Separate cuts at one node in every `n`. Default 10, `0` disables |
 | `--cut-rounds <n>` | Rounds of root cut separation. Default 0 |
 | `--no-presolve` | Skip presolve |
+| `--symmetry` | Find the model's automorphism group and branch on its orbits. Off: it converts nothing on MIPLIB's binary set |
 | `--values <none\|nonzero\|all>` | Print column values, one per line |
 | `--solution <PATH>` | Write the solution to a file as `name value` lines |
 | `-v` | Shorthand for `--values nonzero` |
@@ -385,6 +386,7 @@ solver.
 | `samples/` | Example models in LP and MPS format |
 | `bench/` | Benchmark and fixture-refresh tooling |
 | `docs/design-notes.md` | Why the solver is built the way it is |
+| `docs/handoff.md` | Where the work stands and what to do next |
 
 ## Licence
 

@@ -25,6 +25,7 @@ use crate::heuristic::{self, Limits, Schedule};
 use crate::lp::{BasisState, Lp, LpSolution, LpStatus};
 use crate::model::Problem;
 use crate::presolve::{self, Outcome};
+use crate::symmetry::{self, OrbitScratch, Symmetry};
 
 /// How a search ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +191,27 @@ pub struct Options {
     /// 100. See `branch.rs` for why it was catastrophic under depth-first search
     /// and is merely unprofitable now.
     pub strong_branching_budget: usize,
+    /// Whether to look for the model's automorphism group and use its orbits when
+    /// branching.
+    ///
+    /// **Defaults to off, and the reason is a measurement rather than a doubt about the
+    /// reduction.** Over the 33 symmetric instances of the local MIPLIB set at sixty
+    /// seconds it converts nothing, and it costs between 0.1 and 2.6 seconds of
+    /// detection on every model it runs on. The instances with the widest orbits --
+    /// `cod105` at 1024 columns in one orbit, `neos-953928`, `neos-960392`, `ex10` --
+    /// reach one node in sixty seconds, so there is no symmetric subtree for it to
+    /// collapse. See "Symmetry" in `design-notes.md` for the whole table.
+    ///
+    /// Turn it on for a model whose search runs and whose tree looks like it is
+    /// enumerating the same thing repeatedly. The reduction is real when there is a tree
+    /// to apply it to: `cvs16r89-60` reaches the same bound in 13 nodes against 193.
+    pub symmetry: bool,
+    /// Smallest orbit worth branching on rather than branching on a column.
+    ///
+    /// An orbit of two saves at most half a subtree and gives up the pseudocosts that
+    /// choose between the two columns, so the floor is worth having above the smallest
+    /// orbit that exists.
+    pub symmetry_min_orbit: usize,
 }
 
 impl Default for Options {
@@ -217,6 +239,8 @@ impl Default for Options {
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
+            symmetry: false,
+            symmetry_min_orbit: 4,
         }
     }
 }
@@ -358,7 +382,7 @@ impl OpenNodes {
         while let Some(node) = self.plunge.pop() {
             let key = Key {
                 bound: node.bound,
-                depth: node.fixings.len(),
+                depth: node.depth,
             };
             let id = self.store.len();
             self.store.push(Some(node));
@@ -447,6 +471,14 @@ struct Worker<'a> {
     /// Integer columns this pass arrived with still free, which is what a restart's
     /// worth is measured against.
     free_at_entry: usize,
+    /// The model's column symmetry, and the working space for the orbits of a single
+    /// node's stabilizer. Empty when the model has none or the option is off, in which
+    /// case [`Worker::orbital_zero_side`] returns on its first line.
+    symmetry: &'a Symmetry,
+    orbits: OrbitScratch,
+    /// The columns this node branched on, rebuilt per node into a buffer the worker
+    /// keeps so that asking for a stabilizer costs no allocation.
+    branched: Vec<u32>,
 }
 
 impl<'a> Worker<'a> {
@@ -484,7 +516,13 @@ impl<'a> Worker<'a> {
         decided * 100 >= free * options.restart_share
     }
 
-    fn new(problem: &'a Problem, lp: Lp, options: Options, lurking: &'a Lurking) -> Self {
+    fn new(
+        problem: &'a Problem,
+        lp: Lp,
+        options: Options,
+        lurking: &'a Lurking,
+        symmetry: &'a Symmetry,
+    ) -> Self {
         let n = problem.n_cols();
         Self {
             problem,
@@ -502,7 +540,120 @@ impl<'a> Worker<'a> {
                 .integer_columns()
                 .filter(|&j| problem.col_lb[j] < problem.col_ub[j])
                 .count(),
+            symmetry,
+            orbits: OrbitScratch::new(n),
+            branched: Vec::new(),
         }
+    }
+
+    /// The orbit to send to zero on the down side of a branch on `column`.
+    ///
+    /// Where a group element carries column `j` onto column `h` and fixes everything
+    /// this node has already branched on, a solution with `x_j = 1` maps to one with
+    /// `x_h = 1` that is feasible here and worth the same. So `x_h = 1` covers the whole
+    /// of "some column of the orbit is 1", and its complement -- the down side of the
+    /// branch -- can send the *entire* orbit to zero rather than `h` alone:
+    ///
+    /// ```text
+    ///     x_h >= 1                against       x_j = 0 for every j in h's orbit
+    /// ```
+    ///
+    /// Returns the orbit, or `None` when the model has no symmetry here or the orbit is
+    /// too narrow to be worth the bookkeeping.
+    ///
+    /// # Why this shape and not a branch of its own
+    ///
+    /// The first version of this chose the orbit *and* the column, taking the widest
+    /// orbit at the node and branching on it in place of what [`branch::select`] wanted.
+    /// That is the textbook rule and on this set it loses: `neos-1599274` goes from a
+    /// 35 second proof at twelve nodes to a timeout at fifty, because fixing one column
+    /// of a fifty-wide orbit to one is a branch the relaxation hardly notices, and the
+    /// bound stops climbing. Pseudocosts are choosing well and there is nothing to be
+    /// gained by overruling them.
+    ///
+    /// Taking the orbit *of the column they chose* keeps their decision -- the up child
+    /// is exactly the up child that rule would have made -- and strengthens only the
+    /// down one, which can only prune more. Strong branching's forced side survives it
+    /// for the same reason: if no improving solution has `x_h >= 1`, then by the mapping
+    /// above none has `x_j = 1` for any `j` in the orbit either.
+    ///
+    /// # Why the rest of the search does not invalidate this
+    ///
+    /// The group is found on the presolved model, and two things happen to that model
+    /// afterwards which look like they should break the argument and do not.
+    ///
+    /// Cuts add rows the group knows nothing about. They are valid inequalities, so
+    /// they remove no integer point, and the mapping above is only ever applied to an
+    /// integer solution.
+    ///
+    /// Reduced cost fixing tightens column bounds asymmetrically -- it may pin `j` and
+    /// leave `h` free. What it proves, though, is a statement about every solution
+    /// better than the incumbent, and that set is carried onto itself by the group,
+    /// since the group preserves both feasibility and the objective. So the image of an
+    /// improving solution is an improving solution and satisfies those bounds too.
+    fn orbital_zero_side(&mut self, node: &Node, column: usize) -> Option<Vec<u32>> {
+        if self.symmetry.is_trivial() {
+            return None;
+        }
+        // A binary dichotomy: the up side has to be `x = 1` for the mapping to have
+        // anywhere to send a column of the orbit that is one.
+        if !self.problem.is_integer(column)
+            || self.problem.col_lb[column] < 0.0
+            || self.problem.col_ub[column] > 1.0
+        {
+            return None;
+        }
+        self.branched.clear();
+        self.branched
+            .extend(node.fixings.iter().map(|&(j, _, _)| j));
+        self.symmetry
+            .stabilizer_orbits(&self.branched, &mut self.orbits);
+
+        // Nothing this node's stabilizer moves is in an orbit of more than one, so a
+        // column it does not move is alone in its own and there is nothing to collect.
+        if self.orbits.moved().binary_search(&(column as u32)).is_err() {
+            return None;
+        }
+        let representative = self.orbits.representative(column as u32);
+        let moved: Vec<u32> = self.orbits.moved().to_vec();
+        let mut orbit = Vec::new();
+        for j in moved {
+            if self.orbits.representative(j) == representative {
+                // A column the group can exchange with a binary one is binary, but the
+                // orbit is checked rather than assumed: everything below fixes it to
+                // zero, and a general integer has no `all zero` side.
+                if !self.problem.is_integer(j as usize)
+                    || self.problem.col_lb[j as usize] < 0.0
+                    || self.problem.col_ub[j as usize] > 1.0
+                {
+                    return None;
+                }
+                orbit.push(j);
+            }
+        }
+        // The invariance test above this catches an orbit taken from the wrong group --
+        // the whole group instead of this node's stabilizer turns `pack 9x5` infeasible.
+        // It does *not* catch an orbit with one column too many in it, which is the same
+        // lesson reduced cost fixing recorded: an outcome test sees a proof wrong in kind
+        // and not one wrong at the margin. So the property is asserted directly. An orbit
+        // is a set the group cannot leave, and that is checkable in a line.
+        debug_assert!(
+            {
+                let members: std::collections::HashSet<u32> = orbit.iter().copied().collect();
+                self.symmetry
+                    .generators
+                    .iter()
+                    .zip(&self.symmetry.supports)
+                    .all(|(generator, support)| {
+                        support.iter().any(|&j| self.branched.contains(&j))
+                            || members
+                                .iter()
+                                .all(|j| members.contains(&generator[*j as usize]))
+                    })
+            },
+            "orbit is not closed under the generators that fix this node's branching",
+        );
+        (orbit.len() >= self.options.symmetry_min_orbit).then_some(orbit)
     }
 
     /// Solve one node and decide what becomes of it.
@@ -746,16 +897,27 @@ impl<'a> Worker<'a> {
                 };
                 sides.retain(|&(lo, hi)| lo <= hi);
 
+                // The down side sends the chosen column's whole orbit to zero where
+                // there is one; see `orbital_zero_side`. Asked once, because the orbit
+                // does not depend on which side is being built.
+                let orbit = self.orbital_zero_side(node, column);
+
                 for (lo, hi) in sides {
                     let mut fixings = node.fixings.clone();
-                    fixings.push((column as u32, lo, hi));
                     // `up` is the side that raised the lower bound.
                     let went_up = lo > value.floor();
+                    match &orbit {
+                        Some(orbit) if !went_up => {
+                            fixings.extend(orbit.iter().map(|&j| (j, 0.0, 0.0)));
+                        }
+                        _ => fixings.push((column as u32, lo, hi)),
+                    }
                     out.children.push(Node {
                         fixings,
                         bound,
                         basis: solved.basis.clone(),
                         origin: Some((column, went_up, solved.objective, decision.fraction)),
+                        depth: node.depth + 1,
                     });
                 }
             }
@@ -933,6 +1095,7 @@ fn run_parallel(
     incumbent_x: Option<Vec<f64>>,
     threads: usize,
     lurking: &Lurking,
+    symmetry: &Symmetry,
 ) -> TreeResult {
     let shared = Shared {
         pool: Mutex::new(SharedPool {
@@ -957,7 +1120,7 @@ fn run_parallel(
             // bounds, and its own branching history. Sharing the pseudocosts would
             // pool more evidence but put a lock on the hot path; per-worker history
             // is the cheaper trade at these thread counts.
-            let mut worker = Worker::new(problem, lp.clone(), options, lurking);
+            let mut worker = Worker::new(problem, lp.clone(), options, lurking, symmetry);
             let shared = &shared;
             scope.spawn(move || {
                 while let Some(node) = shared.take() {
@@ -1098,6 +1261,13 @@ struct Node {
     /// parent fractional value)`. Recorded so that solving this node measures the
     /// real cost of that branching decision and feeds it back.
     origin: Option<(usize, bool, f64, f64)>,
+    /// Branches taken to reach this node, which is not the same as `fixings.len()`.
+    ///
+    /// An orbital branch fixes a whole orbit on one side, so it appends as many bound
+    /// changes as the orbit is wide while descending a single level. The open set's
+    /// tie-break is a statement about how far down the tree a node is, so it reads this
+    /// rather than counting bound changes.
+    depth: usize,
 }
 
 /// Solve a mixed-integer program to proven optimality.
@@ -1476,6 +1646,41 @@ fn solve_once(
         (problem, None)
     };
 
+    // The group is looked for here, on the presolved model, and not later. Later the
+    // model has cuts on it and reduced cost fixing in it, and both of those hide
+    // symmetry the model really has -- an asymmetric bound tightening splits an orbit
+    // that every solution better than the incumbent still respects. Neither of them
+    // invalidates what is found here; the argument is in [`Worker::orbital_zero_side`].
+    let symmetry = if options.symmetry {
+        let found = symmetry::detect(
+            problem,
+            symmetry::Budget {
+                max_work: SYMMETRY_MAX_WORK,
+                time: Some(Duration::from_secs_f64(SYMMETRY_SECONDS)),
+                max_vertices: SYMMETRY_MAX_VERTICES,
+                stall_work: SYMMETRY_STALL_WORK,
+            },
+        );
+        // A stabilizer's orbits are contained in the whole group's, so a group whose
+        // widest orbit is already too narrow to branch on can never produce a usable one
+        // at any node. Dropping it here rather than rediscovering that per node is what
+        // `irp` needs: 312 generators whose widest orbit is three columns, asked about
+        // at every one of three thousand nodes, cost it a solve it otherwise closes.
+        let widest = found
+            .nontrivial_orbits()
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if widest >= options.symmetry_min_orbit {
+            found
+        } else {
+            Symmetry::default()
+        }
+    } else {
+        Symmetry::default()
+    };
+
     let _ = problem.n_cols();
     let mut lp = Lp::relaxation(problem).with_tolerances(crate::lp::Tolerances {
         refactor_interval: options.refactor_interval,
@@ -1769,6 +1974,7 @@ fn solve_once(
         bound: root_bound,
         basis: root.basis.clone(),
         origin: None,
+        depth: 0,
     });
     let mut heuristic_solutions = 0usize;
     // Nodes whose LP never resolved. Any of them could hold the optimum.
@@ -2012,6 +2218,7 @@ fn solve_once(
             incumbent_x,
             threads,
             &lurking,
+            &symmetry,
         );
         nodes += result.nodes;
         iterations += result.iterations;
@@ -2050,7 +2257,7 @@ fn solve_once(
         return Attempt { solution, restart };
     }
 
-    let mut worker = Worker::new(problem, lp, options, &lurking);
+    let mut worker = Worker::new(problem, lp, options, &lurking, &symmetry);
     let mut restart_wanted = false;
 
     while let Some(node) = open.pop() {
@@ -2253,6 +2460,24 @@ const AGGREGATION_SHARE: usize = 4;
 /// second here, so this only has to be wide enough not to cut off a model that is still
 /// paying its way.
 const PRESOLVE_SHARE: f64 = 0.4;
+
+/// What looking for the automorphism group may spend.
+///
+/// Not a share of the time limit and not a multiple of the matrix, which are the two
+/// things this file has repeatedly mistaken for budgets. It is a cap on the individual-
+/// ization search itself, because that is the part whose cost is unbounded: refinement
+/// on a model with no symmetry finishes in one pass and reports nothing, and it is the
+/// models with a large group and an awkward one that can be searched for a long time.
+/// The seconds are the backstop for a model where a node is expensive rather than
+/// numerous.
+const SYMMETRY_MAX_WORK: usize = 400_000_000;
+const SYMMETRY_SECONDS: f64 = 2.0;
+const SYMMETRY_STALL_WORK: usize = 150_000_000;
+
+/// Vertices above which the graph is not built. Refinement is linear in the edges per
+/// splitter, so proving a very large model asymmetric is not free, and a model this size
+/// is not one the search reaches a symmetric subtree of anyway.
+const SYMMETRY_MAX_VERTICES: usize = 1_500_000;
 
 /// How far the bounds are moved when a relaxation has stalled.
 ///
@@ -3085,6 +3310,7 @@ mod tests {
             bound,
             basis: lp.solve().basis,
             origin: None,
+            depth,
         }
     }
 

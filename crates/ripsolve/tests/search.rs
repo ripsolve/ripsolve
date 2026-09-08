@@ -263,7 +263,12 @@ fn presolve_does_not_change_any_optimum() {
                 "{file}: the point presolve returned is not feasible for the original"
             );
             let restated = problem.objective_value(
-                problem.obj.iter().zip(&with.x).map(|(c, v)| c * v).sum::<f64>(),
+                problem
+                    .obj
+                    .iter()
+                    .zip(&with.x)
+                    .map(|(c, v)| c * v)
+                    .sum::<f64>(),
             );
             assert!(
                 (restated - reported).abs() < 1e-6,
@@ -382,4 +387,226 @@ fn parallel_search_respects_a_node_limit() {
         "ran {} nodes past a limit of 20",
         solution.nodes
     );
+}
+
+/// Colour `n_vertices` with `k` interchangeable colours, minimizing colours used.
+///
+/// The textbook symmetric model: any relabelling of the colours carries a colouring onto
+/// another one worth the same, so every vertex's columns are one orbit `k` wide and the
+/// tree without symmetry handling enumerates the same colouring `k!` ways.
+fn colouring(edges: &[(usize, usize)], n_vertices: usize, k: usize) -> Problem {
+    use ripsolve::model::{Builder, RowSense, Sense};
+    let mut model = Builder::new(Sense::Minimize).named("colouring");
+    let used: Vec<usize> = (0..k).map(|c| model.binary(&format!("w{c}"))).collect();
+    let mut x = vec![Vec::new(); n_vertices];
+    for v in 0..n_vertices {
+        for c in 0..k {
+            x[v].push(model.binary(&format!("x{v}_{c}")));
+        }
+    }
+    model.objective(&used.iter().map(|&c| (c, 1.0)).collect::<Vec<_>>());
+    for row in &x {
+        let terms: Vec<(usize, f64)> = row.iter().map(|&c| (c, 1.0)).collect();
+        model.row(&terms, RowSense::Eq, 1.0);
+    }
+    for &(u, v) in edges {
+        for c in 0..k {
+            model.row(
+                &[(x[u][c], 1.0), (x[v][c], 1.0), (used[c], -1.0)],
+                RowSense::Le,
+                0.0,
+            );
+        }
+    }
+    model.build()
+}
+
+/// Bin packing with interchangeable bins: every item in exactly one, a bin costs one if
+/// anything is in it.
+fn packing(weights: &[f64], n_bins: usize, capacity: f64) -> Problem {
+    use ripsolve::model::{Builder, RowSense, Sense};
+    let mut model = Builder::new(Sense::Minimize).named("packing");
+    let open: Vec<usize> = (0..n_bins)
+        .map(|b| model.binary(&format!("y{b}")))
+        .collect();
+    let mut x = vec![Vec::new(); weights.len()];
+    for i in 0..weights.len() {
+        for b in 0..n_bins {
+            x[i].push(model.binary(&format!("x{i}_{b}")));
+        }
+    }
+    model.objective(&open.iter().map(|&c| (c, 1.0)).collect::<Vec<_>>());
+    for row in &x {
+        let terms: Vec<(usize, f64)> = row.iter().map(|&c| (c, 1.0)).collect();
+        model.row(&terms, RowSense::Eq, 1.0);
+    }
+    for b in 0..n_bins {
+        let mut terms: Vec<(usize, f64)> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| (x[i][b], w))
+            .collect();
+        terms.push((open[b], -capacity));
+        model.row(&terms, RowSense::Le, 0.0);
+    }
+    model.build()
+}
+
+#[test]
+fn branching_on_an_orbit_does_not_change_any_optimum() {
+    use ripsolve::symmetry::{self, Budget};
+
+    // Sending a branch's whole orbit to zero on its down side rests on a claim about
+    // solutions nobody has seen: that anything the discarded columns could have reached,
+    // a relabelling reaches through the representative instead. A claim like that fails
+    // silently -- the search reports the second best answer and proves it optimal -- so
+    // it is checked against the same search with the reduction off rather than against a
+    // recorded value.
+    //
+    // Purpose-built models, because the reduction only acts where there is symmetry and
+    // the generated families have almost none.
+    let models = [
+        (
+            "pack 9x5",
+            packing(&[6.0, 5.0, 5.0, 4.0, 4.0, 3.0, 3.0, 2.0, 2.0], 5, 9.0),
+        ),
+        (
+            "pack 12x6",
+            packing(
+                &[7.0, 6.0, 6.0, 5.0, 5.0, 4.0, 4.0, 3.0, 3.0, 2.0, 2.0, 1.0],
+                6,
+                9.0,
+            ),
+        ),
+        // Distinct weights, so every item is an orbit class of its own and the model has
+        // many narrow orbits rather than one wide one. That is what makes it sensitive
+        // to an orbit with a column in it that does not belong.
+        (
+            "pack distinct 10x5",
+            packing(&[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.0], 5, 12.0),
+        ),
+        (
+            "pack distinct 11x4",
+            packing(
+                &[10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.0],
+                4,
+                16.0,
+            ),
+        ),
+        ("colour C5 k5", colouring(&five_cycle(), 5, 5)),
+        ("colour Petersen k5", colouring(&petersen(), 10, 5)),
+        ("colour Petersen k6", colouring(&petersen(), 10, 6)),
+    ];
+
+    // Cuts and heuristics off, because with them on every one of these closes at the
+    // root and the branching rule never runs at all. That is worth stating plainly: the
+    // first version of this test used the default options, passed, and tested nothing.
+    let bare = Options {
+        cut_rounds: 0,
+        local_cut_frequency: 0,
+        heuristic_frequency: 0,
+        improvement_frequency: 0,
+        jump_moves: 0,
+        ..Options::default()
+    };
+
+    for (name, problem) in models {
+        let found = symmetry::detect(&problem, Budget::default());
+        let widest = found
+            .nontrivial_orbits()
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest >= 4,
+            "{name}: widest orbit {widest}, so this model no longer exercises the rule"
+        );
+
+        let with = search::solve(
+            &problem,
+            Options {
+                symmetry: true,
+                ..bare
+            },
+        );
+        let without = search::solve(
+            &problem,
+            Options {
+                symmetry: false,
+                ..bare
+            },
+        );
+
+        assert_eq!(with.status, Status::Optimal, "{name}");
+        assert_eq!(without.status, Status::Optimal, "{name}");
+        assert!(
+            with.nodes > 1,
+            "{name}: closed at the root, so nothing branched"
+        );
+        let (a, b) = (with.objective.unwrap(), without.objective.unwrap());
+        assert!((a - b).abs() < 1e-6, "{name}: orbits {a}, plain {b}");
+        // And the answer it hands back has to be a real assignment, not the image of one
+        // under a relabelling that was never applied to it.
+        assert_solution_is_valid(&problem, &with.x, a, name);
+    }
+}
+
+fn five_cycle() -> Vec<(usize, usize)> {
+    (0..5).map(|i| (i, (i + 1) % 5)).collect()
+}
+
+fn petersen() -> Vec<(usize, usize)> {
+    let mut edges: Vec<(usize, usize)> = (0..5).map(|i| (i, (i + 1) % 5)).collect();
+    edges.extend((0..5).map(|i| (i, i + 5)));
+    edges.extend((0..5).map(|i| (5 + i, 5 + (i + 2) % 5)));
+    edges
+}
+
+#[test]
+fn orbits_do_not_change_the_optimum_of_any_fixture() {
+    // The models above are the ones with symmetry to find; these are the ones without,
+    // and they are here because the reduction has to be inert on them rather than merely
+    // unhelpful. A group found where there is none would show up here and nowhere else.
+    let data = fixtures();
+    let samples = data["samples"].as_array().unwrap().iter().map(|entry| {
+        let file = entry["file"].as_str().unwrap().to_string();
+        (
+            Problem::from_file(&samples_dir().join(&file)).unwrap(),
+            file,
+        )
+    });
+    let generated = data["instances"].as_array().unwrap().iter().map(|entry| {
+        let spec = spec_of(entry);
+        let name = entry["name"].as_str().unwrap().to_string();
+        (
+            Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap(),
+            name,
+        )
+    });
+    for (problem, file) in samples.chain(generated) {
+        let with = search::solve(
+            &problem,
+            Options {
+                symmetry: true,
+                ..Options::default()
+            },
+        );
+        let without = search::solve(
+            &problem,
+            Options {
+                symmetry: false,
+                ..Options::default()
+            },
+        );
+
+        assert_eq!(with.status, without.status, "{file}");
+        match (with.objective, without.objective) {
+            (Some(a), Some(b)) => {
+                assert!((a - b).abs() < 1e-6, "{file}: orbits {a}, plain {b}")
+            }
+            (None, None) => {}
+            (a, b) => panic!("{file}: orbits {a:?}, plain {b:?}"),
+        }
+    }
 }

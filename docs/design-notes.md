@@ -2916,3 +2916,142 @@ Circular verification. A check written to confirm two pivot orderings agreed com
 a shortlist against a stable sort of the same ordering it came from, so it could not
 detect the difference it existed to find. Ground truth has to come from somewhere the
 code under test did not produce it.
+
+## Symmetry
+
+Built this session, sound, tested, fast, and **off by default because it converts
+nothing**. The reduction is real; the models it is real on are not short of it. What
+follows is the whole measurement, so that the next attempt starts from it rather than
+from the idea.
+
+### Detection
+
+`symmetry.rs` finds generators of the automorphism group of the model's coefficient
+matrix, in pure Rust. Nothing was linked against; the README's "nothing links against
+another solver" still holds and no combinatorics dependency was taken.
+
+Rows and columns become vertices and nonzeros become edges. The colouring carries
+everything an automorphism must not exchange -- a row's two bounds, a column's objective
+coefficient, bounds and integrality, and the value of a coefficient. Coefficient values
+are edge labels rather than vertex ones, and are handled by subdividing: a nonzero whose
+value is not the model's commonest gets a vertex of its own between its row and its
+column. On the usual all-ones matrix that is no extra vertices at all. Values are
+compared by exact bit pattern, because merging two that differ slightly would claim a
+symmetry the model does not have and every reduction downstream would inherit it.
+
+The search is individualization and refinement, the nauty family, and deliberately not a
+complete implementation of one: no canonical form, and prunings that can lose generators.
+That is the right trade because of an asymmetry in the use. **Every generator is checked
+against the graph before it is returned**, so anything reported is a true automorphism
+and everything built on it stays sound, while missing one costs only reduction. The
+search can therefore be cut off mid-way and what it has is still usable.
+
+It works, and it is fast where it matters:
+
+```text
+cod105              1024 x 1024    11 generators, one orbit of all 1024 columns, 0.07s
+graph20-20-1rand    5587 x 2183    36 generators, 58 orbits, widest 37, 0.18s
+acc-tight2/4        1620 columns    7 generators, 90 orbits, widest 56, 0.02s
+drayage-25-23      11090 columns   78 generators, widest orbit 1600, 0.58s
+```
+
+Over the 235 locally held instances, 41 of the first 69 have a nontrivial group, and 33
+of the 140 pure binary set have an orbit at least four columns wide. So this is not a
+two-instance phenomenon.
+
+### What the budget had to become
+
+Three attempts, and the first two are the same two mistakes this file keeps recording.
+
+A cap on *nodes* prices nothing: refinement walks the edges of whatever cell it splits
+by, so one node on `nw04` at 636k nonzeros costs what a hundred cost on `cod105`. A cap
+that resets on every *generator* prices the wrong progress: `irp` yields 312 generators
+whose widest orbit is three columns and `ex9` yields 100 whose widest is two, and neither
+is worth branching on, so a budget that resets on a generator searches both to the end of
+the clock -- 3.2 and 4.0 seconds for nothing.
+
+What the budget is now is work -- an edge walked by the refinement, or a vertex copied
+when the search branches, because on this set either can dominate. `ex10` spends 185
+million walking edges before the search starts; `neos-787933` spends almost none and
+branches ten thousand times over a partition of 240 thousand vertices, which is why it
+sat at 34 seconds under a node budget. And it resets on the only progress that matters,
+the widest column orbit getting wider. With that, detection costs at most 2.6 seconds on
+the whole local set and under 1.5 on nearly all of it.
+
+### Using it, and the version that lost two instances
+
+The textbook rule is orbital branching: take an orbit of the subgroup fixing everything
+branched on so far, and split it into `x_h = 1` against `all of the orbit is 0`, which
+replaces as many children as the orbit is wide with two. That was built first and it
+**loses**:
+
+```text
+neos-1599274    optimal in 35.2s at 12 nodes  ->  timeout at 50 nodes
+neos18          incumbent 26, bound 11        ->  incumbent 32, bound 10
+irp             optimal in 55.2s              ->  timeout
+```
+
+Two separate faults, both instructive.
+
+Fixing one column of a fifty-wide orbit to one is a branch the relaxation hardly
+notices, so on `neos-1599274` the bound stops climbing. Pseudocosts were choosing well
+and there was nothing to gain by overruling them. The fix is to take the orbit **of the
+column they chose** rather than choosing the column: the up child is then exactly the up
+child the ordinary rule would have made, and only the down side is strengthened, from
+`x_c = 0` to `every column of c's orbit is 0`. That can only prune more, and it restored
+`neos-1599274` to optimal at two nodes.
+
+`irp` was worse and had nothing to do with branching at all. Its widest orbit is three
+columns, below the floor at which any orbit is used, so the rule never fired -- and
+asking for a node's stabilizer at each of three thousand nodes still cost it the solve.
+A stabilizer's orbits are contained in the whole group's, so a group whose widest orbit
+is already too narrow can never produce a usable one at any node, and it is now dropped
+once at the root instead of being re-examined per node.
+
+### The result, and why it is a negative one
+
+With both fixed, over 33 symmetric instances at sixty seconds and one thread: **no
+instance converts, and none is lost.** What remains is the detection cost.
+
+```text
+converted            none
+lost                 none
+slower by detection  decomp1 1.2 -> 2.9   decomp2 2.1 -> 3.5   neos-1516309 0.6 -> 1.7
+                     ex9 22.7 -> 24.4     nw04 53.8 -> 55.9    awarau 2.3 -> 4.9
+fewer nodes, same    cvs16r89-60 193 -> 13 nodes, bound -87 either way
+```
+
+**The reason is not that the reduction is weak. It is that the models with the widest
+orbits never reach a second node.** `cod105`, whose whole 1024 columns are one orbit,
+reaches one node in sixty seconds and proves no bound. So do `neos-953928`,
+`neos-960392`, `neos-957143`, `neos-780889`, `ex10`, `cvs16r106-72`, `cvs16r128-89`,
+`cvs16r70-62` and `drayage-25-23`. Eight of the nine instances in the addressable set
+that have symmetry *and* that HiGHS closes are in that state. There is no symmetric
+subtree to collapse because there is no subtree.
+
+This is the same conclusion the root relaxation work reached from the other direction,
+and it is now reached from a second one. The handoff before this session guessed it for
+`cod105` alone -- "proves no bound at all, so it is not only a search-size problem" --
+and it is true of nearly the whole group.
+
+Where a tree does exist the mechanism does what it should: `cvs16r89-60` reaches the same
+bound in 13 nodes against 193. It is kept, and `Options::symmetry` turns it on, for
+exactly that case.
+
+### What this rules out for the next attempt
+
+- **Do not build a better automorphism search.** The group is found in a tenth of a
+  second on the instances that motivated this, and finding more of it changes nothing.
+- **Do not build orbitopal fixing or Schreier-Sims towers on top of this.** They are
+  stronger versions of a reduction that has nothing to reduce here.
+- **`cod105` and `graph20-20-1rand` are not symmetry instances as far as this solver is
+  concerned; they are root relaxation instances.** SCIP needs symmetry for them because
+  SCIP gets past the root. Turning SCIP's cuts off makes both faster, which was already
+  recorded, and is a second sign that what those models want is a cheaper relaxation.
+- The one thing here that would pay is a use of the group that does not need a tree: a
+  reduction that strengthens the *root bound*. Static symmetry breaking is the candidate
+  and the cheap sound form of it is weak -- for a generator `g`, the lexicographically
+  largest member of an orbit satisfies `x_i >= x_{g^-1(i)}` at the first index `i` that
+  `g` moves, which is one inequality per generator and eleven rows on `cod105`. It was
+  not built, because a bound that needs a relaxation that does not finish is not worth
+  eleven rows.

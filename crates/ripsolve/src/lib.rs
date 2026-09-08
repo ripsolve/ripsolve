@@ -110,6 +110,7 @@ pub mod presolve;
 pub mod reader;
 pub mod search;
 pub mod sparse;
+pub mod symmetry;
 
 pub use model::{Builder, ModelError, Problem, RowSense, Sense, VarType};
 pub use reader::{Format, ReadError};

@@ -78,6 +78,14 @@ enum Command {
         /// Flips per column the LP-free feasibility search may make. 0 disables it.
         #[arg(long, default_value_t = 200)]
         jump_moves: usize,
+        /// Look for the model's automorphism group and send a branch's whole orbit to
+        /// zero on its down side. Off by default: it converts nothing on MIPLIB's binary
+        /// set and costs up to 2.6 seconds to detect.
+        #[arg(long)]
+        symmetry: bool,
+        /// Smallest orbit worth branching on rather than branching on a column.
+        #[arg(long, default_value_t = 4)]
+        min_orbit: usize,
     },
     /// Solve a model's LP relaxation and report the bound.
     Relax {
@@ -155,6 +163,8 @@ fn main() -> Result<()> {
             local_cut_frequency,
             threads,
             jump_moves,
+            symmetry,
+            min_orbit,
         } => {
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -171,6 +181,8 @@ fn main() -> Result<()> {
                 cuts_per_round,
                 local_cut_frequency,
                 jump_moves,
+                symmetry,
+                symmetry_min_orbit: min_orbit,
                 ..Options::default()
             };
             let started = std::time::Instant::now();
