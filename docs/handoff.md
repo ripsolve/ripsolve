@@ -74,11 +74,27 @@ cut loop's warm start was: it is a real fault in the hottest function in the pro
 
 ### And what that leaves is the iteration count
 
-`cod105`'s relaxation needs **more than 100,000 simplex iterations on 1024 rows**, and at
-823 a second that is still two minutes. The `cvs16r*` family is the same shape. That is a
-Dantzig pricing symptom, not a factorization one: `Solver::price` scans every column and
-takes the largest reduced cost, the dual method already carries steepest edge weights and
-the primal carries nothing.
+Measured against HiGHS on the same relaxations rather than inferred, through `highspy`
+with every column relaxed to continuous and one thread:
+
+```text
+                  HiGHS iters   HiGHS s      here
+cod105                   4090      7.47   >100,000, does not converge
+cvs16r70-62              7636      0.88   >100,000, does not converge
+cvs16r106-72            12650      1.66   >100,000, does not converge
+cvs16r128-89            14516      2.34   >100,000, does not converge
+ex10                    25974     71.17   >100,000, does not converge
+neos-953928             12710      5.48       10,751 in 16.5s
+```
+
+**These are two different gaps.** On `cod105` and the `cvs16r*` family it is the iteration
+*count*, eight to twenty-four times too many -- and per iteration this solver is now the
+faster of the two there, 823 a second against HiGHS's 547. On `neos-953928` it is the
+reverse: the counts agree within a fifth and the time is three times worse.
+
+The count is a Dantzig pricing symptom, not a factorization one: `Solver::price` scans
+every column and takes the largest reduced cost, the dual method already carries steepest
+edge weights and the primal carries nothing.
 
 **Primal devex is the next build.** One obstacle to know before starting, and it is
 written in `price`'s own comment: Dantzig is doing double duty as a numerical safeguard
@@ -180,16 +196,20 @@ family, and there is no evidence here about which.
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     35        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-**Read that as 34.** The 35th is `neos-3045796-mogo`, which is a coin flip at about two in
-five and closed on this run; the set that closes every time is 34. See "35 that is really
-34" in `design-notes.md`.
+`docs/baselines/binary-2026-09-12.json`, run at the end of this session. **34 is the
+number this file has been saying the standing really is**: the run before it reported 35
+and the 35th was `neos-3045796-mogo`, a coin flip at about two in five, which landed the
+other way this time. Nothing else changed -- no instance gained, none lost -- and the
+factorization fix shows up as speed on the instances that were already closing: `disctom`
+16.2s to 13.1, `neos-1599274` 28.8 to 25.3, `acc-tight2` 40.1 to 36.8, `neos-3226448-wkra`
+8.9 to 7.8, eight of the ten slowest between 0.81x and 0.96x. `irp` went the other way,
+47.2 to 55.4, which is inside what sixteen threads swing by on an instance that has been
+borderline in every run recorded here.
 
-Confirmed by a full run, `docs/baselines/binary-2026-09-10.json`, which gained
-`neos-787933` and lost the coin flip on `neos-3045796-mogo`. Ahead of CBC, and twelve
-behind HiGHS. Six of the 34 are instances HiGHS does not close.
+Ahead of CBC, and twelve behind HiGHS. Six of the 34 are instances HiGHS does not close.
 
 `ex9` is the widest margin of the 34: 24.9 seconds against HiGHS's 3.5 and SCIP's 23.1,
 with CBC not closing it at all. The instances the probing budgets were most likely to
@@ -564,14 +584,17 @@ pump, fixing with propagation and the LP-free jump all running and all returning
 - `bench/binary_bench.py [seconds] [threads] [--refresh]` is the standing. `--refresh`
   drops this solver's cached rows only. `bench/out/` is gitignored and every run writes
   over it, so the run behind the figures above is kept as
-  `docs/baselines/binary-2026-09-07.json`, with the run before the reduced cost
-  neighbourhood kept as `binary-2026-09-06.json`, the one before the feasibility work as
+  `docs/baselines/binary-2026-09-12.json`, with the run before the symmetry work and the
+  factorization fix kept as `binary-2026-09-11.json`, the run before the reduced cost
+  neighbourhood as `binary-2026-09-06.json`, the one before the feasibility work as
   `binary-2026-09-05.json`, the one before mod-2 cuts as
   `binary-2026-09-04.json`, the one before the cut density fix as
   `binary-2026-09-03.json`, the one before this round's reduced cost work as
   `binary-2026-09-02c.json`, the one before the root work as `binary-2026-09-02.json` and
-  the one before probing as `binary-2026-09-01.json`. Diff against those rather than
+  the one before probing as `binary-2026-09-01.json`. Those filenames are a sequence
+  rather than calendar dates, and the next one continues it. Diff against them rather than
   against a remembered number, and copy the current one aside before a run that matters.
+  A full 140 instance run takes a little over two hours.
 - `cargo run --release --example symmetry -- <models>` reports each model's automorphism
   group and what finding it cost, with `--seconds=`, `--stall-work=` and
   `--max-vertices=` setting the budget. Use it in preference to a solve for anything

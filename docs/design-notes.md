@@ -328,13 +328,38 @@ at 823 a second that is still two minutes. What the change buys is throughput --
 was taken: the fault was real, it was in the hottest function in the profile, and the
 model it most affects is the one this solver is furthest behind on.
 
-**What that leaves pointing at cod105 is the iteration count, not the iteration cost.**
-100,000 iterations on a 1024-row LP is a Dantzig pricing symptom. `price` scans every
-column and takes the largest reduced cost; the dual method here already has steepest edge
-weights and the primal has nothing. Devex on the primal is the next thing to try on this
-group, and the obstacle to know about first is in `price`'s own comment: Dantzig is doing
-double duty as a numerical safeguard there, and partial pricing was reverted for reporting
-a feasible model infeasible. Devex keeps the full scan, so it does not inherit that.
+### What that leaves is the iteration count, and it was measured against HiGHS
+
+Not inferred from the shape of the numbers. The same relaxations, put to HiGHS through
+`highspy` with every column relaxed to continuous and one thread:
+
+```text
+                  HiGHS iters   HiGHS s      here
+cod105                   4090      7.47   >100,000, does not converge
+cvs16r70-62              7636      0.88   >100,000, does not converge
+cvs16r106-72            12650      1.66   >100,000, does not converge
+cvs16r128-89            14516      2.34   >100,000, does not converge
+ex10                    25974     71.17   >100,000, does not converge
+neos-953928             12710      5.48       10,751 in 16.5s
+```
+
+**Two different gaps, and they are not the same problem.**
+
+On `cod105` and the `cvs16r*` family it is the iteration *count*, eight to twenty-four
+times too many. Per iteration this solver is now the faster of the two there: 823 a second
+against HiGHS's 547. Every second of that gap is pivots that should not have been taken.
+
+On `neos-953928` it is the reverse. The iteration counts agree to within a fifth and the
+time is three times worse, so that one is per-iteration cost.
+
+The count is a Dantzig pricing symptom. `Solver::price` scans every column and takes the
+largest reduced cost; the dual method here already carries steepest edge weights and the
+primal carries nothing. **Primal devex is the next build**, and the obstacle to know about
+first is in `price`'s own comment: Dantzig is doing double duty as a numerical safeguard
+there, because partial pricing was reverted for entering a column nearly dependent on the
+basis and reporting `neos-619167` infeasible. Devex keeps the full scan and so does not
+inherit that; a *partial* devex would. Its cost is one extra BTRAN and a pass over the
+columns per iteration to form the pivot row, which is what the dual side already pays.
 
 ### Where the remaining throughput goes
 
