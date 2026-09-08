@@ -78,6 +78,16 @@ pub struct Tolerances {
     /// factorization a third of the solve: raising it to two hundred takes that LP
     /// from 1.75s to 1.09s and leaves every small model unchanged.
     pub refactor_interval: usize,
+    /// Price the primal method's entering column by devex rather than by the largest
+    /// reduced cost.
+    ///
+    /// Dantzig's rule takes the steepest reduced cost, which is the steepest *per unit
+    /// of that variable* and says nothing about how far the solve actually moves. On a
+    /// degenerate model it takes an enormous number of very short steps. Devex divides
+    /// by an approximate norm of the step direction, so the score is improvement per
+    /// unit of distance travelled, and the reference is updated across each pivot from
+    /// the pivot row.
+    pub primal_devex: bool,
 }
 
 impl Default for Tolerances {
@@ -87,9 +97,17 @@ impl Default for Tolerances {
             dual_feasibility: 1e-7,
             pivot: 1e-9,
             refactor_interval: 200,
+            primal_devex: true,
         }
     }
 }
+
+/// Largest devex weight tolerated before the reference framework is restarted.
+///
+/// Weights only ever rise under the update, so past some point they stop approximating
+/// anything and the rule degenerates. Restarting sets every weight back to one, which
+/// makes the current basis the reference.
+const DEVEX_RESET: f64 = 1e7;
 
 /// How a simplex solve ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +167,13 @@ pub struct LpSolution {
     /// Values of the structural variables only.
     pub x: Vec<f64>,
     pub iterations: usize,
+    /// Iterations that ran under Bland's rule, and iterations whose step was zero.
+    ///
+    /// Reported because the two together are what a degenerate stall looks like from
+    /// outside, and finding that out cost a profiler and a day: `cod105`'s relaxation
+    /// was 90% Bland and 94% zero-step, and neither is visible in an iteration count.
+    pub bland_iterations: usize,
+    pub degenerate_iterations: usize,
     /// The final basis, for warm-starting a related solve.
     pub basis: BasisState,
 }
@@ -446,6 +471,8 @@ impl Lp {
                     objective: f64::NAN,
                     x: Vec::new(),
                     iterations: 0,
+                    bland_iterations: 0,
+                    degenerate_iterations: 0,
                     basis: BasisState {
                         basic: Vec::new(),
                         status: Vec::new(),
@@ -660,6 +687,15 @@ struct Solver<'a> {
     row_weights: Vec<f64>,
     /// Scratch for the steepest edge update, `B^-1` applied to the pivot row.
     tau: Vec<f64>,
+    /// Devex reference weights, one per column; see [`Solver::price`].
+    col_weights: Vec<f64>,
+    /// Scratch for the pivot row, `B^-T e_r`.
+    rho: Vec<f64>,
+    /// Iterations that ran under Bland's rule, and iterations whose step was zero.
+    /// Reported out so a stalling solve can be read without a profiler; see
+    /// `examples/pivotmix.rs`.
+    bland_iterations: usize,
+    degenerate_iterations: usize,
 }
 
 /// What the ratio test decided.
@@ -775,6 +811,10 @@ impl<'a> Solver<'a> {
             dual_steepest: dual_ready,
             row_weights: vec![1.0; m],
             tau: Vec::new(),
+            col_weights: vec![1.0; lp.n_total()],
+            rho: Vec::new(),
+            bland_iterations: 0,
+            degenerate_iterations: 0,
         };
         solver.recompute_basic_values();
         solver
@@ -819,6 +859,10 @@ impl<'a> Solver<'a> {
             dual_steepest: false,
             row_weights: Vec::new(),
             tau: Vec::new(),
+            col_weights: vec![1.0; lp.n_total()],
+            rho: Vec::new(),
+            bland_iterations: 0,
+            degenerate_iterations: 0,
             basic: start.basic.clone(),
             status,
             z,
@@ -918,10 +962,34 @@ impl<'a> Solver<'a> {
 
     /// Choose an entering variable, returning it with the direction to move.
     ///
-    /// Dantzig pricing (steepest reduced cost) normally, switching to Bland's rule
-    ///, lowest index that improves, once the solve has stalled. Dantzig is the
-    /// faster rule but can cycle on degenerate vertices; Bland's cannot, so falling
-    /// back to it guarantees termination at the cost of some speed.
+    /// Devex normally, switching to Bland's rule -- lowest index that improves -- once
+    /// the solve has stalled. Devex can cycle on degenerate vertices as Dantzig's rule
+    /// can; Bland's cannot, so falling back to it guarantees termination.
+    ///
+    /// # Why not Dantzig, which this was
+    ///
+    /// Dantzig's rule takes the largest reduced cost, which is the improvement per unit
+    /// of *that variable* and says nothing about how far the solve actually moves along
+    /// the edge it picks. On a degenerate model it takes an enormous number of very
+    /// short steps. Measured against HiGHS on the same relaxations, with every column
+    /// relaxed to continuous:
+    ///
+    /// ```text
+    ///                   HiGHS iters    here, under Dantzig
+    ///     cod105               4090    >100,000, does not converge
+    ///     cvs16r70-62          7636    >100,000, does not converge
+    ///     cvs16r106-72        12650    >100,000, does not converge
+    /// ```
+    ///
+    /// Per iteration this solver was the faster of the two on `cod105` -- 823 a second
+    /// against 547 -- so the whole of that gap was pivots that should not have been
+    /// taken.
+    ///
+    /// Devex divides the squared reduced cost by an approximate squared norm of the step
+    /// direction, so the score is improvement per unit of distance rather than per unit
+    /// of variable. The norms are approximated from a reference framework, updated
+    /// across each pivot from the pivot row and reset when they drift too far, which is
+    /// what makes it affordable where exact steepest edge is not.
     fn price(&mut self, phase_one: bool, bland: bool) -> Option<(usize, f64)> {
         // Every column, every iteration. Partial pricing was implemented here and
         // reverted: sweeping a rotating window took `leo1`'s relaxation from 0.24s to
@@ -970,7 +1038,14 @@ impl<'a> Solver<'a> {
             if bland {
                 return Some((j, sigma));
             }
-            let score = d.abs();
+            // Improvement per unit of distance travelled, not per unit of variable.
+            // Squared, because the weight is a squared norm and taking a square root per
+            // column to compare would cost more than the comparison is worth.
+            let score = if self.devex() {
+                d * d / self.col_weights[j]
+            } else {
+                d.abs()
+            };
             if score > best_score {
                 best_score = score;
                 best = Some((j, sigma));
@@ -1305,6 +1380,79 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Whether devex is pricing this solve.
+    fn devex(&self) -> bool {
+        self.lp.tol.primal_devex
+    }
+
+    /// Carry the devex reference weights across a pivot.
+    ///
+    /// The weight of column `j` approximates the squared norm of the step direction
+    /// entering `j` would take, measured against the reference framework the weights
+    /// were last reset to. With the entering column `q`, the leaving row `r`, the pivot
+    /// row `alpha_r = e_r' B^-1 N` and the pivot `alpha_rq`, the update is
+    ///
+    /// ```text
+    ///     w_j <- max(w_j, (alpha_rj / alpha_rq)^2 w_q)      for every nonbasic j
+    ///     w_leaving <- max(w_q / alpha_rq^2, 1)
+    /// ```
+    ///
+    /// It costs one BTRAN and a pass over the columns to form the pivot row, which is
+    /// the same order as pricing itself, so devex roughly doubles the per-iteration work
+    /// outside the solves. That is the price of the rule.
+    ///
+    /// Weights only ever rise, so they drift away from the norms they approximate as the
+    /// basis leaves the reference framework behind. When the largest passes
+    /// `DEVEX_RESET` the framework is restarted at the current basis and every weight
+    /// goes back to one, which is what keeps the approximation honest without ever
+    /// computing an exact norm.
+    ///
+    /// Must be called before [`Basis::update`], because `rho` is a row of the *old*
+    /// `B^-1`.
+    fn update_column_weights(&mut self, entering: usize, r: usize) {
+        let pivot = self.alpha[r];
+        if pivot.abs() <= self.lp.tol.pivot {
+            return;
+        }
+        let mut rho = std::mem::take(&mut self.rho);
+        self.basis.btran_unit(r, &mut rho);
+        let reference = Self::clamp_weight(self.col_weights[entering]).max(1.0);
+        let leaving = self.basic[r];
+
+        let mut largest = 0.0f64;
+        for j in 0..self.lp.n_total() {
+            if j == entering || !matches!(self.status[j], Status::NonBasic(_)) {
+                continue;
+            }
+            let arj = if j < self.lp.n_structural {
+                let (rows, vals) = self.lp.matrix.column(j);
+                rows.iter()
+                    .zip(vals)
+                    .map(|(&i, &a)| rho[i] * a)
+                    .sum::<f64>()
+            } else {
+                -rho[j - self.lp.n_structural]
+            };
+            if arj != 0.0 {
+                let ratio = arj / pivot;
+                let candidate = ratio * ratio * reference;
+                if candidate > self.col_weights[j] {
+                    self.col_weights[j] = candidate;
+                }
+            }
+            largest = largest.max(self.col_weights[j]);
+        }
+
+        // The leaving variable is about to become nonbasic, and its direction is the
+        // entering one's scaled by the pivot.
+        self.col_weights[leaving] = Self::clamp_weight(reference / (pivot * pivot)).max(1.0);
+        self.rho = rho;
+
+        if largest > DEVEX_RESET {
+            self.col_weights.fill(1.0);
+        }
+    }
+
     /// Carry the steepest edge weights across a pivot.
     ///
     /// The weight of row `i` approximates the squared norm of row `i` of `B^-1`, which
@@ -1375,6 +1523,7 @@ impl<'a> Solver<'a> {
         // every node in the search. MIPLIB's pk1, 86 columns, burned 100,000
         // iterations across four nodes before the caller gave up.
         const STALL_LIMIT: usize = 100;
+
         // Bland's rule is a way out of a cycle, not a way to run a solve. Staying in it
         // costs enormously on a merely degenerate model: on MIPLIB's neos-555001, 98%
         // of 116953 pivots ran under Bland where the reference solver needs 1396
@@ -1821,6 +1970,8 @@ impl<'a> Solver<'a> {
             objective,
             x,
             iterations,
+            bland_iterations: self.bland_iterations,
+            degenerate_iterations: self.degenerate_iterations,
             basis: BasisState {
                 basic: self.basic.clone(),
                 status: self.status.clone(),
@@ -1834,7 +1985,31 @@ impl<'a> Solver<'a> {
         cutoff: Option<f64>,
     ) -> (LpSolution, Vec<usize>, Basis) {
         // Degenerate (zero-length) steps in a row before switching to Bland's rule.
-        const STALL_LIMIT: usize = 100;
+        /// Degenerate steps in a row before the *primal* method switches to Bland's rule.
+        ///
+        /// Twenty times the dual method's, and the difference is the point. A run of degenerate
+        /// steps is not a cycle: `cvs16r70-62`'s relaxation is 94% zero-step pivots *while
+        /// converging normally*, and 100 in a row is an ordinary event on a model like that.
+        /// Treating it as a cycle sent the solve into Bland's rule and left it there, which is a
+        /// way out of a cycle and not a way to run a solve.
+        ///
+        /// What that cost, measured over 200,000 iterations of the relaxation:
+        ///
+        /// ```text
+        ///                   at 100                          at 2000
+        ///     cod105        95% Bland, no convergence       6337 iterations, optimal, 7.4s
+        ///     cvs16r70-62   93% Bland, no convergence       8942 iterations, optimal, 3.2s
+        ///     cvs16r106-72  93% Bland, no convergence      22835 iterations, optimal, 11.5s
+        /// ```
+        ///
+        /// Nothing that converged at 100 stops converging at 2000, and the termination guarantee
+        /// is untouched: a genuine cycle produces an unbounded run of degenerate steps, so it
+        /// still reaches Bland's rule, just after a longer and bounded delay.
+        ///
+        /// The dual method keeps 100 and was not measured here. It is entered warm at nearly
+        /// every node in the search, where it repairs one bound in a few pivots and a long
+        /// degenerate run means something different.
+        const PRIMAL_STALL_LIMIT: usize = 2_000;
         // Bland's rule is a way out of a cycle, not a way to run a solve. Staying in it
         // costs enormously on a merely degenerate model: on MIPLIB's neos-555001, 98%
         // of 116953 pivots ran under Bland where the reference solver needs 1396
@@ -1913,10 +2088,13 @@ impl<'a> Solver<'a> {
             self.basis.btran(&self.cost_b, &mut y);
             self.y = y;
 
-            let bland = stalled > STALL_LIMIT;
-            if stalled > STALL_LIMIT + bland_run {
+            let bland = stalled > PRIMAL_STALL_LIMIT;
+            if stalled > PRIMAL_STALL_LIMIT + bland_run {
                 stalled = 0;
                 bland_run *= 2;
+            }
+            if bland {
+                self.bland_iterations += 1;
             }
             let Some((entering, sigma)) = self.price(phase_one, bland) else {
                 // No improving column. In phase 2 that is optimality; in phase 1 it
@@ -1983,13 +2161,19 @@ impl<'a> Solver<'a> {
                     let at = if sigma > 0.0 { At::Upper } else { At::Lower };
                     self.status[entering] = Status::NonBasic(at);
                     self.z[entering] = self.lp.value_at(entering, at);
-                    stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
+                    let degenerate = step.abs() <= 1e-12;
+                    self.degenerate_iterations += usize::from(degenerate);
+                    stalled = if degenerate { stalled + 1 } else { 0 };
                 }
                 Step::Pivot {
                     leaving_row,
                     step,
                     to,
                 } => {
+                    // Before the basis moves: the pivot row is a row of the old inverse.
+                    if self.devex() {
+                        self.update_column_weights(entering, leaving_row);
+                    }
                     self.take_step(entering, sigma, step);
                     let leaving = self.basic[leaving_row];
 
@@ -1999,7 +2183,9 @@ impl<'a> Solver<'a> {
                     self.status[leaving] = Status::NonBasic(to);
                     self.z[leaving] = self.lp.value_at(leaving, to);
 
-                    stalled = if step.abs() <= 1e-12 { stalled + 1 } else { 0 };
+                    let degenerate = step.abs() <= 1e-12;
+                    self.degenerate_iterations += usize::from(degenerate);
+                    stalled = if degenerate { stalled + 1 } else { 0 };
                 }
             }
 

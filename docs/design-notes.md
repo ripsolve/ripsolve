@@ -352,14 +352,59 @@ against HiGHS's 547. Every second of that gap is pivots that should not have bee
 On `neos-953928` it is the reverse. The iteration counts agree to within a fifth and the
 time is three times worse, so that one is per-iteration cost.
 
-The count is a Dantzig pricing symptom. `Solver::price` scans every column and takes the
-largest reduced cost; the dual method here already carries steepest edge weights and the
-primal carries nothing. **Primal devex is the next build**, and the obstacle to know about
-first is in `price`'s own comment: Dantzig is doing double duty as a numerical safeguard
-there, because partial pricing was reverted for entering a column nearly dependent on the
-basis and reporting `neos-619167` infeasible. Devex keeps the full scan and so does not
-inherit that; a *partial* devex would. Its cost is one extra BTRAN and a pass over the
-columns per iteration to form the pivot row, which is what the dual side already pays.
+### And the count was Bland's rule, not the pricing rule
+
+Devex was built first and on its own it changed nothing on `cod105`: still 200,000
+iterations without converging, and slower per iteration for the extra BTRAN. So the
+iterations were counted by what produced them, which is what should have been done first:
+
+```text
+                 under Bland   zero-step
+    cod105             89.8%       93.9%
+    cvs16r70-62        89.1%       99.0%
+    cvs16r106-72       87.3%       98.7%
+    neos-953928         0.1%       78.5%   <- and this one solves
+```
+
+**Nine iterations in ten ran under Bland's rule.** The primal method entered it after 100
+degenerate steps in a row and then spent the solve there. Bland's rule is a way out of a
+cycle, not a way to run a solve, and this file already recorded that in another form:
+"on `neos-555001`, 98% of 116953 pivots ran under Bland where the reference solver needs
+1396 pivots in total". What was not noticed is that 100 degenerate steps is not evidence
+of a cycle at all. `cvs16r70-62` is 94% zero-step pivots *while converging normally*.
+
+Raising the primal's threshold to 2000, with the dual's left at 100:
+
+```text
+                   at 100                          at 2000
+    cod105         95% Bland, no convergence       6337 iterations, optimal, 7.4s
+    cvs16r70-62    93% Bland, no convergence       8942 iterations, optimal, 3.2s
+    cvs16r106-72   93% Bland, no convergence      22835 iterations, optimal, 11.5s
+```
+
+The termination guarantee is untouched: a genuine cycle is an unbounded run of degenerate
+steps, so it still reaches Bland's rule, after a longer and bounded delay.
+
+**And with Bland out of the way devex is worth having, which it was not before.** The two
+interact, and measured separately either one reads as a wash:
+
+```text
+                    Dantzig            devex
+    cod105          6337 / 7.0s        3801 / 5.6s      HiGHS 4090
+    cvs16r70-62     8942 / 3.0s        7180 / 2.9s      HiGHS 7636
+    cvs16r106-72   22835 / 10.5s       9914 / 4.2s      HiGHS 12650
+    neos-953928    10554 / 17.4s       7827 / 12.5s     HiGHS 12710
+    neos-555001     4052 / 0.6s        4359 / 0.9s
+    gasprod1-2     18461 / 15.8s      14984 / 20.0s
+```
+
+On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
+`gasprod1-2` are the two that prefer Dantzig, and both still solve.
+
+The lesson is the one this file keeps writing down in other forms: the first measurement
+was of the thing that was easy to measure. An iteration count says a solve is slow and
+says nothing about what the iterations are, and reading that took a profiler, a wrong
+build, and a counter in the loop.
 
 ### Where the remaining throughput goes
 

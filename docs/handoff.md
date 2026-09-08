@@ -92,21 +92,56 @@ neos-953928             12710      5.48       10,751 in 16.5s
 faster of the two there, 823 a second against HiGHS's 547. On `neos-953928` it is the
 reverse: the counts agree within a fifth and the time is three times worse.
 
-The count is a Dantzig pricing symptom, not a factorization one: `Solver::price` scans
-every column and takes the largest reduced cost, the dual method already carries steepest
-edge weights and the primal carries nothing.
+The count looked like a Dantzig pricing symptom -- `Solver::price` scanned every column
+and took the largest reduced cost, where the dual method already carried steepest edge
+weights. It was half that and half something else, and the something else was larger.
 
-**Primal devex is the next build.** One obstacle to know before starting, and it is
-written in `price`'s own comment: Dantzig is doing double duty as a numerical safeguard
-there, because partial pricing was reverted for making the solver report `neos-619167`
-feasible-then-infeasible by entering a column nearly dependent on the basis. Devex keeps
-the full scan and so does not inherit that; a partial devex would. The cost is one extra
-BTRAN and a pass over the columns per iteration to get the pivot row, which is what the
-dual side already pays for its own weights.
+### It was Bland's rule, and both fixes are in
 
-Measure it with `cargo run --release --example rootlp`, which runs presolve and the
-relaxation and nothing else, and read iterations per second *and* the iteration count. The
-two moved in opposite directions this session and only reading both showed it.
+Devex was built and on its own it changed nothing. So the iterations were counted by what
+produced them, with `cargo run --release --example pivotmix`:
+
+```text
+                 under Bland   zero-step
+    cod105             89.8%       93.9%
+    cvs16r70-62        89.1%       99.0%
+    cvs16r106-72       87.3%       98.7%
+```
+
+**Nine iterations in ten ran under Bland's rule**, entered after 100 degenerate steps in a
+row. 100 in a row is not a cycle -- `cvs16r70-62` is 94% zero-step *while converging
+normally*. The primal's threshold is now 2000 (the dual's is untouched at 100), and with
+Bland out of the way devex is worth having, which it was not before:
+
+```text
+                    before             now      HiGHS
+    cod105          no convergence     3801      4090
+    cvs16r70-62     no convergence     7180      7636
+    cvs16r106-72    no convergence     9914     12650
+    neos-953928     10751 / 16.5s      7827     12710
+```
+
+Three of those are now *below* HiGHS's iteration count.
+
+**What is NOT done, and is the first thing to do next.** The change is validated at the LP
+and by the whole test suite -- 213 tests, including the sixteen that solve real instances
+to proven optimality against the oracle -- but the search-level A/B was cut short and **no
+full benchmark has been run on it**. The partial A/B at one thread, before it was stopped,
+shows no regression and real movement:
+
+```text
+                    after                     before
+    cod105          3 nodes                   1 node
+    cvs16r70-62     100 nodes                 1 node
+    cvs16r106-72    167 nodes, found -2       1 node, no incumbent
+    cvs16r128-89    70 nodes, found -2        1 node, no incumbent
+    cvs16r89-60     172 nodes                 191 nodes
+```
+
+Run `bench/binary_bench.py 60 16 --refresh` and diff against
+`docs/baselines/binary-2026-09-12.json` before trusting any of it. Watch `gasprod1-2` and
+`neos-555001` in particular: both prefer Dantzig pricing and both still solve, but they
+are where a regression would show. Two hours.
 
 ## The order after that, and this is the second measurement saying so
 
@@ -595,6 +630,11 @@ pump, fixing with propagation and the LP-free jump all running and all returning
   rather than calendar dates, and the next one continues it. Diff against them rather than
   against a remembered number, and copy the current one aside before a run that matters.
   A full 140 instance run takes a little over two hours.
+- `cargo run --release --example pivotmix -- <models>` reports, per relaxation, the share
+  of iterations that ran under Bland's rule and the share whose step moved nothing.
+  `--no-devex` prices by the largest reduced cost instead. Reach for it before a profiler
+  on any model whose LP is slow: an iteration count says a solve is slow and says nothing
+  about what the iterations are, and not asking cost three sessions here.
 - `cargo run --release --example symmetry -- <models>` reports each model's automorphism
   group and what finding it cost, with `--seconds=`, `--stall-work=` and
   `--max-vertices=` setting the budget. Use it in preference to a solve for anything
