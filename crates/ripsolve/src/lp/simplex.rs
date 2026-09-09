@@ -47,6 +47,13 @@ const ETA_GROWTH_LIMIT: f64 = 1.0;
 
 const CLOCK_INTERVAL: usize = 256;
 
+/// Share of the row count at or below which `B^-1 a_q` counts as hyper-sparse.
+///
+/// The usual threshold in the literature, and the one the reverted implementation was
+/// judged against: below roughly a tenth of the rows it pays to walk only the reachable
+/// part of the elimination graph instead of every row.
+pub const HYPERSPARSE_SHARE: f64 = 0.10;
+
 /// Factorizations kept per LP.
 ///
 /// Swept over 1, 4, 8, 32, 64, 128 and 256: solve time falls all the way up, but so
@@ -98,6 +105,15 @@ pub struct Tolerances {
     /// reachable; see "Devex is off, and what the measurement was worth" in
     /// `docs/design-notes.md`.
     pub primal_devex: bool,
+    /// Count how sparse the entering column's solve `B^-1 a_q` comes out.
+    ///
+    /// Off by default and read once per iteration when on, because the count itself is
+    /// a pass over `alpha` and belongs in a diagnostic rather than in every solve. It
+    /// exists to answer whether a hyper-sparse triangular solve would pay on the
+    /// row-heavy models, which needs *this* solve isolated: an earlier attempt counted
+    /// every FTRAN including the dense `B^-1 b` and read 95% everywhere, which decides
+    /// nothing. See `examples/spikedensity.rs`.
+    pub entering_density_stats: bool,
 }
 
 impl Default for Tolerances {
@@ -108,6 +124,7 @@ impl Default for Tolerances {
             pivot: 1e-9,
             refactor_interval: 200,
             primal_devex: false,
+            entering_density_stats: false,
         }
     }
 }
@@ -184,6 +201,12 @@ pub struct LpSolution {
     /// was 90% Bland and 94% zero-step, and neither is visible in an iteration count.
     pub bland_iterations: usize,
     pub degenerate_iterations: usize,
+    /// Entering-column solves, their total nonzeros, and how many came out at or under
+    /// [`HYPERSPARSE_SHARE`] of the row count. Zero unless
+    /// [`Tolerances::entering_density_stats`] asked for them.
+    pub entering_solves: usize,
+    pub entering_nonzeros: u64,
+    pub entering_sparse_solves: usize,
     /// The final basis, for warm-starting a related solve.
     pub basis: BasisState,
 }
@@ -483,6 +506,9 @@ impl Lp {
                     iterations: 0,
                     bland_iterations: 0,
                     degenerate_iterations: 0,
+                    entering_solves: 0,
+                    entering_nonzeros: 0,
+                    entering_sparse_solves: 0,
                     basis: BasisState {
                         basic: Vec::new(),
                         status: Vec::new(),
@@ -706,6 +732,12 @@ struct Solver<'a> {
     /// `examples/pivotmix.rs`.
     bland_iterations: usize,
     degenerate_iterations: usize,
+    /// Entering-column solves counted, their total nonzeros, and how many of them came
+    /// out at or under [`HYPERSPARSE_SHARE`] of the row count. Only filled when
+    /// [`Tolerances::entering_density_stats`] is set.
+    entering_solves: usize,
+    entering_nonzeros: u64,
+    entering_sparse_solves: usize,
 }
 
 /// What the ratio test decided.
@@ -825,6 +857,9 @@ impl<'a> Solver<'a> {
             rho: Vec::new(),
             bland_iterations: 0,
             degenerate_iterations: 0,
+            entering_solves: 0,
+            entering_nonzeros: 0,
+            entering_sparse_solves: 0,
         };
         solver.recompute_basic_values();
         solver
@@ -873,6 +908,9 @@ impl<'a> Solver<'a> {
             rho: Vec::new(),
             bland_iterations: 0,
             degenerate_iterations: 0,
+            entering_solves: 0,
+            entering_nonzeros: 0,
+            entering_sparse_solves: 0,
             basic: start.basic.clone(),
             status,
             z,
@@ -1684,6 +1722,7 @@ impl<'a> Solver<'a> {
             self.basis.ftran(&col, &mut alpha);
             self.col = col;
             self.alpha = alpha;
+            self.count_entering_density();
 
             if self.alpha[r].abs() <= pivot_tol {
                 // The pivot row and column disagree about this element's magnitude,
@@ -1962,6 +2001,20 @@ impl<'a> Solver<'a> {
         cuts
     }
 
+    /// Record how sparse the entering column's solve came out; see
+    /// [`Tolerances::entering_density_stats`], which gates it.
+    fn count_entering_density(&mut self) {
+        if !self.lp.tol.entering_density_stats {
+            return;
+        }
+        let nonzeros = self.alpha.iter().filter(|v| **v != 0.0).count();
+        self.entering_solves += 1;
+        self.entering_nonzeros += nonzeros as u64;
+        if nonzeros as f64 <= HYPERSPARSE_SHARE * self.alpha.len() as f64 {
+            self.entering_sparse_solves += 1;
+        }
+    }
+
     /// Finish, handing the final basis and its factorization back for caching.
     fn done(self, status: LpStatus, iterations: usize) -> (LpSolution, Vec<usize>, Basis) {
         let solution = self.finish(status, iterations);
@@ -1982,6 +2035,9 @@ impl<'a> Solver<'a> {
             iterations,
             bland_iterations: self.bland_iterations,
             degenerate_iterations: self.degenerate_iterations,
+            entering_solves: self.entering_solves,
+            entering_nonzeros: self.entering_nonzeros,
+            entering_sparse_solves: self.entering_sparse_solves,
             basis: BasisState {
                 basic: self.basic.clone(),
                 status: self.status.clone(),
@@ -2153,6 +2209,7 @@ impl<'a> Solver<'a> {
             self.basis.ftran(&col, &mut alpha);
             self.col = col;
             self.alpha = alpha;
+            self.count_entering_density();
 
             match self.ratio_test(entering, sigma, phase_one, bland) {
                 Step::Unbounded => {

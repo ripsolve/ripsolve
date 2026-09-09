@@ -3,4 +3,4 @@ pub mod lu;
 pub mod simplex;
 
 pub use basis::Basis;
-pub use simplex::{BasisState, Lp, LpSolution, LpStatus, RangeRow, Tolerances};
+pub use simplex::{BasisState, HYPERSPARSE_SHARE, Lp, LpSolution, LpStatus, RangeRow, Tolerances};

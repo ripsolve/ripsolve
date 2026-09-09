@@ -401,6 +401,47 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### The hyper-sparse triangular solve is refuted, on the measurement it asked for
+
+The lead this file carried for four sessions was that `B^-1 a_q` had been measured 12 to
+33% dense on *column-rich* models, and that the models needing speed are row-heavy, whose
+basis is nearly all logicals. A first attempt to check it was wasted by counting every
+FTRAN including the dense `B^-1 b`, which reads ~95% everywhere and decides nothing.
+
+`examples/spikedensity.rs` counts the entering column's solve alone, gated behind
+`Tolerances::entering_density_stats` so the hot path is untouched when it is off:
+
+```text
+                      rows x cols     density   solves <=10%
+    ex10             69608 x 17680      79.0%          0.6%
+    supportcase4      9492 x  3162      70.2%          3.1%
+    bley_xl1        175620 x  5831      36.1%          2.6%
+    neos-633273      21781 x 11154      17.4%         61.7%
+    cod105            1024 x  1024      98.9%          0.0%
+    nw04                36 x 87482      89.0%          0.2%
+    cvs16r106-72      3608 x  2848      69.1%          7.6%
+    neos-953928      12498 x 23305      29.2%          8.3%
+    n2seq36f           285 x  8100      16.8%         17.3%
+    neos-555001       3474 x  3855      14.0%         43.7%
+```
+
+**Being row-heavy does not make the solve sparse.** Three of the four row-heavy models run
+36 to 79% dense with under 4% of solves under the threshold -- *denser* than the 12 to 33%
+the original revert was judged on, not sparser. `ex10` is the second most row-heavy model
+here and the densest of all at 79%.
+
+The one genuinely hyper-sparse case is the opposite of the prediction: `neos-633273` at
+17.4% with 61.7% of its solves under threshold, and `neos-555001` at 14.0% and 43.7%. Both
+already solve their relaxation -- `neos-633273`'s finishes in 3284 iterations -- so the
+models where the technique would fire are the ones that do not need it.
+
+Two caveats. The models that do not finish are sampled over their first 20000 iterations,
+so this describes the phase they are stuck in. And this file's dimensions for the group
+were wrong: `bley_xl1` is 175620 x 5831, not "17039 x 751", and `ex10` is 69608 x 17680,
+not "16760 x 408". The row-heavy characterisation survives; the numbers did not.
+
+**Do not implement a hyper-sparse triangular solve on this evidence.** It is closed.
+
 ### Devex is off, and what the measurement was worth
 
 **The table above is correct and it argued for the wrong thing.** Benchmarked over the
