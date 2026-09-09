@@ -188,6 +188,65 @@ twenty minutes when this was written. Something in that model defeats the deadli
 the checks are every 256 iterations in each simplex loop, so the time is going somewhere
 that is not those loops. Nobody has looked; `pb-fit2d` appears nowhere else in these notes.
 
+## The root cut loop's guard was taking the run, and it is fixed
+
+**A third instance of the fault this file has now recorded three times: a guard given the
+caller's whole remaining clock.** The root cut loop is budgeted by `ROOT_CUT_SHARE`; the
+purge that runs after it was not. Phase timing on `neos-633273`:
+
+```text
+    separate 0.10s -> resolve 0.08s warm     (x5 rounds, ~1.5s in total)
+    final-purge cold 54.43s, 11901 iterations
+```
+
+The loop costs a second and a half. Its guard took **54.4 of a 60 second budget**, leaving
+two nodes and no incumbent where the same model reaches 732 nodes with no cutting at all.
+`ROOT_PURGE_SHARE` now bounds it at a fifth, chosen by measurement (the table is on the
+constant). Bounding it is safe by construction: a purge that does not finish leaves the
+untrimmed model, which already solves and already holds the bound.
+
+Measured over the 140 at 60s and 16 threads: **34, none gained, none lost**, with `irp`
+47.8s to 41.1, `cap6000` 18.3 to 15.4, `neos-787933` 41.3 to 39.2, `acc-tight2` 38.7 to
+37.3, against `nw04` 3 to 4 seconds slower over three runs each way.
+
+**Read this before touching a deadline anywhere.** Writing the fix introduced a bug the
+whole test suite passed with: the shortened deadline was set on `candidate`, which is
+conditionally promoted to the LP the *entire search* runs on, so every node inherited it
+and gave up at a fifth of the run -- `p2m2p1m1p0n100` reported the time limit after 12.1
+seconds of 60. 213 tests did not see it, and neither did a targeted A/B over ten models.
+The full benchmark's partial diff caught it at 31 instances. If a bounded deadline is set
+on an `Lp` that outlives the solve it was for, restore it immediately afterwards.
+
+## Where the nine instances two open solvers close actually fail, and the two defects left
+
+The set this solver misses that at least two of HiGHS, SCIP and CBC close is nine. Two
+were already answered (`air05`, `neos-3045796-mogo`), two never finish their root
+relaxation (`supportcase4`, `neos-780889`), and the full table is in `design-notes.md`
+under "Where the nine instances two open solvers close actually fail".
+
+Two things were established there that the next session should not re-derive:
+
+**The Gomory density filter is not a defect, and loosening it is a trap.**
+`chromaticindex32-8` separates one cut where its neighbours separate hundreds, and the
+filter explains it -- rows averaging 4 columns of 2304 give an allowance of 72 terms and
+the one surviving cut is exactly 72. Disabling it admits 1459 more cuts and the bound does
+not move at all, while `neos18`'s bound gets *worse*, 8.5 to 7.6, because dense cuts crowd
+out the sparse ones that pay. This was tested, not assumed.
+
+**`neos-633273` is a presolve instance, and it is the argument for building postsolve.**
+SCIP closes it in 0.47s, reducing 11154 x 21781 to 5079 x 5498; our presolve reports zero
+of everything. **10648 of its 21781 rows are the identical doubleton equality
+`x_p - x_q = 0`** on binaries. Merging equal columns removes a row and a column each time
+and cannot be expressed in place, because `x_p` has to be recovered from `x_q` --
+`presolve.rs` is deliberately postsolve-free and says so. Doubleton aggregation is the
+first reduction that needs postsolve, and this is the instance that justifies it.
+
+A second, smaller defect is diagnosed and unfixed: **the in-loop cut ageing never fires on
+a large model**, because its trigger is `active.len() > base.n_rows()` -- on a 21781-row
+model the pool would need 21781 cuts before a slack one ages out. That is why fifty rounds
+accumulate 969 cuts and the node LPs crawl even with the purge bounded: `neos-633273`
+reaches 290 nodes at five rounds and still 2 at the default fifty. It needs its own A/B.
+
 ## The order after that, and this is the second measurement saying so
 
 The order this file used to state was LP throughput, then symmetry, then `mogo`'s primal
@@ -195,14 +254,12 @@ side. LP throughput was closed as a *conversion* lever and symmetry is now close
 too, and **both closed onto the same thing**: a group of instances that spend sixty
 seconds inside their first relaxation.
 
-The specific hypothesis to test first is already written down at the bottom of this file
-under "The one place the remaining conversions are", and it has not been tried: the
-hyper-sparse triangular solve, reverted once on the measured grounds that `B^-1 a_q` runs
-12 to 33% dense, where that measurement was taken on column-rich models and the models
-that need it are row-heavy. The note there also records how the second attempt at
-measuring it was wasted -- by counting every `ftran` including the dense `B^-1 b`, which
-read 95% everywhere and means nothing. **The measurement has to isolate the entering
-column's solve.**
+**That hypothesis has now been tested and is closed.** The entering column's solve was
+isolated, as the note demanded, and being row-heavy does not make it sparse: `ex10` 79.0%
+dense, `supportcase4` 70.2%, `bley_xl1` 36.1%, all with under 4% of solves under the
+threshold. The only hyper-sparse models are `neos-633273` and `neos-555001`, both of which
+already solve their relaxation. See "The hyper-sparse triangular solve is refuted" in
+`design-notes.md`. Do not build it.
 
 What is new since that was written is the size of the group it would serve. It is not the
 four models named there. Adding the symmetric instances that stop at one node, the list
@@ -279,9 +336,9 @@ Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-`docs/baselines/binary-2026-09-13.json`, which is the devex-off re-run described above:
-the same 34 instances as `binary-2026-09-12.json`, none gained and none lost, with `nw04`,
-`neos-1599274` and `irp` faster for the stall threshold. The paragraph below was written
+`docs/baselines/binary-2026-09-14.json`, the run that validated the cut-purge bound below:
+the same 34 instances as `binary-2026-09-13.json` and `binary-2026-09-12.json`, none gained
+and none lost across all three. The paragraph below was written
 against the 09-12 run and still holds instance for instance. **34 is the
 number this file has been saying the standing really is**: the run before it reported 35
 and the 35th was `neos-3045796-mogo`, a coin flip at about two in five, which landed the

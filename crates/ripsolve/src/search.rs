@@ -1504,8 +1504,20 @@ fn separate_at_root(
         let mut trimmed = base.clone();
         trimmed.add_cuts(&rows);
         let mut candidate = Lp::relaxation(&trimmed);
-        candidate.set_deadline(deadline);
+        // Bounded rather than given the rest of the run; see `ROOT_PURGE_SHARE`.
+        candidate.set_deadline(match options.time_limit {
+            Some(limit) => {
+                let bounded = Instant::now() + limit.mul_f64(ROOT_PURGE_SHARE);
+                Some(deadline.map_or(bounded, |hard| hard.min(bounded)))
+            }
+            None => deadline,
+        });
         let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        // The bound above belongs to this one solve. `candidate` may become the LP the
+        // whole search then runs on, and leaving the purge's short deadline on it makes
+        // every node below give up at a fifth of the run: `p2m2p1m1p0n100` reported the
+        // time limit after 12.1 seconds of a 60 second budget.
+        candidate.set_deadline(deadline);
         iterations += resolved.iterations;
         // Keep the trimmed model only if it really did hold the bound.
         if resolved.status == LpStatus::Optimal
@@ -2420,6 +2432,38 @@ fn narrow_for_restart(problem: &Problem, lurking: &Lurking, incumbent: f64) -> O
 /// budget. A third leaves the bound most of what cutting was going to give it while
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
+
+/// The share of a run the root cut loop's final purge may spend on its guard.
+///
+/// The purge drops the cuts that are slack at the root optimum, so that the search does
+/// not carry them through every node LP below. Dropping a row invalidates the basis the
+/// loop was warm-starting from, so the re-solve that checks the bound survived is a
+/// *cold* solve of the whole relaxation -- and it was held to the run's own deadline,
+/// which on a large model is the whole run. On MIPLIB's `neos-633273` five separations
+/// and five warm re-solves come to 1.5 seconds and this one guard took **54.4 of a 60
+/// second budget**, leaving two nodes; the same model reaches 732 nodes with no cutting
+/// at all. That is the same fault the stalled-root rescue had, in a second place.
+///
+/// Bounding it is safe by construction: a purge that does not finish leaves the
+/// untrimmed model, which is the one already known to solve and known to hold the
+/// bound. The cost of being wrong is carrying slack rows, which is what the loop did
+/// before the purge existed.
+///
+/// A fifth, measured against the unbounded behaviour it replaces at a 60 second limit:
+///
+/// ```text
+///                    0.10     0.20     0.33   unbounded
+///     n2seq36f      18.75s    9.70s    9.71s      9.84s
+///     cap6000       12.41    16.12    17.35      17.05
+///     acc-tight2    26.29    31.94    36.48      39.37
+///     neos-787933   27.48    32.89    40.34      37.08
+/// ```
+///
+/// A fifth is no worse than unbounded anywhere here and better on three. A tenth is
+/// better still on those three and costs `n2seq36f` nine times the nodes, because that
+/// model's purge really does need the time and pays for it: the share has to cover the
+/// models the guard earns its place on, not only the ones it robs.
+const ROOT_PURGE_SHARE: f64 = 0.20;
 
 /// How much of the run the relaxation gets before it is treated as stuck.
 ///

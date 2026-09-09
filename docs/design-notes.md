@@ -401,6 +401,109 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### The root cut loop's final purge was unbounded, and it cost the whole run
+
+The loop that separates at the root is budgeted by `ROOT_CUT_SHARE`, a third of the run.
+The purge that runs *after* it was not. It drops the cuts that are slack at the root
+optimum so the search does not carry them through every node LP; dropping a row
+invalidates the basis the loop was warm-starting from, so its re-solve is a **cold solve
+of the whole relaxation**, and it was held to the run's own deadline.
+
+Phase timing on `neos-633273`, which is the model that exposed it:
+
+```text
+    separate 0.10s -> resolve 0.08s warm     (x5 rounds, ~1.5s in total)
+    final-purge cold 54.43s, 11901 iterations
+```
+
+**The loop costs 1.5 seconds and its guard cost 54.4 of a 60 second budget**, leaving two
+nodes and no incumbent where the same model reaches 732 nodes and three incumbents with no
+cutting at all. The comment on the purge calls its re-solve "a guard against that reasoning
+meeting a degenerate basis, not an expectation of change", and it was being given the run.
+
+That is the third time this fault has appeared here in a different place -- the stalled
+root rescue was given the caller's entire remaining clock, and so was the restart pass --
+and the shape of the fix is the same. Bounding it is safe by construction: a purge that
+does not finish leaves the untrimmed model, which is the one already known to solve and
+known to hold the bound.
+
+A fifth of the run, chosen by measurement rather than by taste:
+
+```text
+                       0.10     0.20     0.33   unbounded
+    n2seq36f          18.75s    9.70s    9.71s      9.84s
+    cap6000           12.41    16.12    17.35      17.05
+    acc-tight2        26.29    31.94    36.48      39.37
+    neos-787933       27.48    32.89    40.34      37.08
+```
+
+A tenth is better on three of these and costs `n2seq36f` nine times the nodes, because
+that model's purge really does need the time and pays for it. A fifth is no worse than
+unbounded anywhere and better on three.
+
+**One bug was introduced writing this and is worth recording, because the test suite did
+not catch it.** The shortened deadline was set on `candidate`, which is conditionally
+promoted to the LP the *whole search* then runs on, so every node below inherited a
+fifth-of-a-run deadline and gave up there: `p2m2p1m1p0n100` reported the time limit after
+12.1 seconds of a 60 second budget, `mine-90-10` after 14.9. All 213 tests passed with
+that in place -- it only shows on a model that needs more than the share, which the
+real-instance tests do not exercise -- and the targeted A/B over ten models missed it too,
+because none of them both kept the trimmed model and needed the rest of the run. **The
+full benchmark's partial diff is what found it.** The deadline is now restored on
+`candidate` immediately after the solve that needed it.
+
+Measured over the 140: 34, none gained, none lost, `irp` 47.8s to 41.1, `cap6000` 18.3 to
+15.4, `neos-787933` 41.3 to 39.2, `acc-tight2` 38.7 to 37.3, against `nw04` at a
+consistent 3 to 4 seconds slower over three runs each way (47-50s to 51s; the baseline's
++16.4s reads an unusually fast old run against a slow new one).
+
+### Where the nine instances two open solvers close actually fail
+
+Re-derived this session from `binary-2026-09-13.json`: the instances this solver misses
+that at least two of HiGHS, SCIP and CBC close.
+
+```text
+    instance             nodes   cuts   root bound        what is wrong
+    supportcase4             1      -   -                 root relaxation never finishes
+    neos-780889              1      -   -                 root relaxation never finishes
+    neos-633273              2    925   4.68e9 -> 6.15e9  see above, and presolve below
+    ab71-20-100              2    326   barely moves      936% gap, huge coefficients
+    acc-tight5              40    320   0 -> 0            4662 iterations a node
+    neos18                 401    286   7 -> 11           bound short of 25
+    air05                 1371    192   25878 -> 25973    already answered, see above
+    neos-3045796-mogo     2828   1863   -175 -> -175      known coin flip, purely primal
+    chromaticindex32-8    3959      1   3 -> 3            holds the optimum, cannot prove it
+```
+
+**`chromaticindex32-8` separates one cut where the others separate hundreds, and the
+density filter explains it and is not the defect.** Its rows average 4 columns of 2304, so
+the allowance is `max(30, min(24*3, 768))` = 72 terms and the single surviving cut is
+exactly 72. Disabling the filter admits 1459 more -- and the bound stays at 3.000000 with
+200 of them in, while on `neos18` the same change makes the bound *worse*, 8.5 to 7.6,
+because dense cuts crowd out the sparse ones that pay under a fixed per-round budget. The
+filter is doing its job. Do not loosen it.
+
+**`neos-633273`'s remaining gap is presolve, and it is a reduction we do not have.** SCIP
+closes it in 0.47s and reduces 11154 x 21781 to 5079 x 5498; ours reports zero columns
+fixed, zero rows removed, zero coefficients tightened. The reason is exact: **10648 of its
+21781 rows are the identical doubleton equality `x_p - x_q = 0`** on binaries -- half the
+model says two variables are equal -- and its remaining rows are 10648 of length three and
+485 of length 22. Merging equal columns removes a row and a column each time.
+
+That is a real lead and it is blocked on architecture, not on knowing what to do:
+`presolve.rs` is deliberately postsolve-free ("Physically removing rows and columns would
+make the LPs smaller, but it requires an index map and a postsolve pass, historically the
+most bug-prone part of a presolver"), and a merge cannot be expressed as an in-place
+fixing because `x_p`'s value has to be recovered from `x_q`. **Doubleton aggregation is
+the first thing that needs postsolve, and this instance is the argument for building it.**
+
+**A second defect found and not fixed: the in-loop cut ageing never fires on a large
+model.** Its trigger is `active.len() > base.n_rows()`, so on `neos-633273` the pool would
+need 21781 cuts before a slack one is aged out. That is why fifty rounds accumulate 969
+cuts and the node LPs crawl even with the purge bounded -- the instance reaches 290 nodes
+at five rounds and still 2 at the default fifty. It wants its own A/B; bundling it with
+the purge is what made the devex regression hard to attribute.
+
 ### The hyper-sparse triangular solve is refuted, on the measurement it asked for
 
 The lead this file carried for four sessions was that `B^-1 a_q` had been measured 12 to
