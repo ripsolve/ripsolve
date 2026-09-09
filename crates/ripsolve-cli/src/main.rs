@@ -63,6 +63,9 @@ enum Command {
         /// Skip presolve.
         #[arg(long)]
         no_presolve: bool,
+        /// Skip doubleton equality aggregation.
+        #[arg(long)]
+        no_aggregate: bool,
         /// Rounds of root cut separation. Zero disables cuts.
         #[arg(long, default_value_t = 50)]
         cut_rounds: usize,
@@ -158,6 +161,7 @@ fn main() -> Result<()> {
             verbose,
             solution: solution_path,
             no_presolve,
+            no_aggregate,
             cut_rounds,
             cuts_per_round,
             local_cut_frequency,
@@ -175,6 +179,7 @@ fn main() -> Result<()> {
                 time_limit: time_limit.map(Duration::from_secs_f64),
                 gap_tolerance: gap,
                 presolve: !no_presolve,
+                aggregate: !no_aggregate,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
                 cut_rounds,

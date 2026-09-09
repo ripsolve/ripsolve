@@ -99,6 +99,7 @@
 //! The reasoning behind the defaults, including the approaches that were measured and
 //! rejected, is in [design-notes.md](https://github.com/ripsolve/ripsolve/blob/main/docs/design-notes.md).
 
+pub mod aggregate;
 pub mod branch;
 pub mod compact;
 pub mod cuts;

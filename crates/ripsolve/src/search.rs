@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::aggregate;
 use crate::branch::{self, Pseudocosts};
 use crate::cuts;
 use crate::compact;
@@ -63,6 +64,23 @@ pub struct Options {
     pub max_iterations_per_node: usize,
     /// Tighten the model before searching.
     pub presolve: bool,
+    /// Substitute out doubleton equalities before searching.
+    ///
+    /// Unlike every other reduction here this one renumbers, so it carries a postsolve;
+    /// see [`crate::aggregate`]. It is the only way to reach models built out of "these
+    /// two columns are equal" rows -- `neos-633273` is 10648 of them on 21781 rows.
+    ///
+    /// **Off by default because it has not been validated, not because it was measured
+    /// and rejected.** The reduction is correct and tested, and on the 26 instances of
+    /// the binary set it touches it is large: `rail02` loses 39086 columns, `neos-780889`
+    /// 26600, `neos-633273` half its rows with its root relaxation going 4.32s to 1.58.
+    /// The one full run made of it scored 33 against 34, and that run is not evidence:
+    /// it was taken with the machine on battery and roughly a tenth slower than the
+    /// baseline it was compared against, and the instances it "lost" -- `ex9` above all
+    /// -- are ones `aggregate` provably never touches, `ex9` failing three runs of three
+    /// on the *committed* build too. Turn it on and benchmark it on a machine on mains
+    /// before believing either number. See `docs/handoff.md`.
+    pub aggregate: bool,
     /// Separate cuts at one node in every `local_cut_frequency`, not only at the
     /// root. Zero disables node-local cutting.
     ///
@@ -223,6 +241,7 @@ impl Default for Options {
             gap_tolerance: 1e-4,
             max_iterations_per_node: 100_000,
             presolve: true,
+            aggregate: false,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
             jump_moves: 200,
@@ -1570,6 +1589,30 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 /// asking whether it can then *prove* optimality separates an instance that is short of a
 /// point from one that is short of a bound, and those want completely different work.
 pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
+    // Aggregation is applied once, around everything: the restart loop, presolve, the
+    // cut loop and every node then see only the smaller model, so no index inside the
+    // search has to know this happened. The solution comes back through the map at the
+    // end, and a caller's starting point goes down through it at the start.
+    if options.aggregate {
+        match aggregate::aggregate(problem, AGGREGATE_TOLERANCE) {
+            Err(_) => return Solution::without_solution(Status::Infeasible, 0, 0, None),
+            Ok(Some((smaller, map))) => {
+                let restricted = start.map(|x| map.restrict(x));
+                let mut solution = solve_all_restarts(&smaller, options, restricted.as_deref());
+                if !solution.x.is_empty() {
+                    solution.x = map.expand(&solution.x);
+                }
+                return solution;
+            }
+            // Nothing to substitute, so nothing to undo.
+            Ok(None) => {}
+        }
+    }
+    solve_all_restarts(problem, options, start)
+}
+
+/// The restart loop, on whatever model it was handed.
+fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
     let started = Instant::now();
     let mut model: Option<Problem> = None;
     let mut seed: Option<(f64, Vec<f64>)> = start
@@ -2432,6 +2475,12 @@ fn narrow_for_restart(problem: &Problem, lurking: &Lurking, incumbent: f64) -> O
 /// budget. A third leaves the bound most of what cutting was going to give it while
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
+
+/// How near an equality a doubleton row must be before it is substituted out.
+///
+/// Tight rather than the integrality tolerance: this decides whether two columns are
+/// *identical*, and a reduction that renumbers should be certain of its premise.
+const AGGREGATE_TOLERANCE: f64 = 1e-9;
 
 /// The share of a run the root cut loop's final purge may spend on its guard.
 ///

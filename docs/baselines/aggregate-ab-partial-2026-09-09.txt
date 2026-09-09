@@ -1,0 +1,16 @@
+instance                   aggregation OFF        aggregation ON        
+supportcase16              optimal       0.1s      optimal       0.0s
+supportcase14              optimal       0.1s      optimal       0.1s
+neos-831188                TimeLimit    60.1s      TimeLimit    60.1s
+neos-1330346               TimeLimit    60.1s      TimeLimit    60.1s
+acc-tight5                 TimeLimit    60.0s      TimeLimit    60.0s
+neos-1324574               TimeLimit    60.1s      TimeLimit    60.0s
+disctom                    optimal      15.2s      optimal      15.6s
+supportcase4               TimeLimit    60.1s      TimeLimit    60.0s
+cap6000                    optimal      20.4s      optimal      19.3s
+supportcase3               TimeLimit    60.1s      TimeLimit    60.1s
+neos-633273                TimeLimit    60.2s      TimeLimit    60.1s
+air04                      TimeLimit    60.1s      TimeLimit    60.1s
+air03                      optimal       1.2s      optimal       1.3s
+neos-578379                TimeLimit    60.1s      TimeLimit    60.2s
+bab5                       TimeLimit    60.4s      TimeLimit    60.4s
