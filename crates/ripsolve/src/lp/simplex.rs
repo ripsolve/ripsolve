@@ -87,6 +87,16 @@ pub struct Tolerances {
     /// by an approximate norm of the step direction, so the score is improvement per
     /// unit of distance travelled, and the reference is updated across each pivot from
     /// the pivot row.
+    ///
+    /// **Off by default, because over the whole binary set it loses more than it wins.**
+    /// The case for it was iteration counts on the models whose root relaxation does not
+    /// converge -- cod105 3801 against 6337, cvs16r106-72 9914 against 22835 -- and none
+    /// of those close at sixty seconds either way, so that gain converts nothing. What it
+    /// cost is measured: `neos-787933` and `neos-913984` both close under Dantzig's rule
+    /// and neither closes under devex, at either stall threshold, three runs each. It is
+    /// kept because the relaxations it speeds up are real and a later change may make them
+    /// reachable; see "Devex is off, and what the measurement was worth" in
+    /// `docs/design-notes.md`.
     pub primal_devex: bool,
 }
 
@@ -97,7 +107,7 @@ impl Default for Tolerances {
             dual_feasibility: 1e-7,
             pivot: 1e-9,
             refactor_interval: 200,
-            primal_devex: true,
+            primal_devex: false,
         }
     }
 }

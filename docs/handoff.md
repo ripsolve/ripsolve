@@ -110,8 +110,8 @@ produced them, with `cargo run --release --example pivotmix`:
 
 **Nine iterations in ten ran under Bland's rule**, entered after 100 degenerate steps in a
 row. 100 in a row is not a cycle -- `cvs16r70-62` is 94% zero-step *while converging
-normally*. The primal's threshold is now 2000 (the dual's is untouched at 100), and with
-Bland out of the way devex is worth having, which it was not before:
+normally*. The primal's threshold is now 2000 (the dual's is untouched at 100). With Bland
+out of the way devex looked worth having, which it was not before:
 
 ```text
                     before             now      HiGHS
@@ -123,25 +123,70 @@ Bland out of the way devex is worth having, which it was not before:
 
 Three of those are now *below* HiGHS's iteration count.
 
-**What is NOT done, and is the first thing to do next.** The change is validated at the LP
-and by the whole test suite -- 213 tests, including the sixteen that solve real instances
-to proven optimality against the oracle -- but the search-level A/B was cut short and **no
-full benchmark has been run on it**. The partial A/B at one thread, before it was stopped,
-shows no regression and real movement:
+**It was benchmarked, and half of it was wrong. Devex is now off by default.** The full
+run the previous session asked for scored **32 against the standing 34**: no gain, and two
+instances lost. Both reproduce three runs of three, and the parent commit closes both, so
+this was not variance.
 
 ```text
-                    after                     before
-    cod105          3 nodes                   1 node
-    cvs16r70-62     100 nodes                 1 node
-    cvs16r106-72    167 nodes, found -2       1 node, no incumbent
-    cvs16r128-89    70 nodes, found -2        1 node, no incumbent
-    cvs16r89-60     172 nodes                 191 nodes
+    neos-787933     optimal 38.4s  ->  limit
+    neos-913984     optimal 51.3s  ->  limit
 ```
 
-Run `bench/binary_bench.py 60 16 --refresh` and diff against
-`docs/baselines/binary-2026-09-12.json` before trusting any of it. Watch `gasprod1-2` and
-`neos-555001` in particular: both prefer Dantzig pricing and both still solve, but they
-are where a regression would show. Two hours.
+The commit changed two things at once, so they were separated, and the whole cost is on
+devex. The threshold is exonerated:
+
+```text
+    pricing    stall limit        neos-787933      neos-913984
+    Dantzig    100 (parent)       optimal 40s      optimal 47-50s
+    Dantzig    2000               optimal 40-42s   optimal 48.7s
+    devex      100                limit            optimal, 1 run of 2
+    devex      2000 (as shipped)  limit            limit
+```
+
+**The case for devex was iteration counts on relaxations that do not converge, and none of
+those instances close at sixty seconds either way.** `cod105`, `cvs16r70-62`,
+`cvs16r106-72` and `cvs16r128-89` are all still `limit` in both runs. That is a real gain
+against HiGHS's iteration count and it converts nothing, while the cost is two instances
+that were closing. `Tolerances::primal_devex` is kept and defaults to `false`; the reasoning
+is under "Devex is off, and what the measurement was worth" in `design-notes.md`.
+
+**The stall threshold is the half worth keeping, and it is the whole of the improvement.**
+Re-run with devex off: 34 again, none lost, none gained, and three instances materially
+faster.
+
+```text
+    nw04             47.8s -> 37.5s
+    neos-1599274     25.3s -> 15.1s
+    irp              55.4s -> 47.8s
+```
+
+`irp` is the one to notice. This file has called it borderline in every run recorded, and
+it now closes with twelve seconds to spare rather than five. `nw04` has never closed in any
+run of any version before reduced-cost fixing was added. `mitre` and `decomp1`, which devex
+had cost 4.7s and 8.5s, are back at baseline.
+
+`docs/baselines/binary-2026-09-13.json` is that run.
+
+**A benchmark artifact worth knowing about, because it will happen again.** Two instances
+reported impossible times -- `neos-831188` at 240.3s and `pb-fit2d` at 15122.1s against a
+sixty second limit -- and the machine suspending mid-run is why, confirmed in the journal at
+21:21:28. The harness times a solve with `time.time()`, which counts suspended time, while
+both `subprocess.run`'s timeout and the solver's own `Instant::now()` deadline use
+CLOCK_MONOTONIC, which does not. **Statuses are unaffected** -- the solver still gets its
+real sixty seconds -- but the reported seconds are not, and a contaminated entry is cached
+like any other. `neos-831188` re-ran at 60.09s standalone. If a time looks impossible, check
+`journalctl | grep -i suspend` before believing it, and drop that one key from
+`bench/out/tractable_screen.json` rather than re-running the set.
+
+**`pb-fit2d` is a real time-limit overrun underneath that artifact, and it is not new.** Its
+suspend-free time is **458.8s against a sixty second limit**, no bound proven, which is why
+it crosses the harness's `LIMIT * 4 + 120` cap and lands in the 09-13 baseline as `killed`
+where 09-12 has `limit` at 294.2s. Neither counts as solved and the standing is untouched
+either way. It is not this change: the parent build was still inside the same instance after
+twenty minutes when this was written. Something in that model defeats the deadline check --
+the checks are every 256 iterations in each simplex loop, so the time is going somewhere
+that is not those loops. Nobody has looked; `pb-fit2d` appears nowhere else in these notes.
 
 ## The order after that, and this is the second measurement saying so
 
@@ -234,7 +279,10 @@ Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-`docs/baselines/binary-2026-09-12.json`, run at the end of this session. **34 is the
+`docs/baselines/binary-2026-09-13.json`, which is the devex-off re-run described above:
+the same 34 instances as `binary-2026-09-12.json`, none gained and none lost, with `nw04`,
+`neos-1599274` and `irp` faster for the stall threshold. The paragraph below was written
+against the 09-12 run and still holds instance for instance. **34 is the
 number this file has been saying the standing really is**: the run before it reported 35
 and the 35th was `neos-3045796-mogo`, a coin flip at about two in five, which landed the
 other way this time. Nothing else changed -- no instance gained, none lost -- and the
@@ -242,7 +290,8 @@ factorization fix shows up as speed on the instances that were already closing: 
 16.2s to 13.1, `neos-1599274` 28.8 to 25.3, `acc-tight2` 40.1 to 36.8, `neos-3226448-wkra`
 8.9 to 7.8, eight of the ten slowest between 0.81x and 0.96x. `irp` went the other way,
 47.2 to 55.4, which is inside what sixteen threads swing by on an instance that has been
-borderline in every run recorded here.
+borderline in every run recorded here -- and the 09-13 run puts it back at 47.8, which
+settles that: it was swing, not the factorization.
 
 Ahead of CBC, and twelve behind HiGHS. Six of the 34 are instances HiGHS does not close.
 

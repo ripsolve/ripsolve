@@ -401,6 +401,38 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Devex is off, and what the measurement was worth
+
+**The table above is correct and it argued for the wrong thing.** Benchmarked over the
+whole binary set, devex scored 32 against the standing 34, losing `neos-787933` (optimal
+38.4s) and `neos-913984` (optimal 51.3s) and gaining nothing. Both reproduce three runs of
+three, and the parent commit closes both.
+
+The commit had changed the stall threshold and the pricing rule together, so they were
+separated across the two lost instances:
+
+| pricing | stall limit | `neos-787933` | `neos-913984` |
+|---|---|---|---|
+| Dantzig | 100 | optimal 40s | optimal 47-50s |
+| Dantzig | 2000 | optimal 40-42s | optimal 48.7s |
+| devex | 100 | limit | optimal, 1 run of 2 |
+| devex | 2000 | limit | limit |
+
+All of the cost is devex's and none of it is the threshold's. `Tolerances::primal_devex`
+now defaults to `false`, and is kept rather than deleted because the relaxations it speeds
+up are real and a later change may make them reachable.
+
+**What the iteration counts were measuring is a set that does not convert.** Every instance
+in the table -- `cod105`, `cvs16r70-62`, `cvs16r106-72`, `neos-953928` -- is `limit` at
+sixty seconds with devex and `limit` without it. Halving the iteration count on a relaxation
+that does not finish inside the budget changes the number of instances solved by zero, and
+the two instances it cost were being solved. This is the same error as the one recorded two
+sections above, in a new place: the quantity that was easy to measure was an iteration
+count, and the quantity that decides anything is whether the model closes.
+
+The stall threshold, measured on its own, is worth what the commit claimed for the pair:
+`nw04` 47.8s to 37.5, `neos-1599274` 25.3 to 15.1, `irp` 55.4 to 47.8, none lost.
+
 The lesson is the one this file keeps writing down in other forms: the first measurement
 was of the thing that was easy to measure. An iteration count says a solve is slow and
 says nothing about what the iterations are, and reading that took a profiler, a wrong
