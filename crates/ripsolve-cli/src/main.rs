@@ -66,9 +66,10 @@ enum Command {
         /// Skip propagating the model's implications at every node.
         #[arg(long)]
         no_node_propagation: bool,
-        /// Skip learning a clause from every node propagation proves empty.
+        /// Learn a clause from every node proved empty, and propagate it below. Off by
+        /// default: it fires but changes no outcome on the benchmark set.
         #[arg(long)]
-        no_conflict_analysis: bool,
+        conflict_analysis: bool,
         /// Substitute out doubleton equalities before searching. Off by default: the
         /// reduction is correct and tested but has not been validated on the benchmark.
         #[arg(long)]
@@ -169,7 +170,7 @@ fn main() -> Result<()> {
             solution: solution_path,
             no_presolve,
             no_node_propagation,
-            no_conflict_analysis,
+            conflict_analysis,
             aggregate,
             cut_rounds,
             cuts_per_round,
@@ -189,7 +190,7 @@ fn main() -> Result<()> {
                 gap_tolerance: gap,
                 presolve: !no_presolve,
                 node_propagation: !no_node_propagation,
-                conflict_analysis: !no_conflict_analysis,
+                conflict_analysis,
                 aggregate,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),

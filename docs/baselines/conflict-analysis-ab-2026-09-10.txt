@@ -1,0 +1,26 @@
+instance                 conflict OFF           conflict ON           
+chromaticindex32-8       TimeLimit  60.3s   3618n  TimeLimit  60.3s   4689n
+acc-tight5               TimeLimit  60.0s      2n  TimeLimit  60.0s     36n
+neos18                   TimeLimit  60.2s    500n  TimeLimit  60.8s    475n
+air05                    TimeLimit  60.1s   1668n  TimeLimit  60.2s   1758n
+neos-633273              TimeLimit  60.2s      2n  TimeLimit  60.2s      2n
+ab71-20-100              TimeLimit  60.1s      2n  TimeLimit  60.1s      2n
+ex9                      optimal    24.9s      2n  optimal    24.9s      2n
+mitre                    optimal     3.6s      4n  optimal     3.3s      4n
+irp                      NodeLimit  60.1s   5494n  optimal    43.5s   3922n
+nw04                     optimal    49.6s   1214n  optimal    47.9s   1532n
+cap6000                  optimal    21.0s    738n  optimal    19.8s   5946n
+acc-tight2               optimal    37.2s      2n  optimal    40.8s      2n
+n2seq36f                 optimal    10.1s      4n  optimal     9.6s      4n
+neos-1599274             optimal    14.9s    204n  optimal    15.3s    198n
+neos-3045796-mogo        optimal    22.3s      2n  optimal    23.4s      2n
+disctom                  optimal    14.7s      2n  optimal    15.4s      2n
+CLAB-COMPLETE
+
+irp, four runs each way (the one instance that differed in the table above):
+  conflict OFF   optimal 4 of 4   45.4 41.3 41.1 46.0
+  conflict ON    optimal 4 of 4   40.8 41.3 40.9 50.5
+The single NodeLimit in the table was variance.
+
+Clauses are learned: 196 on chromaticindex32-8 in 25 seconds, one per infeasible node LP.
+They change no outcome.

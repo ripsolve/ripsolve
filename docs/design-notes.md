@@ -401,6 +401,45 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Conflict analysis fires, and converts nothing
+
+The section below built the analyser and found it had no conflicts to work from:
+propagation tightens at a node, it does not refute, so nothing ever reached it. The fix
+was the source, and the source is the LP.
+
+**The certificate had to be taken from phase one, not from the dual method.** The first
+wiring read the ray where the *dual* simplex runs out of room, which looked like the
+obvious place. Instrumented, `chromaticindex32-8` gave **367 infeasible node LPs and zero
+rays**: infeasibility here is proved in the primal's phase one, where the certificate is
+that phase's dual vector. Capturing it there turned zero into 196 rays and 196 clauses.
+
+**The certificate is verified, never trusted.** It is floating point output from a basis
+that may have drifted, and a learned clause is obeyed everywhere, so `farkas_conflict`
+aggregates the rows by the ray, checks the resulting form really is unsatisfiable over the
+node's box, tries both sign conventions, and learns nothing if neither holds. Only then
+does it relax each bound back to the root's to find which the proof needed, and walk those
+back to the branchings.
+
+**And it changes nothing.** Sixteen instances, both arms back to back:
+`docs/baselines/conflict-analysis-ab-2026-09-10.txt`. Nothing gained, nothing lost, every
+time inside the noise. The one instance that differed, `irp`, is 4 of 4 optimal either way
+on repeat; its single `NodeLimit` was variance. `chromaticindex32-8` was 6198 against 12001
+nodes in one pair of runs and 3618 against 4689 in the next, which is how noisy that
+instance is and why the first pair was not evidence.
+
+**Why, and it is the same shape as the last two answers.** A clause learned this way comes
+from a node the search has *already* pruned. It can only stop that conflict being
+rediscovered somewhere else in the tree, and on these models it is not being rediscovered
+often enough to matter. A reference solver closes `chromaticindex32-8` in **one node** --
+none of its conflict analysis happens in a tree at all. It manufactures conflicts at the
+root by probing, and the clauses it accumulates there strengthen the root before any
+branching. **The analyser was never the missing piece; the source is.**
+
+So the next thing on that instance is root probing that learns clauses of more than one
+literal, feeding the machinery that now exists. `presolve::probe_columns` already probes
+and already refutes single suppositions; what it does not do is keep a clause when a
+*pair* of suppositions conflicts. That is where this stops being an analyser without input.
+
 ### Conflict analysis is built and has no conflicts to analyse
 
 SCIP's own ablation says this is the mechanism to want. On `chromaticindex32-8`, one

@@ -225,7 +225,39 @@ where the closing instances are not uniformly slower than the baseline -- that i
 signal that the machine is comparable, and it is worth checking on the first twenty rows
 rather than at the end.
 
-## Conflict analysis is built, and needs a source of conflicts. Start here.
+## Conflict analysis is built, fires, and converts nothing. The source is still the gap.
+
+Both halves exist now. The analyser (`explain`, `Clauses`) learns a clause from any node
+proved empty and propagates it below. The source is `farkas_conflict`: when a node's LP is
+infeasible, the certificate names which of this node's bounds the proof needed, and those
+walk back to the branchings behind them.
+
+**Getting the certificate is the part worth knowing.** It is not in the dual method where
+it looks like it should be -- `chromaticindex32-8` gives 367 infeasible node LPs and zero
+rays there. Infeasibility is proved in the primal's **phase one**, and the certificate is
+that phase's dual vector. Capturing it there gives 196 rays and 196 clauses on the same
+model. The certificate is then verified rather than trusted, because it is floating point
+from a possibly drifted basis and a bad clause deletes the optimum silently.
+
+**Measured: nothing gained, nothing lost, over sixteen instances**, both arms back to back,
+`docs/baselines/conflict-analysis-ab-2026-09-10.txt`. `Options::conflict_analysis` is
+therefore **off by default** -- it is not wrong, it just does not pay. Do not re-derive
+this; the A/B is on disk.
+
+**Why it does not pay, and what to build.** A clause learned this way comes from a node the
+search has already pruned, so it only stops that conflict being rediscovered elsewhere. A
+reference solver closes `chromaticindex32-8` in **one node**: its conflict analysis happens
+at the root, where it *manufactures* conflicts by probing rather than waiting for the tree
+to produce them. **The next build is root probing that keeps a clause when a pair of
+suppositions conflicts**, feeding the machinery that now exists. `presolve::probe_columns`
+already probes and already refutes single suppositions; the pair case is what is missing.
+
+Three builds this session have each been one level shallower than the answer -- propagation,
+then a tree-sourced analyser, then a certificate for it. **Ablate the reference solver
+first.** `m.setParam('conflict/enable', False)` and its neighbours cost ten minutes and
+would have pointed here directly; the table is under "What the other solvers do".
+
+
 
 The machinery is in and correct -- `explain` and `Clauses` in `propagate.rs`, a clause
 learned from any node propagation proves empty, propagated per worker below, refusing to

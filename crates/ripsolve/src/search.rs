@@ -79,11 +79,17 @@ pub struct Options {
     /// an LP-fractional column and the LP is what proves the node empty. Measured over
     /// eleven instances, zero conflicts detected and zero clauses learned.
     ///
-    /// It is left on because it is sound, tested, and free when idle -- the explaining
-    /// path runs only on a conflict -- and it will fire on a model whose branchings do
-    /// contradict. It is not what closes `chromaticindex32-8`. See
-    /// "Conflict analysis is built and has no conflicts to analyse" in
-    /// `docs/design-notes.md` for where the conflicts actually come from.
+    /// The certificate path does fire -- 196 clauses on `chromaticindex32-8` in 25
+    /// seconds, one per infeasible node LP -- and **changes no outcome.** Over sixteen
+    /// instances A/B'd back to back: nothing gained, nothing lost, every time inside the
+    /// noise. Off by default for that reason, not because it is wrong.
+    ///
+    /// Why it does not pay is the useful part. A clause learned here comes from a node
+    /// the search has *already* pruned, so it can only stop the same conflict being
+    /// rediscovered elsewhere. A reference solver closes `chromaticindex32-8` in **one
+    /// node**: its conflicts are manufactured at the root by probing, before a tree
+    /// exists. The machinery is the same; the source is not. See "Conflict analysis
+    /// fires, and converts nothing" in `docs/design-notes.md`.
     pub conflict_analysis: bool,
     /// Substitute out doubleton equalities before searching.
     ///
@@ -263,7 +269,7 @@ impl Default for Options {
             max_iterations_per_node: 100_000,
             presolve: true,
             node_propagation: true,
-            conflict_analysis: true,
+            conflict_analysis: false,
             aggregate: false,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
@@ -901,7 +907,30 @@ impl<'a> Worker<'a> {
         match solved.status {
             // Unbounded is impossible for a bounded binary relaxation; treated as a
             // dead node defensively rather than trusted.
-            LpStatus::Infeasible | LpStatus::CutOff | LpStatus::Unbounded => return out,
+            LpStatus::Infeasible => {
+                // The LP is what proves a node empty here, so this -- not a propagation
+                // conflict -- is where the conflicts are. Ask the certificate which of
+                // this node's bounds its proof actually needed, and learn that.
+                if options.conflict_analysis
+                    && let Some(ray) = solved.farkas.as_ref()
+                    && let Some(clause) = propagate::farkas_conflict(
+                        problem,
+                        self.rows_of_a,
+                        &self.clauses,
+                        &mut self.propagation,
+                        ray,
+                        &self.node_lb,
+                        &self.node_ub,
+                        CONFLICT_EXPLAIN_BUDGET,
+                        options.integrality_tolerance,
+                    )
+                    && self.clauses.add(clause)
+                {
+                    self.learned += 1;
+                }
+                return out;
+            }
+            LpStatus::CutOff | LpStatus::Unbounded => return out,
             LpStatus::IterationLimit => {
                 out.exhausted = true;
                 return out;

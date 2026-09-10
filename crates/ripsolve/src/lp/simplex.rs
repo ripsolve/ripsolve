@@ -207,6 +207,16 @@ pub struct LpSolution {
     pub entering_solves: usize,
     pub entering_nonzeros: u64,
     pub entering_sparse_solves: usize,
+    /// A candidate Farkas certificate, when the status is [`LpStatus::Infeasible`] and
+    /// the dual method is what proved it.
+    ///
+    /// One multiplier per row: `B^-T e_r` for the row the dual could not repair. Aggregate
+    /// the model's rows by it and the result is a linear form no point of the current box
+    /// can satisfy, which is what makes it a *proof* rather than an assertion. **It is a
+    /// candidate and not a guarantee** -- the sign convention and the arithmetic both have
+    /// to hold -- so a caller must verify it before resting anything on it; see
+    /// [`crate::propagate::farkas_conflict`].
+    pub farkas: Option<Vec<f64>>,
     /// The final basis, for warm-starting a related solve.
     pub basis: BasisState,
 }
@@ -506,6 +516,7 @@ impl Lp {
                     iterations: 0,
                     bland_iterations: 0,
                     degenerate_iterations: 0,
+                    farkas: None,
                     entering_solves: 0,
                     entering_nonzeros: 0,
                     entering_sparse_solves: 0,
@@ -738,6 +749,8 @@ struct Solver<'a> {
     entering_solves: usize,
     entering_nonzeros: u64,
     entering_sparse_solves: usize,
+    /// Set when the dual method proves infeasibility; see [`LpSolution::farkas`].
+    farkas: Option<Vec<f64>>,
 }
 
 /// What the ratio test decided.
@@ -860,6 +873,7 @@ impl<'a> Solver<'a> {
             entering_solves: 0,
             entering_nonzeros: 0,
             entering_sparse_solves: 0,
+            farkas: None,
         };
         solver.recompute_basic_values();
         solver
@@ -911,6 +925,7 @@ impl<'a> Solver<'a> {
             entering_solves: 0,
             entering_nonzeros: 0,
             entering_sparse_solves: 0,
+            farkas: None,
             basic: start.basic.clone(),
             status,
             z,
@@ -1712,6 +1727,11 @@ impl<'a> Solver<'a> {
                 if rejected_small {
                     return None;
                 }
+                // The row the dual could not repair is the certificate: aggregating the
+                // model by `B^-T e_r` yields a form no point of this box satisfies. Kept
+                // so a caller can *check* that and, if it holds, say which bounds are to
+                // blame. It is handed over unverified on purpose; see `LpSolution::farkas`.
+                self.farkas = Some(rho.clone());
                 return Some(LpStatus::Infeasible);
             };
 
@@ -2035,6 +2055,7 @@ impl<'a> Solver<'a> {
             iterations,
             bland_iterations: self.bland_iterations,
             degenerate_iterations: self.degenerate_iterations,
+            farkas: self.farkas.clone(),
             entering_solves: self.entering_solves,
             entering_nonzeros: self.entering_nonzeros,
             entering_sparse_solves: self.entering_sparse_solves,
@@ -2200,6 +2221,13 @@ impl<'a> Solver<'a> {
                 } else {
                     LpStatus::Optimal
                 };
+                if status == LpStatus::Infeasible {
+                    // Phase one has finished with a violation it cannot remove, and its
+                    // dual vector is the certificate of that: aggregating the model by it
+                    // yields a form the box cannot satisfy. Handed over unverified, like
+                    // the dual method's; see `LpSolution::farkas`.
+                    self.farkas = Some(self.y.clone());
+                }
                 return self.done(status, iterations);
             };
 
@@ -2221,6 +2249,9 @@ impl<'a> Solver<'a> {
                     } else {
                         LpStatus::Unbounded
                     };
+                    if status == LpStatus::Infeasible {
+                        self.farkas = Some(self.y.clone());
+                    }
                     return self.done(status, iterations);
                 }
                 Step::BoundFlip { step } => {

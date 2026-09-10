@@ -505,6 +505,30 @@ pub fn explain(
         }
     }
 
+    walk_to_decisions(problem, rows_of_a, clauses, scratch, lb, budget, moved)
+}
+
+/// Walk whatever is on `scratch.stack` back to the branchings behind it.
+///
+/// Shared by both explainers: one seeds the stack from where propagation broke, the other
+/// from the bounds a Farkas certificate says it needs. Returns `None` on anything that
+/// cannot be rested on -- see [`explain`].
+fn walk_to_decisions(
+    problem: &Problem,
+    rows_of_a: &SparseMatrix,
+    clauses: &Clauses,
+    scratch: &mut Scratch,
+    lb: &[f64],
+    budget: usize,
+    moved: impl Fn(usize) -> bool,
+) -> Option<Clause> {
+    let mut push = |scratch: &mut Scratch, k: usize| {
+        if !scratch.seen[k] {
+            scratch.seen[k] = true;
+            scratch.seen_list.push(k as u32);
+            scratch.stack.push(k as u32);
+        }
+    };
     let mut clause: Clause = Vec::new();
     let mut work = 0usize;
     while let Some(k) = scratch.stack.pop() {
@@ -553,6 +577,143 @@ pub fn explain(
     clause.sort_unstable();
     clause.dedup();
     Some(clause)
+}
+
+/// Turn an infeasible node LP's Farkas certificate into a clause.
+///
+/// The dual simplex proves infeasibility by running out of room on one row, and the
+/// multipliers `B^-T e_r` aggregate the model into a single linear form `c` with a bound
+/// `L` that every point of the model must satisfy -- while no point of *this node's box*
+/// can. That is a proof, and unlike a propagation conflict it is exactly what an LP-driven
+/// search produces in quantity: the LP is what proves a node empty here, not propagation.
+///
+/// **The certificate is verified, not trusted.** The sign convention is settled by trying
+/// both and keeping whichever actually proves infeasibility, and if neither does, nothing
+/// is learned. Resting a globally-obeyed clause on an unchecked dual ray is how a solver
+/// deletes its own optimum, and the ray comes from floating point arithmetic on a basis
+/// that may have drifted.
+///
+/// With a verified certificate, the bounds are relaxed one at a time back to the root's:
+/// any whose relaxation keeps the form unsatisfiable was not needed, and what remains is
+/// the reason. Those are then walked back to the branchings behind them, exactly as a
+/// propagation conflict is.
+#[allow(clippy::too_many_arguments)]
+pub fn farkas_conflict(
+    problem: &Problem,
+    rows_of_a: &SparseMatrix,
+    clauses: &Clauses,
+    scratch: &mut Scratch,
+    ray: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    budget: usize,
+    tolerance: f64,
+) -> Option<Clause> {
+    let n = problem.n_cols();
+    let m = problem.n_rows();
+    if ray.len() < m {
+        return None;
+    }
+
+    // Aggregate the rows the ray touches, in whichever sign proves anything.
+    let mut aggregate = vec![0.0f64; n];
+    let mut work = 0usize;
+    for sign in [1.0f64, -1.0] {
+        aggregate.iter_mut().for_each(|c| *c = 0.0);
+        let mut required = 0.0f64;
+        let mut usable = true;
+        for i in 0..m {
+            let y = sign * ray[i];
+            if y.abs() <= tolerance {
+                continue;
+            }
+            // The row bound this multiplier leans on. Without it the aggregation says
+            // nothing, so a ray needing an infinite bound is not a certificate.
+            let bound = if y > 0.0 {
+                problem.row_lb[i]
+            } else {
+                problem.row_ub[i]
+            };
+            if !bound.is_finite() {
+                usable = false;
+                break;
+            }
+            required += y * bound;
+            let (columns, values) = rows_of_a.column(i);
+            work += columns.len();
+            if work > budget {
+                return None;
+            }
+            for (&j, &a) in columns.iter().zip(values) {
+                aggregate[j] += y * a;
+            }
+        }
+        if !usable {
+            continue;
+        }
+
+        // The most the aggregate can reach inside this node's box. If that falls short of
+        // what every feasible point must reach, the box holds no feasible point.
+        let reach = |lo: &[f64], hi: &[f64]| -> f64 {
+            let mut total = 0.0;
+            for (j, &c) in aggregate.iter().enumerate() {
+                if c == 0.0 {
+                    continue;
+                }
+                total += if c > 0.0 { c * hi[j] } else { c * lo[j] };
+            }
+            total
+        };
+        if !(reach(lb, ub) < required - tolerance) {
+            continue;
+        }
+
+        // Verified. Now find which of this node's bound changes the proof actually needs,
+        // by putting each back and seeing whether the proof survives.
+        let mut relaxed_lb = lb.to_vec();
+        let mut relaxed_ub = ub.to_vec();
+        let mut needed: Vec<u32> = Vec::new();
+        for j in 0..n {
+            let tightened = (lb[j] - problem.col_lb[j]).abs() > tolerance
+                || (ub[j] - problem.col_ub[j]).abs() > tolerance;
+            if !tightened || aggregate[j] == 0.0 {
+                continue;
+            }
+            let (held_lb, held_ub) = (relaxed_lb[j], relaxed_ub[j]);
+            relaxed_lb[j] = problem.col_lb[j];
+            relaxed_ub[j] = problem.col_ub[j];
+            if !(reach(&relaxed_lb, &relaxed_ub) < required - tolerance) {
+                // The proof needs this one; put it back.
+                relaxed_lb[j] = held_lb;
+                relaxed_ub[j] = held_ub;
+                needed.push(j as u32);
+            }
+        }
+        if needed.is_empty() {
+            // The model is infeasible at the root, which is not a clause.
+            return None;
+        }
+
+        scratch.stack.clear();
+        for &j in &scratch.seen_list {
+            scratch.seen[j as usize] = false;
+        }
+        scratch.seen_list.clear();
+        for &j in &needed {
+            let j = j as usize;
+            if !scratch.seen[j] {
+                scratch.seen[j] = true;
+                scratch.seen_list.push(j as u32);
+                scratch.stack.push(j as u32);
+            }
+        }
+        let moved = |k: usize| {
+            (lb[k] - problem.col_lb[k]).abs() > tolerance
+                || (ub[k] - problem.col_ub[k]).abs() > tolerance
+        };
+        return walk_to_decisions(problem, rows_of_a, clauses, scratch, lb, budget, moved);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -782,6 +943,142 @@ mod tests {
             ),
             None,
             "a clause resting on an incumbent-earned bound must not be learned"
+        );
+    }
+
+    /// **The same property, for the certificate-driven clauses.** These are the ones that
+    /// will actually fire, and they rest on a floating point dual ray rather than on a
+    /// chain of exact implications, so they get the same exhaustive treatment: enumerate
+    /// every binary point, learn from every branch whose LP is infeasible, and check each
+    /// clause against every feasible point.
+    #[test]
+    fn a_farkas_clause_never_excludes_a_feasible_point() {
+        use crate::lp::Lp;
+        let mut learned_any = 0;
+        let (mut infeasible_lps, mut rays) = (0, 0);
+        for seed in 0..300u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let n = 4 + (next() % 4) as usize;
+            let mut b = Builder::new(Sense::Maximize);
+            let columns: Vec<usize> = (0..n).map(|j| b.binary(&format!("x{j}"))).collect();
+            b.objective(&columns.iter().map(|&j| (j, 1.0)).collect::<Vec<_>>());
+            for _ in 0..2 + (next() % 4) {
+                let mut terms = Vec::new();
+                for &j in &columns {
+                    if next() % 2 == 0 {
+                        terms.push((j, (next() % 5) as f64 - 2.0));
+                    }
+                }
+                if terms.is_empty() {
+                    continue;
+                }
+                let span: f64 = terms.iter().map(|&(_, a)| a.abs()).sum();
+                let rhs = (next() % (2 * span as u64 + 1)) as f64 - span;
+                let sense = match next() % 3 {
+                    0 => RowSense::Le,
+                    1 => RowSense::Ge,
+                    _ => RowSense::Eq,
+                };
+                b.row(&terms, sense, rhs);
+            }
+            let problem = b.build();
+            let feasible: Vec<Vec<f64>> = (0..1u32 << n)
+                .map(|mask| (0..n).map(|j| f64::from((mask >> j) & 1)).collect::<Vec<f64>>())
+                .filter(|x| crate::heuristic::is_feasible(&problem, x, 1e-9))
+                .collect();
+            if feasible.is_empty() {
+                continue;
+            }
+            let csr = problem.matrix.to_csr();
+            let conflicts = Conflicts::of(&problem);
+
+            for a in 0..n {
+                for va in [0.0, 1.0] {
+                    for c in (a + 1)..n {
+                        for vc in [0.0, 1.0] {
+                            let mut scratch = Scratch::new(n);
+                            let mut lb = problem.col_lb.clone();
+                            let mut ub = problem.col_ub.clone();
+                            lb[a] = va;
+                            ub[a] = va;
+                            lb[c] = vc;
+                            ub[c] = vc;
+                            let seeds =
+                                [(a as u32, Seed::Decision), (c as u32, Seed::Decision)];
+                            // Seed the reasons the walk reads back, without drawing any
+                            // consequence: a zero budget stops propagation before its
+                            // first step. That is deliberate -- on models this small
+                            // propagation refutes every infeasible branch itself, and the
+                            // LP never gets to prove anything, which is exactly the path
+                            // under test here.
+                            if propagate(
+                                &problem,
+                                &csr,
+                                &conflicts,
+                                &Clauses::default(),
+                                &mut scratch,
+                                &mut lb,
+                                &mut ub,
+                                &seeds,
+                                0,
+                                1e-9,
+                            )
+                            .is_err()
+                            {
+                                continue;
+                            }
+                            let mut lp = Lp::relaxation(&problem);
+                            for j in 0..n {
+                                lp.set_column_bounds(j, lb[j], ub[j]);
+                            }
+                            let solved = lp.solve_with_limit(100_000);
+                            if solved.status != crate::lp::LpStatus::Infeasible {
+                                continue;
+                            }
+                            infeasible_lps += 1;
+                            let Some(ray) = solved.farkas.as_ref() else {
+                                continue;
+                            };
+                            rays += 1;
+                            let Some(clause) = farkas_conflict(
+                                &problem,
+                                &csr,
+                                &Clauses::default(),
+                                &mut scratch,
+                                ray,
+                                &lb,
+                                &ub,
+                                usize::MAX,
+                                1e-9,
+                            ) else {
+                                continue;
+                            };
+                            learned_any += 1;
+                            for point in &feasible {
+                                let satisfied = clause
+                                    .iter()
+                                    .any(|&(j, want)| (point[j as usize] > 0.5) == want);
+                                assert!(
+                                    satisfied,
+                                    "seed {seed}: Farkas clause {clause:?} from x{a}={va}, \
+                                     x{c}={vc} excludes the feasible point {point:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            learned_any > 20,
+            "only {learned_any} Farkas clauses learned from {infeasible_lps} infeasible \
+             LPs and {rays} rays, so little was checked"
         );
     }
 
