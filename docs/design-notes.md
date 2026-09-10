@@ -401,6 +401,75 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### What the reference solver does inside its one node, read off its own log
+
+Asked directly, at `display/verblevel 5`. The whole of `chromaticindex32-8` happens in
+three lines:
+
+```text
+ time | node | LP iter | cons | cuts | sepa | confs |  dualbound
+ 0.5s |    1 |    7541 | 2125 |    0 |    0 |    13 | 3.000000e+00
+ 0.8s |    1 |    7551 | 2326 |    0 |    1 |    14 | 4.000000e+00
+```
+
+**The bound goes 3 to 4 on ten LP iterations and two hundred extra constraints**, with
+`cuts` still zero. The statistics name what added them:
+
+```text
+Separators   :  ExecTime  Calls  RootCalls  DomReds  FoundCuts  Conss
+  rapidlearning:    0.21      1          1      620          0    200
+```
+
+`rapidlearning` runs a bounded auxiliary search on a copy of the problem at the root, with
+conflict analysis turned up, and imports what it learns: **200 conflict constraints and 620
+domain reductions in 0.21 seconds.** Those constraints cut off the fractional vertices that
+held the bound at 3, and the root LP then returns 4 in ten more iterations. There is no
+tree. Ablating that one separator:
+
+```text
+    default             optimal   0.68s        1 node
+    no rapidlearning    optimal   5.91s      532 nodes     <- 8.7x
+    no conflict         optimal  42.07s    11782 nodes     <- 62x
+```
+
+And its conflict table says where the conflicts come from -- **propagation, not the LP**:
+
+```text
+Conflict Analysis :  Calls  Success  Conflicts  Literals
+  propagation     :     12       12         17       4.3
+  infeasible LP   :      0        0          0       0.0
+  applied globally:      -        -         14       4.1
+```
+
+So the mechanism is: dive hard somewhere cheap, let propagation contradict, learn the
+clause, and bring it back to the real root. The learner is what this solver already has.
+The dive is what it does not.
+
+### A correction: propagation does conflict here, at one thread
+
+The section below says conflict analysis "fires on nothing", measured over eleven
+instances as zero conflicts. **That was measured at sixteen threads and it is wrong at
+one.** On `chromaticindex32-8`, twenty seconds:
+
+```text
+    one thread       841 propagation calls, 134 conflicts
+    sixteen threads 3772 propagation calls,   0 conflicts
+```
+
+Propagation runs in both -- more often in the parallel search -- and contradicts only in
+the serial one. Why is not established. The plausible reading is that sixteen workers
+drawing from one best-bound pool take the sixteen shallowest open nodes, so no worker ever
+holds an assignment deep enough to contradict, where a single worker following its own
+children goes deeper. **That is a guess and is not measured**, and it is worth settling
+before anything is built on it, because it bears on plunging as well: `plunge_limit`
+defaults to 0 on a measurement taken before any of this existed, when a dive was only a
+primal device and not also the source of learned clauses.
+
+**The conclusion is unchanged even so.** At one thread, where the conflicts are, learning
+them still converts nothing: `chromaticindex32-8` 2560 nodes against 2317, `acc-tight5` 6
+against 5, `neos18` 192 against 198, every bound identical. The feature stays off. What was
+wrong was the reason, not the verdict.
+
 ### Root probing learns implications, and the instance it was for has none to learn
 
 An implication -- supposing `x_j = v` forces `x_k = w` -- is a two-literal clause, and it
