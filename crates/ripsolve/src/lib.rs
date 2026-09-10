@@ -108,6 +108,7 @@ pub mod heuristic;
 pub mod lp;
 pub mod model;
 pub mod presolve;
+pub mod propagate;
 pub mod reader;
 pub mod search;
 pub mod sparse;

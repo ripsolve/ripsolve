@@ -401,6 +401,41 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Node propagation, and what it did and did not do
+
+Built from the comparison below. Two rules to a fixpoint from the columns a branch just
+moved: the conflict graph, and row activity with integer rounding. `crates/ripsolve/src/
+propagate.rs`, bounded in matrix entries because it runs on every node -- stopping early is
+sound, since a bound it proved is implied whether or not it proved the rest.
+
+**It converts `neos-3045796-mogo`**, which this file had recorded as a coin flip at about
+two in five and told the next session not to spend on without a plan for the primal side:
+
+```text
+    propagation OFF   optimal 1 of 5   (47.5s)
+    propagation ON    optimal 5 of 5   (23.2 - 26.4s)
+```
+
+Over twenty instances A/B'd back to back nothing was lost, and the closers mostly got
+faster: `irp` 50.8s to 41.4 on fewer nodes, `nw04` 53.7 to 50.3, `acc-tight2` 44.5 to 41.2,
+`neos-787933` 44.3 to 40.8.
+
+**It did not do what it was built for, and that is the more useful half of the result.**
+The argument was `chromaticindex32-8`, where a reference solver reduces nothing, separates
+nothing and closes in 0.71s. Propagation doubles the node count there, 6652 to 13739, and
+**the bound stays at 3.** Throughput was never that instance's problem; the proof is. What
+is missing is the mechanism that proves a combinatorial statement, and the candidate not
+accounted for anywhere in this file is **conflict analysis** -- deriving a clause from each
+infeasible node and keeping it. That is the next thing to test there.
+
+**A measurement note that cost an hour.** The full 140 run of this change scored 33 and is
+void: it reported losing `ex9` and `neos-913984`, and both fail three runs of three with
+propagation *off* as well as on, while thirty of its thirty-two closers were slower than the
+baseline. Under sustained sixteen-thread load this laptop settles at 1.87 to 2.26 GHz
+against a 2.5 GHz base; a short A/B gets turbo and a 1.7 hour benchmark does not. **A full
+run whose closing instances are uniformly slower than the baseline is measuring the machine.**
+Check that on the first twenty rows, not at the end.
+
 ### What the other solvers do that this one does not, read off their own statistics
 
 Asked directly, rather than inferred: SCIP was run on the instances this solver loses and

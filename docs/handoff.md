@@ -188,41 +188,56 @@ twenty minutes when this was written. Something in that model defeats the deadli
 the checks are every 256 iterations in each simplex loop, so the time is going somewhere
 that is not those loops. Nobody has looked; `pb-fit2d` appears nowhere else in these notes.
 
-## The next build is node propagation, and this is measured rather than argued
+## Node propagation is built, and it converts `neos-3045796-mogo`
 
-SCIP was run on the instances this solver loses and asked which of its components did the
-work. The answer is not cuts and it is mostly not the LP.
+`crates/ripsolve/src/propagate.rs`. Two rules run to a fixpoint from the columns a branch
+just moved: the conflict graph (a fixed binary excludes every literal it is joined to) and
+row activity (a row's reachable range bounds every column in it, rounding inwards on
+integers). A node it proves empty needs no LP at all. It is bounded by work rather than by
+reaching a fixpoint -- `NODE_PROPAGATION_BUDGET`, in matrix entries -- because it runs on
+every node, and stopping early is sound.
 
-**This solver does no propagation at a node.** `search.rs` applies the branch's bound
-changes and calls `solve_warm`; the LP relaxation is the only inference a node makes. SCIP
-propagates every constraint to a fixpoint at every node against a global clique table.
-
-`chromaticindex32-8` isolates it, because every other explanation is ruled out on that
-model: SCIP **reduces nothing** (2304 columns and 2111 rows in and out), separates **no
-cuts**, and closes it in **0.71 seconds** against our sixty and 3959 nodes. We already hold
-its optimum and cannot prove the bound.
-
-**We already build the information and never propagate it.** `examples/conflictstats`:
+**What it converts.** `neos-3045796-mogo`, the coin flip this file said not to spend more
+on without a plan for the primal side:
 
 ```text
-    chromaticindex32-8   12642 edges   2111 cliques      (SCIP's clique table: 8438)
-    acc-tight5           20095 edges    490 cliques
+    propagation OFF   optimal 1 of 5   (47.5s)
+    propagation ON    optimal 5 of 5   (23.2 - 26.4s)
 ```
 
-The conflict graph feeds clique cuts, the feasibility heuristic and root probing. No node
-uses it. Fixing a column to 1 on a colouring model forces every clique-mate to 0, and the
-subtree a bound change would close instead costs an LP solve here. **Build node
-propagation: bound propagation plus the conflict graph, at every node, to a fixpoint.**
+That is the rule this file states -- quote the set that closes every run -- and it passes
+it. Over a 20 instance A/B, both arms back to back, **nothing was lost** and the instances
+that already closed mostly got faster: `irp` 50.8s to 41.4 on fewer nodes, `nw04` 53.7 to
+50.3, `acc-tight2` 44.5 to 41.2, `neos-787933` 44.3 to 40.8. On instances that do not close
+it buys nodes: `chromaticindex32-8` 6652 to 13739, `neos18` 350 to 486, `air05` 948 to 1282.
+`docs/baselines/node-propagation-ab-2026-09-09.txt`.
 
-Second, and independently worth it: **set-packing presolve**. On `neos-633273` SCIP's
-`setppc` fixes **5107 of 11154 columns** where our presolve fixes zero, and it separates no
-cuts on that model at all. Its `linear` presolver's 484 aggregations and 11132 deleted rows
-are exactly what `aggregate.rs` already does, so that half is matched.
+**The full 140 run scored 33 and it is not usable.** It reported losing `ex9` and
+`neos-913984` -- and both fail **three runs of three with propagation off as well as on**.
+Thirty of its thirty-two closing instances were slower than the baseline. The machine could
+not reproduce the 09-14 conditions: under sustained sixteen-thread load this laptop settles
+at 1.87 to 2.26 GHz against a 2.5 GHz base, where a short run gets turbo. `ex9` closed at
+24.5s earlier the same day and at 23.6/24.4s in the A/B an hour before that.
 
-Third, a long tail this file should not start with: `domcol`, dual fixing and inference,
-`gateextraction`, `sparsify`, `stuffing`, `tworowbnd`, `components`. Individually small.
-The full write-up is under "What the other solvers do that this one does not" in
-`design-notes.md`.
+**So the standing is not re-measured and 34 still stands from `binary-2026-09-14.json`,
+with `mogo` a verified gain on top of it.** Before quoting a new number, get a full run
+where the closing instances are not uniformly slower than the baseline -- that is the
+signal that the machine is comparable, and it is worth checking on the first twenty rows
+rather than at the end.
+
+## What propagation did NOT do, which was the reason it was built
+
+The argument for building it was `chromaticindex32-8`: a reference solver reduces nothing
+on it, separates no cuts, and closes it in 0.71s where this spends sixty seconds with the
+optimum already in hand. **Propagation doubles its node throughput and the bound stays at
+3.** The prediction was wrong.
+
+What is still unexplained is how that solver *proves* the bound there with no presolve and
+no cuts. The candidate not yet accounted for is **conflict analysis** -- learning a clause
+from each infeasible node -- which is the standard way a solver proves a combinatorial
+statement like "no 3-colouring exists", and which this solver does not have. That is the
+next thing to test on that instance, and it is a different mechanism from more propagation
+strength.
 
 ## Doubleton aggregation is built, measured, and neutral
 

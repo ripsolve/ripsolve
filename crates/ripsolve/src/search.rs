@@ -19,12 +19,14 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::aggregate;
+use crate::propagate;
 use crate::branch::{self, Pseudocosts};
-use crate::cuts;
+use crate::cuts::{self, Conflicts};
 use crate::compact;
 use crate::heuristic::{self, Limits, Schedule};
 use crate::lp::{BasisState, Lp, LpSolution, LpStatus};
 use crate::model::Problem;
+use crate::sparse::SparseMatrix;
 use crate::presolve::{self, Outcome};
 use crate::symmetry::{self, OrbitScratch, Symmetry};
 
@@ -64,6 +66,11 @@ pub struct Options {
     pub max_iterations_per_node: usize,
     /// Tighten the model before searching.
     pub presolve: bool,
+    /// Propagate the model's own implications at every node, not only at the root.
+    ///
+    /// Without this a node's only inference is its LP relaxation. See
+    /// [`crate::propagate`].
+    pub node_propagation: bool,
     /// Substitute out doubleton equalities before searching.
     ///
     /// Unlike every other reduction here this one renumbers, so it carries a postsolve;
@@ -241,6 +248,7 @@ impl Default for Options {
             gap_tolerance: 1e-4,
             max_iterations_per_node: 100_000,
             presolve: true,
+            node_propagation: true,
             aggregate: false,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
@@ -498,6 +506,18 @@ struct Worker<'a> {
     /// The columns this node branched on, rebuilt per node into a buffer the worker
     /// keeps so that asking for a stabilizer costs no allocation.
     branched: Vec<u32>,
+    /// The model by rows, and which columns exclude one another: what a node needs to
+    /// draw the model's own consequences from the bounds its branch just changed. Both
+    /// are built once for the whole search and shared; see [`crate::propagate`].
+    rows_of_a: &'a SparseMatrix,
+    conflicts: &'a Conflicts,
+    propagation: propagate::Scratch,
+    /// This node's bounds, assembled here before the LP is told any of them, so that
+    /// propagation reasons about the branch rather than about the previous node.
+    node_lb: Vec<f64>,
+    node_ub: Vec<f64>,
+    /// Columns whose bounds this node moved, which is what propagation starts from.
+    moved: Vec<u32>,
 }
 
 impl<'a> Worker<'a> {
@@ -541,6 +561,8 @@ impl<'a> Worker<'a> {
         options: Options,
         lurking: &'a Lurking,
         symmetry: &'a Symmetry,
+        rows_of_a: &'a SparseMatrix,
+        conflicts: &'a Conflicts,
     ) -> Self {
         let n = problem.n_cols();
         Self {
@@ -562,6 +584,12 @@ impl<'a> Worker<'a> {
             symmetry,
             orbits: OrbitScratch::new(n),
             branched: Vec::new(),
+            rows_of_a,
+            conflicts,
+            propagation: propagate::Scratch::new(n),
+            node_lb: problem.col_lb.clone(),
+            node_ub: problem.col_ub.clone(),
+            moved: Vec::new(),
         }
     }
 
@@ -738,12 +766,13 @@ impl<'a> Worker<'a> {
             heuristic_hits: 0,
         };
 
-        // Rebuild this node's bounds from the root. Resetting first costs O(n) and
-        // makes the node independent of whatever the previous one left behind.
-        for j in 0..problem.n_cols() {
-            self.lp
-                .set_column_bounds(j, problem.col_lb[j], problem.col_ub[j]);
-        }
+        // Rebuild this node's bounds from the root, in the worker's own arrays rather
+        // than in the LP. Propagation below has to reason about this node's bounds
+        // before the LP is told any of them, and assembling them here costs the same
+        // O(n) the reset always cost.
+        self.node_lb.copy_from_slice(&problem.col_lb);
+        self.node_ub.copy_from_slice(&problem.col_ub);
+        self.moved.clear();
         // Then whatever the incumbent has earned since the root, which is a statement
         // about the whole tree and so belongs before this node's own branching.
         if !self.lurking.is_empty() && incumbent != self.priced_at {
@@ -755,19 +784,54 @@ impl<'a> Worker<'a> {
             self.priced_at = incumbent;
         }
         for entry in &self.lurking.entries[..self.in_force] {
-            self.lp
-                .set_column_bounds(entry.column as usize, entry.lo, entry.hi);
+            let j = entry.column as usize;
+            self.node_lb[j] = entry.lo;
+            self.node_ub[j] = entry.hi;
+            self.moved.push(entry.column);
         }
         // The branch last, and intersected rather than assigned: a branch that asks for
         // a value the incumbent has already ruled out leaves an empty range, and an
         // empty range is a node with nothing in it rather than a bound to be honoured.
         for &(j, lo, hi) in &node.fixings {
-            let (held_lo, held_hi) = self.lp.column_bounds(j as usize);
-            let (lo, hi) = (lo.max(held_lo), hi.min(held_hi));
+            let j = j as usize;
+            let (lo, hi) = (lo.max(self.node_lb[j]), hi.min(self.node_ub[j]));
             if lo > hi {
                 return out;
             }
-            self.lp.set_column_bounds(j as usize, lo, hi);
+            self.node_lb[j] = lo;
+            self.node_ub[j] = hi;
+            self.moved.push(j as u32);
+        }
+
+        // What the model itself says about those bounds. A node this proves empty needs
+        // no LP at all, which is most of what this is worth.
+        if options.node_propagation && !self.moved.is_empty() {
+            let mut moved = std::mem::take(&mut self.moved);
+            let mut node_lb = std::mem::take(&mut self.node_lb);
+            let mut node_ub = std::mem::take(&mut self.node_ub);
+            let outcome = propagate::propagate(
+                problem,
+                self.rows_of_a,
+                self.conflicts,
+                &mut self.propagation,
+                &mut node_lb,
+                &mut node_ub,
+                &moved,
+                NODE_PROPAGATION_BUDGET,
+                options.integrality_tolerance,
+            );
+            self.node_lb = node_lb;
+            self.node_ub = node_ub;
+            moved.clear();
+            self.moved = moved;
+            if outcome.is_err() {
+                return out;
+            }
+        }
+
+        for j in 0..problem.n_cols() {
+            self.lp
+                .set_column_bounds(j, self.node_lb[j], self.node_ub[j]);
         }
 
         let cutoff = incumbent.is_finite().then_some(incumbent);
@@ -1133,13 +1197,26 @@ fn run_parallel(
         unresolved_bound: AtomicU64::new(f64::INFINITY.to_bits()),
     };
 
+    // Built once for the whole search and shared by every worker: the model by rows, and
+    // which columns exclude one another. Both are read-only from here on.
+    let rows_of_a = problem.matrix.to_csr();
+    let conflicts = Conflicts::of(problem);
+
     std::thread::scope(|scope| {
         for _ in 0..threads {
             // Each worker gets its own LP, since solving a node mutates the column
             // bounds, and its own branching history. Sharing the pseudocosts would
             // pool more evidence but put a lock on the hot path; per-worker history
             // is the cheaper trade at these thread counts.
-            let mut worker = Worker::new(problem, lp.clone(), options, lurking, symmetry);
+            let mut worker = Worker::new(
+                problem,
+                lp.clone(),
+                options,
+                lurking,
+                symmetry,
+                &rows_of_a,
+                &conflicts,
+            );
             let shared = &shared;
             scope.spawn(move || {
                 while let Some(node) = shared.take() {
@@ -2312,7 +2389,17 @@ fn solve_once(
         return Attempt { solution, restart };
     }
 
-    let mut worker = Worker::new(problem, lp, options, &lurking, &symmetry);
+    let rows_of_a = problem.matrix.to_csr();
+    let conflicts = Conflicts::of(problem);
+    let mut worker = Worker::new(
+        problem,
+        lp,
+        options,
+        &lurking,
+        &symmetry,
+        &rows_of_a,
+        &conflicts,
+    );
     let mut restart_wanted = false;
 
     while let Some(node) = open.pop() {
@@ -2475,6 +2562,14 @@ fn narrow_for_restart(problem: &Problem, lurking: &Lurking, incumbent: f64) -> O
 /// budget. A third leaves the bound most of what cutting was going to give it while
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
+
+/// Matrix entries one node's propagation may read before it gives up.
+///
+/// Propagation runs on every node, so it is bounded by work rather than by reaching a
+/// fixpoint: stopping early is sound, since the bounds it has proved are implied whether
+/// or not it proved the rest. The figure is a few passes over an ordinary model and a
+/// small fraction of one node's LP.
+const NODE_PROPAGATION_BUDGET: usize = 50_000;
 
 /// How near an equality a doubleton row must be before it is substituted out.
 ///

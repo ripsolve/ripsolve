@@ -1,0 +1,31 @@
+instance                 propagation OFF          propagation ON          
+neos-633273              TimeLimit   60.1s       2n  TimeLimit   60.2s       2n
+chromaticindex32-8       TimeLimit   60.1s    6652n  TimeLimit   60.1s   13739n
+neos-3045796-mogo        TimeLimit   60.2s    4572n  optimal     27.4s       2n
+supportcase4             TimeLimit   60.0s       1n  TimeLimit   60.0s       1n
+neos-780889              TimeLimit   61.6s       1n  TimeLimit   61.2s       1n
+air05                    TimeLimit   60.1s     948n  TimeLimit   60.1s    1282n
+neos18                   TimeLimit   60.1s     350n  TimeLimit   60.2s     486n
+acc-tight5               TimeLimit   60.0s      36n  TimeLimit   60.0s      40n
+ab71-20-100              TimeLimit   60.1s       2n  TimeLimit   60.1s       2n
+ex9                      optimal     23.6s       2n  optimal     24.4s       2n
+mitre                    optimal      3.7s       4n  optimal      3.6s       4n
+irp                      optimal     50.8s    7763n  optimal     41.4s    5954n
+nw04                     optimal     53.7s    1558n  optimal     50.3s    1464n
+cap6000                  optimal     18.0s    1278n  optimal     19.3s    1097n
+acc-tight2               optimal     44.5s       2n  optimal     41.2s       2n
+n2seq36f                 optimal     10.4s       4n  optimal     11.3s       4n
+disctom                  optimal     15.3s       2n  optimal     14.7s       2n
+neos-1599274             optimal     16.3s     196n  optimal     15.4s     176n
+neos-787933              optimal     44.3s       2n  optimal     40.8s       2n
+neos-1516309             optimal      0.6s       4n  optimal      0.6s       4n
+PROPAB-COMPLETE
+
+neos-3045796-mogo, five runs each way (the documented coin flip):
+  propagation OFF   optimal 1 of 5   (47.5s)
+  propagation ON    optimal 5 of 5   (23.2 - 26.4s)
+
+The two instances the full 140-run reported lost, three runs each way, back to back:
+  ex9           OFF TimeLimit 3/3    ON TimeLimit 3/3
+  neos-913984   OFF TimeLimit 3/3    ON TimeLimit 3/3
+Neither is propagation: both fail with the feature disabled.

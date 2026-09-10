@@ -63,6 +63,9 @@ enum Command {
         /// Skip presolve.
         #[arg(long)]
         no_presolve: bool,
+        /// Skip propagating the model's implications at every node.
+        #[arg(long)]
+        no_node_propagation: bool,
         /// Substitute out doubleton equalities before searching. Off by default: the
         /// reduction is correct and tested but has not been validated on the benchmark.
         #[arg(long)]
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
             verbose,
             solution: solution_path,
             no_presolve,
+            no_node_propagation,
             aggregate,
             cut_rounds,
             cuts_per_round,
@@ -180,6 +184,7 @@ fn main() -> Result<()> {
                 time_limit: time_limit.map(Duration::from_secs_f64),
                 gap_tolerance: gap,
                 presolve: !no_presolve,
+                node_propagation: !no_node_propagation,
                 aggregate,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),

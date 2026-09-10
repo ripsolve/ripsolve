@@ -1113,7 +1113,7 @@ pub struct Conflicts {
 }
 
 /// The node standing for column `j` taking `value`.
-fn literal(j: usize, value: bool) -> u32 {
+pub fn literal(j: usize, value: bool) -> u32 {
     (2 * j + usize::from(!value)) as u32
 }
 
