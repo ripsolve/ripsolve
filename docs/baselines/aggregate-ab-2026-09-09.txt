@@ -1,0 +1,28 @@
+instance                   aggregation OFF      aggregation ON      
+supportcase16              optimal      0.0s      72n   optimal      0.0s     128n
+supportcase14              optimal      0.0s      52n   optimal      0.0s      32n
+neos-831188                TimeLimit   60.1s     837n   TimeLimit   60.1s     820n
+neos-1330346               TimeLimit   60.0s     113n   TimeLimit   60.1s      95n
+acc-tight5                 TimeLimit   60.0s      45n   TimeLimit   60.0s      46n
+neos-1324574               TimeLimit   60.1s      37n   TimeLimit   60.0s      34n
+disctom                    optimal     15.4s       2n   optimal     15.7s       2n
+supportcase4               TimeLimit   60.0s       1n   TimeLimit   60.0s       1n
+cap6000                    optimal     17.2s     737n   optimal     17.8s    2272n
+supportcase3               TimeLimit   60.1s       1n   TimeLimit   60.1s       1n
+neos-633273                TimeLimit 6074.4s       2n   TimeLimit   60.1s       2n
+air04                      TimeLimit   60.1s     347n   TimeLimit   60.1s     346n
+air03                      optimal      1.4s       4n   optimal      1.2s       4n
+neos-578379                TimeLimit   60.2s       1n   TimeLimit   60.2s       2n
+bab5                       TimeLimit   60.4s      89n   TimeLimit   60.4s     117n
+academictimetablesmall     TimeLimit   60.4s       1n   TimeLimit   60.3s       1n
+neos-3148108-pahi          optimal      1.4s       2n   optimal      1.5s       2n
+rail01                     TimeLimit   60.9s       1n   TimeLimit   60.8s       1n
+neos-780889                TimeLimit   61.0s       1n   TimeLimit   60.9s       1n
+supportcase10              TimeLimit   60.7s       1n   TimeLimit   60.8s       1n
+neos-876808                TimeLimit   60.7s       1n   TimeLimit   60.9s       1n
+rail02                     TimeLimit   61.3s       1n   TimeLimit   61.6s       1n
+neos-3555904-turama        TimeLimit   61.3s       1n   TimeLimit   62.1s       1n
+bley_xl1                   TimeLimit   61.1s       1n   TimeLimit   61.3s       1n
+neos-4754521-awarau        optimal      3.7s       2n   optimal      5.4s       2n
+bab6                       TimeLimit   61.5s       1n   TimeLimit   61.4s       1n
+AB2-COMPLETE

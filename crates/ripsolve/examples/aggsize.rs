@@ -15,11 +15,21 @@ fn main() {
                 "{name:<24} {:>8} {:>8} {:>9}   unchanged",
                 problem.n_rows(), problem.n_cols(), problem.matrix.nnz()
             ),
-            Ok(Some((smaller, map))) => println!(
+            Ok(Some((smaller, map))) => { 
+                let colstats = |q: &Problem| {
+                    let mut v: Vec<usize> = (0..q.n_cols()).map(|j| q.matrix.column(j).0.len()).collect();
+                    v.sort_unstable();
+                    let mean = v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+                    (mean, v[v.len()/2], *v.last().unwrap_or(&0))
+                };
+                let (bm, bmed, bmax) = colstats(&problem);
+                let (am, amed, amax) = colstats(&smaller);
+                println!("{name:<20} column nnz  mean {bm:>6.1}->{am:>6.1}  median {bmed:>4}->{amed:>4}  max {bmax:>6}->{amax:>6}");
+                println!(
                 "{name:<24} {:>8} {:>8} {:>9} ->{:>8} {:>8} {:>9}   {} eliminated",
                 problem.n_rows(), problem.n_cols(), problem.matrix.nnz(),
                 smaller.n_rows(), smaller.n_cols(), smaller.matrix.nnz(), map.eliminated()
-            ),
+            ); }
         }
     }
 }

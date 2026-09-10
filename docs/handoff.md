@@ -188,77 +188,77 @@ twenty minutes when this was written. Something in that model defeats the deadli
 the checks are every 256 iterations in each simplex loop, so the time is going somewhere
 that is not those loops. Nobody has looked; `pb-fit2d` appears nowhere else in these notes.
 
-## Doubleton aggregation and postsolve are built. Start here.
+## Doubleton aggregation is built, measured, and neutral
 
-**The code is in and correct; the measurement is not done.** `crates/ripsolve/aggregate.rs`
-substitutes out equality rows on two columns, which removes a row *and* a column, and it
-is the first reduction here that renumbers -- so it carries a real postsolve. It is wired
-into `solve_from` around everything (restarts, presolve, cuts, every node see only the
-smaller model) behind `Options::aggregate` and the CLI's `--no-aggregate`.
+`crates/ripsolve/src/aggregate.rs` substitutes out equality rows on two columns, removing
+a row *and* a column, and carries the first real postsolve in this solver. It is wired
+around everything in `solve_from`, behind `Options::aggregate` and the CLI's `--aggregate`,
+**off by default**.
 
-**It is off by default because it is unvalidated, not because it was rejected.** Turn it
-on, benchmark it **on mains power**, and set the default by the answer.
-
-What it does to the 26 instances of the binary set it touches -- the other 114 have no
-doubleton equality and `aggregate` returns `None`, so they cannot be affected at all:
+**Measured properly and it converts nothing and loses nothing.** Aggregation touches 26 of
+the 140 pure binary instances; the other 114 have no doubleton equality and `aggregate`
+returns `None`, so they cannot be affected. Both arms run back to back on mains in
+`docs/baselines/aggregate-ab-2026-09-09.txt`:
 
 ```text
-    rail02              95791 x 270869  ->   56705 x 231783    39086 columns gone
-    neos-780889         73910 x 182700  ->   47310 x 156100    26600
-    neos-4754521-awarau 255386 x 41680  ->  233430 x  19724    21956
-    rail01              46843 x 117527  ->   26052 x  96736    20791
-    neos-633273         21781 x  11154  ->   11133 x  10670      484 (and half the rows)
+    26 instances, every status identical on and off
+    the only consistent time difference is neos-4754521-awarau, 4.2/4.9s -> 6.6/7.1s
 ```
 
-`neos-633273` is the instance it was built for: its root relaxation goes **4.32s to 1.58**,
-and with cutting off the search goes **727 nodes to 1964** with a better bound.
+The reduction itself is large where it applies -- `rail02` loses 39086 columns,
+`neos-780889` 26600, `rail01` 20791, `neos-633273` half its rows with its root relaxation
+going 4.32s to 1.58 -- and it still changes no outcome. Six of those (`rail01`, `rail02`,
+`neos-780889`, `supportcase10`, `bley_xl1`, `bab6`) reach **one node either way**: their
+root relaxations do not finish, which no amount of column removal fixes.
 
-**The full run that scored 33 against 34 is not evidence and should not be repeated as
-fact.** It was taken with the laptop on battery, measured 1.06 to 1.19x slower than the
-mains baseline it was compared against, and every instance it "lost" or slowed is one
-aggregation never touches: `ex9`, `irp`, `nw04`, `neos-787933`, `eil33-2` all return
-`None` from `aggregate`. `ex9` -- the reported loss -- fails **three runs of three on the
-committed build `6fa6233` itself**, which is the build whose own baseline records it
-optimal at 22.8s. It closes only if probing finishes inside a time-share budget, so a
-tenth slower machine drops it. **Check `cat /sys/class/power_supply/AC/online` before
-trusting any timing in this file from 2026-09-09.**
+**Ignore the earlier run that scored 33.** It was taken on battery, 1.06 to 1.19x slower
+than the mains baseline it was compared against, and every instance it "lost" is one
+aggregation never touches. `ex9`, the reported loss, fails three runs of three on the
+committed build `6fa6233` itself and closes at 24.5s once plugged in. **Check
+`cat /sys/class/power_supply/AC/online` before trusting a timing.**
 
-The like-for-like A/B, both arms back to back on the same machine, got 15 of 26 done
-before the session ended and is in `docs/baselines/aggregate-ab-partial-2026-09-09.txt`.
-**Nothing regressed in it.** Every status identical, and `cap6000` -- which the confounded
-full run blamed on aggregation at 15.4s to 24.1 -- is 20.4s off against **19.3s on**.
-Finish those 26 first; it costs under an hour and answers the question the 1.7 hour run
-could not.
+## The density cap is NOT what stops aggregation paying. Three levers tested, three refuted
 
-## The density cap is the next thing, and the fix is known but unmeasured
+`neos-633273` is the instance aggregation was built for, and with cutting off it goes from
+727 nodes to **1964** with a better bound. Turn cutting on and it is 2 nodes. The obvious
+explanation was the Gomory density cap: aggregation deletes the model's shortest rows, the
+mean row length goes 2.93 to 3.74, and under integer division the cap widens from 48 terms
+to 72. **That explanation is wrong, and so are the two after it.**
 
-Aggregation raises a model's *mean* row length, because the doubleton rows it deletes are
-the shortest rows in the model. The Gomory cap is `24 * (nnz / m)` under integer division,
-so on `neos-633273` it widens from **48 terms to 72**, and this session already established
-that denser cuts collapse node throughput there. That is the mechanism by which a sound
-reduction can cost a solve.
-
-**The mean is the wrong statistic and the median is the right one.** Measured:
+**The cap level is not the lever.** Forcing it, at fifty rounds:
 
 ```text
-                     mean            median         p90
-    neos-633273    2.9 -> 3.8      3 -> 3        3 -> 3
-    ex9           12.6 -> 12.6    13 -> 13      18 -> 18
-    cap6000       22.2 -> 22.9     3 -> 3        3 -> 3
-    irp         2519.3 -> 2519.3 3103 -> 3103  4394 -> 4394
+    cap    aggregation ON        aggregation OFF
+     16    1894 nodes (0 cuts)   482 nodes (0 cuts)
+     30       2 nodes (645)      117 nodes (665)
+     48       2 nodes (774)      111 nodes (757)
+     72       2 nodes (803)        2 nodes (968)
+    120       2 nodes (977)        2 nodes (1020)
 ```
 
-The median is exactly invariant under aggregation where the mean is not, which is the
-property the rule needs: deleting a model's shortest rows should not change what counts as
-a dense cut. `bench/../scratchpad` held the script; it is a dozen lines of `highspy`.
+With aggregation on, **every cap that admits any cut at all collapses to two nodes**. Only
+a cap so tight it admits none (16) leaves a search. The same ~650 cuts at the same cap
+leave 117 nodes on the unaggregated model. So it is not the density of the cuts.
 
-**Do not change the factor at the same time as the statistic.** The current calibration is
-tuned against `neos-1516309`, `n2seq36f`, `irp` and `decomp2`, and the reasoning for each
-is in the constant's own comment in `lp/simplex.rs`. Note `cap6000`'s median is 3 against a
-mean of 22.2, so a median rule would tighten its cap from 532 to 72 -- that one has to be
-checked before anything lands.
+**The ageing trigger is not the lever either.** `active.len() > base.n_rows()` never fires
+on a large model, which is a real defect, but forcing it to fire changes nothing here:
+dividing the threshold by 20, 100 and 400 gives 2 nodes at every setting, down to 190
+cuts, because each purge it triggers costs the cold rebuild the loop otherwise avoids.
 
-## The root cut loop's guard was taking the run, and it is fixed
+**Column density explains the wrong instance.** Aggregation merges columns, so a survivor
+carries the union of both columns' entries -- but measured, `neos-633273`'s columns get
+*sparser*, mean 5.7 to 3.9 with the median and max unmoved. It does explain
+`neos-4754521-awarau`, whose columns double (mean 29.7 to 58.3, median 12 to 26, max 9801
+to 19600) and which is the one instance consistently ~2s slower with aggregation on.
+
+**So what is left is the question nobody has answered: why do a few hundred cuts of
+bounded density cost twenty seconds a node on the aggregated `neos-633273` and a fraction
+of a second on the unaggregated one?** Phase timing says root 1.58s, five rounds 1.3s,
+purge 12s -- about 15 seconds of 60 -- and the remaining 45 go into *two* node LPs. That
+is the thing to profile, and `examples/aggsize.rs` now reports column statistics to help.
+Do not spend another session tuning `DENSITY_FACTOR`; it has been swept.
+
+## The root cut loop's guard was taking the run, and it is fixed## The root cut loop's guard was taking the run, and it is fixed
 
 **A third instance of the fault this file has now recorded three times: a guard given the
 caller's whole remaining clock.** The root cut loop is budgeted by `ROOT_CUT_SHARE`; the
