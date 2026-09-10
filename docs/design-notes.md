@@ -401,6 +401,54 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Conflict analysis is built and has no conflicts to analyse
+
+SCIP's own ablation says this is the mechanism to want. On `chromaticindex32-8`, one
+thread, 120 seconds:
+
+```text
+    default            optimal    0.88s        1 node
+    no conflict        optimal   49.55s    11782 nodes     <- 56x
+    no presolve        optimal    0.66s        1 node
+    no cuts            optimal    4.06s      371 nodes
+    no propagation     timelimit           28398 nodes
+```
+
+And it is not optional elsewhere: without it SCIP **fails to close** `acc-tight5`
+(20.9s -> timelimit) and `supportcase4` (2.2s -> timelimit), and `neos18` goes 16.1s to
+38.8. Four of the nine instances this solver loses to two open solvers.
+
+So it was built: `explain` in `propagate.rs` walks the implication graph back from where
+propagation broke, through the rows, conflicts and earlier clauses that forced each bound,
+until only the branch's own choices remain. Those are a sufficient reason, every step is an
+implication of the model, and negating them is a globally valid clause. A pool per worker
+propagates them, so a conflict found once is not rediscovered. It refuses to learn through
+a bound reduced cost fixing earned, which holds only while the incumbent does.
+
+**It fires on nothing.** Instrumented over eleven instances -- `chromaticindex32-8`,
+`acc-tight5`, `neos18`, `neos-1599274`, `cap6000`, `irp`, `n2seq36f`, `neos-3045796-mogo`,
+`air05`, `ex9`, `disctom` -- **zero conflicts detected and zero clauses learned.**
+
+The reason is structural and worth writing down, because it says what to build instead.
+Branching here picks an LP-fractional column, and fixing such a column rarely contradicts
+the model's *bounds*: there are feasible completions bound-wise, and it is the LP that
+proves the node empty. Propagation at a node tightens; it does not refute. So a conflict
+analyser waiting for propagation to fail waits forever.
+
+**Where SCIP's conflicts actually come from.** It closes `chromaticindex32-8` in **one
+node**, so none of its conflict analysis happens in a tree at all -- it is all root work,
+where it *manufactures* conflicts by probing rather than waiting for them. Its other two
+sources are analysis of an **infeasible LP**, through the dual ray that certifies the
+infeasibility, and of an LP whose bound exceeds the cutoff. Neither exists here.
+
+**What that leaves, in order.** The unit case is already covered: `presolve::probe_columns`
+refutes a supposition and fixes the column to its other value, which is a one-literal
+clause by another name. What is missing is (1) conflict analysis on an **infeasible node
+LP**, using the dual ray to name which bound changes caused it -- this is the source that
+would make the machinery above live, and it needs the simplex to hand back a Farkas
+certificate; and (2) probing that learns clauses of more than one literal. Do not build
+more propagation strength for this; propagation is not what is missing.
+
 ### Node propagation, and what it did and did not do
 
 Built from the comparison below. Two rules to a fixpoint from the columns a branch just

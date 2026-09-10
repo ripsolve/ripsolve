@@ -225,6 +225,39 @@ where the closing instances are not uniformly slower than the baseline -- that i
 signal that the machine is comparable, and it is worth checking on the first twenty rows
 rather than at the end.
 
+## Conflict analysis is built, and needs a source of conflicts. Start here.
+
+The machinery is in and correct -- `explain` and `Clauses` in `propagate.rs`, a clause
+learned from any node propagation proves empty, propagated per worker below, refusing to
+learn through a bound the incumbent earned. **It fires on nothing**: zero conflicts over
+eleven instances. Branching picks an LP-fractional column, fixing one rarely contradicts
+the model's bounds, and it is the LP that proves a node empty. Propagation tightens; it
+does not refute.
+
+**It is still the right thing to want.** SCIP's ablation, one thread:
+
+```text
+    chromaticindex32-8   default 0.88s / 1 node    no conflict analysis 49.55s / 11782
+    acc-tight5           default 20.9s             no conflict analysis TIMELIMIT
+    supportcase4         default  2.2s             no conflict analysis TIMELIMIT
+    neos18               default 16.1s             no conflict analysis 38.8s
+```
+
+**The next build is the source, not the analyser.** SCIP closes `chromaticindex32-8` in one
+node, so its conflicts are made at the root by probing, not found in a tree. Its other
+sources are the **infeasible LP**, explained through the dual ray that certifies it, and
+the LP whose bound exceeds the cutoff.
+
+Of those, the one that would make what is already built pay is **conflict analysis on an
+infeasible node LP**: when the node's relaxation is infeasible, the dual ray names a subset
+of the bound changes responsible, and that subset is exactly the clause `explain` already
+knows how to turn into a constraint. It needs the simplex to return a Farkas certificate,
+which it does not today. That is a bounded piece of work in `lp/simplex.rs` and it is the
+next thing.
+
+The one-literal case is already covered and should not be rebuilt: `presolve::probe_columns`
+refutes a supposition and fixes the column to its other value.
+
 ## What propagation did NOT do, which was the reason it was built
 
 The argument for building it was `chromaticindex32-8`: a reference solver reduces nothing

@@ -71,6 +71,20 @@ pub struct Options {
     /// Without this a node's only inference is its LP relaxation. See
     /// [`crate::propagate`].
     pub node_propagation: bool,
+    /// Learn a clause from every node propagation proves empty, and propagate it below.
+    ///
+    /// Needs `node_propagation`, which is what detects the conflict to learn from -- and
+    /// that is the catch. **On MIPLIB's binary set this fires on nothing**: propagation
+    /// tightens bounds at a node but never contradicts, because branching is chosen on
+    /// an LP-fractional column and the LP is what proves the node empty. Measured over
+    /// eleven instances, zero conflicts detected and zero clauses learned.
+    ///
+    /// It is left on because it is sound, tested, and free when idle -- the explaining
+    /// path runs only on a conflict -- and it will fire on a model whose branchings do
+    /// contradict. It is not what closes `chromaticindex32-8`. See
+    /// "Conflict analysis is built and has no conflicts to analyse" in
+    /// `docs/design-notes.md` for where the conflicts actually come from.
+    pub conflict_analysis: bool,
     /// Substitute out doubleton equalities before searching.
     ///
     /// Unlike every other reduction here this one renumbers, so it carries a postsolve;
@@ -249,6 +263,7 @@ impl Default for Options {
             max_iterations_per_node: 100_000,
             presolve: true,
             node_propagation: true,
+            conflict_analysis: true,
             aggregate: false,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
@@ -512,12 +527,19 @@ struct Worker<'a> {
     rows_of_a: &'a SparseMatrix,
     conflicts: &'a Conflicts,
     propagation: propagate::Scratch,
+    /// Clauses this worker has learned from nodes propagation proved empty. Per worker,
+    /// so the propagation path carries no lock; see [`crate::propagate::Clauses`].
+    clauses: propagate::Clauses,
+    learned: usize,
     /// This node's bounds, assembled here before the LP is told any of them, so that
     /// propagation reasons about the branch rather than about the previous node.
     node_lb: Vec<f64>,
     node_ub: Vec<f64>,
-    /// Columns whose bounds this node moved, which is what propagation starts from.
-    moved: Vec<u32>,
+    /// Columns whose bounds this node moved, which is what propagation starts from, and
+    /// whether each is a branching decision or a bound the incumbent earned. The
+    /// distinction decides whether a conflict may be learned from; see
+    /// [`crate::propagate::Seed`].
+    moved: Vec<(u32, propagate::Seed)>,
 }
 
 impl<'a> Worker<'a> {
@@ -587,6 +609,8 @@ impl<'a> Worker<'a> {
             rows_of_a,
             conflicts,
             propagation: propagate::Scratch::new(n),
+            clauses: propagate::Clauses::new(n, LEARNED_CLAUSE_CAPACITY, LEARNED_CLAUSE_MAX_LENGTH),
+            learned: 0,
             node_lb: problem.col_lb.clone(),
             node_ub: problem.col_ub.clone(),
             moved: Vec::new(),
@@ -787,7 +811,7 @@ impl<'a> Worker<'a> {
             let j = entry.column as usize;
             self.node_lb[j] = entry.lo;
             self.node_ub[j] = entry.hi;
-            self.moved.push(entry.column);
+            self.moved.push((entry.column, propagate::Seed::Assumption));
         }
         // The branch last, and intersected rather than assigned: a branch that asks for
         // a value the incumbent has already ruled out leaves an empty range, and an
@@ -800,7 +824,7 @@ impl<'a> Worker<'a> {
             }
             self.node_lb[j] = lo;
             self.node_ub[j] = hi;
-            self.moved.push(j as u32);
+            self.moved.push((j as u32, propagate::Seed::Decision));
         }
 
         // What the model itself says about those bounds. A node this proves empty needs
@@ -813,6 +837,7 @@ impl<'a> Worker<'a> {
                 problem,
                 self.rows_of_a,
                 self.conflicts,
+                &self.clauses,
                 &mut self.propagation,
                 &mut node_lb,
                 &mut node_ub,
@@ -820,13 +845,36 @@ impl<'a> Worker<'a> {
                 NODE_PROPAGATION_BUDGET,
                 options.integrality_tolerance,
             );
+            if let Err(conflict) = outcome {
+                // The node is empty. Ask why, in terms of the branchings that made it so,
+                // and keep the answer: it is a statement about the model, so every node
+                // below obeys it and no other branch need rediscover it.
+                if options.conflict_analysis {
+                    if let Some(clause) = propagate::explain(
+                        problem,
+                        self.rows_of_a,
+                        &self.clauses,
+                        &mut self.propagation,
+                        conflict,
+                        &node_lb,
+                        &node_ub,
+                        CONFLICT_EXPLAIN_BUDGET,
+                        options.integrality_tolerance,
+                    ) && self.clauses.add(clause)
+                    {
+                        self.learned += 1;
+                    }
+                }
+                self.node_lb = node_lb;
+                self.node_ub = node_ub;
+                moved.clear();
+                self.moved = moved;
+                return out;
+            }
             self.node_lb = node_lb;
             self.node_ub = node_ub;
             moved.clear();
             self.moved = moved;
-            if outcome.is_err() {
-                return out;
-            }
         }
 
         for j in 0..problem.n_cols() {
@@ -2570,6 +2618,20 @@ const ROOT_CUT_SHARE: f64 = 0.33;
 /// or not it proved the rest. The figure is a few passes over an ordinary model and a
 /// small fraction of one node's LP.
 const NODE_PROPAGATION_BUDGET: usize = 50_000;
+
+/// Implication-graph steps one conflict may be walked back through.
+///
+/// An explanation that runs long is one resting on most of the tree, and the clause it
+/// would yield forbids almost nothing while costing a scan at every node below.
+const CONFLICT_EXPLAIN_BUDGET: usize = 2_000;
+
+/// Clauses one worker keeps, and the longest worth keeping.
+///
+/// A long clause is a weak one: it rules out a single assignment of many columns and is
+/// checked at every node touching any of them. The cap on the pool bounds what
+/// propagation pays per node once the search has been running a while.
+const LEARNED_CLAUSE_CAPACITY: usize = 20_000;
+const LEARNED_CLAUSE_MAX_LENGTH: usize = 32;
 
 /// How near an equality a doubleton row must be before it is substituted out.
 ///
