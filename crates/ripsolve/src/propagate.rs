@@ -716,6 +716,115 @@ pub fn farkas_conflict(
     None
 }
 
+/// Probe each binary at the root and keep the implications as clauses.
+///
+/// This is the source the analyser above was missing. A clause learned from a node the
+/// search has already pruned only stops that conflict being rediscovered; a reference
+/// solver closes `chromaticindex32-8` in **one node**, so its conflicts are not harvested
+/// from a tree at all -- they are manufactured at the root, before any branching, by
+/// supposing a value and seeing what follows.
+///
+/// What follows is an *implication*: supposing `x_j = v` forces `x_k = w`. That is a
+/// two-literal clause, "either `x_j` is not `v`, or `x_k` is `w`", and it holds for every
+/// feasible point of the model because every step deriving it was one of the model's own.
+/// Kept and propagated at every node, it says something the rows alone never state and the
+/// conflict graph never held.
+///
+/// Bounded three ways, because this runs before the search gets any time at all: total
+/// work across every probe, work within one probe, and how many clauses are worth keeping.
+/// Implications the conflict graph already carries are skipped -- propagation gets those
+/// from the graph, and a duplicate costs a scan for nothing.
+///
+/// The refuted case -- a supposition that propagation contradicts, proving the column
+/// takes its other value -- is deliberately not collected here. `presolve::probe_columns`
+/// already finds those and fixes the column outright, which is strictly better than a
+/// one-literal clause.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_implications(
+    problem: &Problem,
+    rows_of_a: &SparseMatrix,
+    conflicts: &Conflicts,
+    scratch: &mut Scratch,
+    total_budget: usize,
+    per_probe_budget: usize,
+    max_clauses: usize,
+    tolerance: f64,
+) -> Vec<Clause> {
+    let n = problem.n_cols();
+    let mut out: Vec<Clause> = Vec::new();
+    let mut spent = 0usize;
+    let mut lb = problem.col_lb.clone();
+    let mut ub = problem.col_ub.clone();
+
+    for j in 0..n {
+        if out.len() >= max_clauses || spent >= total_budget {
+            break;
+        }
+        if !is_binary(problem, j) || (problem.col_ub[j] - problem.col_lb[j]).abs() <= tolerance {
+            continue;
+        }
+        // A column joined to nothing implies nothing through the graph, and a probe on it
+        // has only the rows to work with. Those are worth probing too, but the ones that
+        // pay are the connected ones, and the budget is better spent there first.
+        if !conflicts.has_conflicts(literal(j, true)) && !conflicts.has_conflicts(literal(j, false))
+        {
+            continue;
+        }
+
+        for value in [false, true] {
+            if out.len() >= max_clauses || spent >= total_budget {
+                break;
+            }
+            lb.copy_from_slice(&problem.col_lb);
+            ub.copy_from_slice(&problem.col_ub);
+            let supposed = if value { 1.0 } else { 0.0 };
+            lb[j] = supposed;
+            ub[j] = supposed;
+            // Charged the whole probe budget whether or not the probe used it, which
+            // over-counts and is deliberate: `propagate` does not report the work it did,
+            // and a bound that errs towards stopping early is the safe direction for
+            // something running before the search gets any time at all.
+            spent = spent.saturating_add(per_probe_budget);
+            let outcome = propagate(
+                problem,
+                rows_of_a,
+                conflicts,
+                &Clauses::default(),
+                scratch,
+                &mut lb,
+                &mut ub,
+                &[(j as u32, Seed::Decision)],
+                per_probe_budget,
+                tolerance,
+            );
+            // Refuted: presolve's probing already turns this into a fixing. See the note.
+            if outcome.is_err() {
+                continue;
+            }
+            for k in 0..n {
+                if k == j || out.len() >= max_clauses {
+                    continue;
+                }
+                if !is_binary(problem, k) || (ub[k] - lb[k]).abs() > tolerance {
+                    continue;
+                }
+                // Fixed by the probe rather than by the model.
+                if (problem.col_ub[k] - problem.col_lb[k]).abs() <= tolerance {
+                    continue;
+                }
+                let forced = lb[k] > 0.5;
+                // "x_j = value" and "x_k = !forced" cannot both hold. If the graph says
+                // that already, propagation has it and the clause is dead weight.
+                if conflicts.conflicts(literal(j, value), literal(k, !forced)) {
+                    continue;
+                }
+                out.push(vec![(j as u32, !value), (k as u32, forced)]);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +1052,131 @@ mod tests {
             ),
             None,
             "a clause resting on an incumbent-earned bound must not be learned"
+        );
+    }
+
+    #[test]
+    fn probing_learns_an_implication_no_single_row_states() {
+        // x + y <= 1 makes x=1 force y=0, and y + z >= 1 makes y=0 force z=1. So x=1
+        // forces z=1 -- through two rows, which is why no row states it and the conflict
+        // graph, built from rows, does not hold it. That is exactly what probing is for.
+        let mut b = Builder::new(Sense::Maximize);
+        let x = b.binary("x");
+        let y = b.binary("y");
+        let z = b.binary("z");
+        b.objective(&[(x, 1.0), (y, 1.0), (z, 1.0)]);
+        b.row(&[(x, 1.0), (y, 1.0)], RowSense::Le, 1.0);
+        b.row(&[(y, 1.0), (z, 1.0)], RowSense::Ge, 1.0);
+        let problem = b.build();
+        let csr = problem.matrix.to_csr();
+        let conflicts = Conflicts::of(&problem);
+        let mut scratch = Scratch::new(problem.n_cols());
+        let learned = probe_implications(
+            &problem, &csr, &conflicts, &mut scratch, 1_000_000, 10_000, 1000, 1e-9,
+        );
+        assert!(
+            learned.contains(&vec![(x as u32, false), (z as u32, true)]),
+            "x=1 implies z=1 through two rows; learned {learned:?}"
+        );
+        for clause in &learned {
+            assert_eq!(clause.len(), 2, "these are pair clauses: {clause:?}");
+        }
+    }
+
+    #[test]
+    fn probing_does_not_relearn_what_the_conflict_graph_holds() {
+        // A partitioning row is a clique, and propagation already reads it from the
+        // graph. Learning it again would cost a scan at every node for nothing.
+        let mut b = Builder::new(Sense::Maximize);
+        let x = b.binary("x");
+        let y = b.binary("y");
+        let z = b.binary("z");
+        b.objective(&[(x, 1.0), (y, 1.0), (z, 1.0)]);
+        b.row(&[(x, 1.0), (y, 1.0), (z, 1.0)], RowSense::Eq, 1.0);
+        let problem = b.build();
+        let csr = problem.matrix.to_csr();
+        let conflicts = Conflicts::of(&problem);
+        let mut scratch = Scratch::new(problem.n_cols());
+        let learned = probe_implications(
+            &problem, &csr, &conflicts, &mut scratch, 1_000_000, 10_000, 1000, 1e-9,
+        );
+        assert!(
+            learned.is_empty(),
+            "every implication here is already a graph edge; learned {learned:?}"
+        );
+    }
+
+    /// **The property probe-learned clauses rest on.** They are kept for the whole search
+    /// and propagated at every node, so one that excludes a feasible point deletes the
+    /// optimum. Enumerate every binary point of a random model and check every clause
+    /// probing produced against every one of them.
+    #[test]
+    fn a_probed_clause_never_excludes_a_feasible_point() {
+        let mut learned_any = 0;
+        for seed in 0..400u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let n = 4 + (next() % 5) as usize;
+            let mut b = Builder::new(Sense::Maximize);
+            let columns: Vec<usize> = (0..n).map(|j| b.binary(&format!("x{j}"))).collect();
+            b.objective(&columns.iter().map(|&j| (j, 1.0)).collect::<Vec<_>>());
+            for _ in 0..2 + (next() % 4) {
+                let mut terms = Vec::new();
+                for &j in &columns {
+                    if next() % 2 == 0 {
+                        terms.push((j, (next() % 5) as f64 - 2.0));
+                    }
+                }
+                if terms.is_empty() {
+                    continue;
+                }
+                let span: f64 = terms.iter().map(|&(_, a)| a.abs()).sum();
+                let rhs = (next() % (2 * span as u64 + 1)) as f64 - span;
+                let sense = match next() % 3 {
+                    0 => RowSense::Le,
+                    1 => RowSense::Ge,
+                    _ => RowSense::Eq,
+                };
+                b.row(&terms, sense, rhs);
+            }
+            let problem = b.build();
+            let feasible: Vec<Vec<f64>> = (0..1u32 << n)
+                .map(|mask| (0..n).map(|j| f64::from((mask >> j) & 1)).collect::<Vec<f64>>())
+                .filter(|x| crate::heuristic::is_feasible(&problem, x, 1e-9))
+                .collect();
+            if feasible.is_empty() {
+                continue;
+            }
+            let csr = problem.matrix.to_csr();
+            let conflicts = Conflicts::of(&problem);
+            let mut scratch = Scratch::new(n);
+            let learned = probe_implications(
+                &problem, &csr, &conflicts, &mut scratch, 10_000_000, 100_000, 10_000, 1e-9,
+            );
+            learned_any += learned.len();
+            for clause in &learned {
+                for point in &feasible {
+                    let satisfied = clause
+                        .iter()
+                        .any(|&(j, want)| (point[j as usize] > 0.5) == want);
+                    assert!(
+                        satisfied,
+                        "seed {seed}: probed clause {clause:?} excludes the feasible \
+                         point {point:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            learned_any > 20,
+            "only {learned_any} probed clauses, so little was checked. Most implications \
+             on a random model are already conflict graph edges and are deliberately not \
+             relearned, so this counts only the derived ones"
         );
     }
 

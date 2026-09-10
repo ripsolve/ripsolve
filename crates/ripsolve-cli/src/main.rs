@@ -70,6 +70,10 @@ enum Command {
         /// default: it fires but changes no outcome on the benchmark set.
         #[arg(long)]
         conflict_analysis: bool,
+        /// Probe the root for the implications its rows do not state, and keep them as
+        /// clauses. Off by default: it finds plenty and converts nothing.
+        #[arg(long)]
+        root_probing: bool,
         /// Substitute out doubleton equalities before searching. Off by default: the
         /// reduction is correct and tested but has not been validated on the benchmark.
         #[arg(long)]
@@ -171,6 +175,7 @@ fn main() -> Result<()> {
             no_presolve,
             no_node_propagation,
             conflict_analysis,
+            root_probing,
             aggregate,
             cut_rounds,
             cuts_per_round,
@@ -191,6 +196,7 @@ fn main() -> Result<()> {
                 presolve: !no_presolve,
                 node_propagation: !no_node_propagation,
                 conflict_analysis,
+                root_probing,
                 aggregate,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),

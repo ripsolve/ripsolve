@@ -71,6 +71,26 @@ pub struct Options {
     /// Without this a node's only inference is its LP relaxation. See
     /// [`crate::propagate`].
     pub node_propagation: bool,
+    /// Probe each binary at the root and keep what it implies, as clauses propagated at
+    /// every node below.
+    ///
+    /// This is where a conflict-driven search gets its clauses: not from the tree, which
+    /// only rediscovers what it has already pruned, but from supposing values before any
+    /// branching exists. Implications the conflict graph already holds are not relearned.
+    /// See [`crate::propagate::probe_implications`].
+    ///
+    /// **Off by default: it finds plenty and converts nothing.** 20000 clauses on
+    /// `acc-tight5` in 0.09 seconds, 13279 on `neos18`, 956 on `neos-633273` -- and over
+    /// eighteen instances A/B'd back to back, nothing gained, nothing lost, with thirteen
+    /// slightly slower for the propagation the pool costs at every node. `nw04` is the
+    /// worst of them, 35.3s to 48.6.
+    ///
+    /// And **zero clauses on `chromaticindex32-8`**, which is the instance the whole line
+    /// of work was aimed at. That model is pure set packing, so every implication is
+    /// already an edge of the conflict graph -- 12642 of them against the reference
+    /// solver's 8438. Whatever its 56x advantage there is, it is not implications we
+    /// lack, and that rules out the explanation three builds were resting on.
+    pub root_probing: bool,
     /// Learn a clause from every node propagation proves empty, and propagate it below.
     ///
     /// Needs `node_propagation`, which is what detects the conflict to learn from -- and
@@ -269,6 +289,7 @@ impl Default for Options {
             max_iterations_per_node: 100_000,
             presolve: true,
             node_propagation: true,
+            root_probing: false,
             conflict_analysis: false,
             aggregate: false,
             local_cut_frequency: 10,
@@ -591,6 +612,7 @@ impl<'a> Worker<'a> {
         symmetry: &'a Symmetry,
         rows_of_a: &'a SparseMatrix,
         conflicts: &'a Conflicts,
+        seed_clauses: &[propagate::Clause],
     ) -> Self {
         let n = problem.n_cols();
         Self {
@@ -615,7 +637,17 @@ impl<'a> Worker<'a> {
             rows_of_a,
             conflicts,
             propagation: propagate::Scratch::new(n),
-            clauses: propagate::Clauses::new(n, LEARNED_CLAUSE_CAPACITY, LEARNED_CLAUSE_MAX_LENGTH),
+            clauses: {
+                let mut pool = propagate::Clauses::new(
+                    n,
+                    LEARNED_CLAUSE_CAPACITY,
+                    LEARNED_CLAUSE_MAX_LENGTH,
+                );
+                for clause in seed_clauses {
+                    pool.add(clause.clone());
+                }
+                pool
+            },
             learned: 0,
             node_lb: problem.col_lb.clone(),
             node_ub: problem.col_ub.clone(),
@@ -1278,6 +1310,7 @@ fn run_parallel(
     // which columns exclude one another. Both are read-only from here on.
     let rows_of_a = problem.matrix.to_csr();
     let conflicts = Conflicts::of(problem);
+    let probed = root_clauses(problem, &rows_of_a, &conflicts, &options);
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -1293,6 +1326,7 @@ fn run_parallel(
                 symmetry,
                 &rows_of_a,
                 &conflicts,
+                &probed,
             );
             let shared = &shared;
             scope.spawn(move || {
@@ -1763,6 +1797,29 @@ pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) ->
         }
     }
     solve_all_restarts(problem, options, start)
+}
+
+/// Probe the root for implications the conflict graph does not already hold.
+fn root_clauses(
+    problem: &Problem,
+    rows_of_a: &SparseMatrix,
+    conflicts: &Conflicts,
+    options: &Options,
+) -> Vec<propagate::Clause> {
+    if !options.root_probing || conflicts.is_empty() {
+        return Vec::new();
+    }
+    let mut scratch = propagate::Scratch::new(problem.n_cols());
+    propagate::probe_implications(
+        problem,
+        rows_of_a,
+        conflicts,
+        &mut scratch,
+        ROOT_PROBE_TOTAL_BUDGET,
+        ROOT_PROBE_BUDGET,
+        LEARNED_CLAUSE_CAPACITY,
+        options.integrality_tolerance,
+    )
 }
 
 /// The restart loop, on whatever model it was handed.
@@ -2468,6 +2525,7 @@ fn solve_once(
 
     let rows_of_a = problem.matrix.to_csr();
     let conflicts = Conflicts::of(problem);
+    let probed = root_clauses(problem, &rows_of_a, &conflicts, &options);
     let mut worker = Worker::new(
         problem,
         lp,
@@ -2476,6 +2534,7 @@ fn solve_once(
         &symmetry,
         &rows_of_a,
         &conflicts,
+        &probed,
     );
     let mut restart_wanted = false;
 
@@ -2659,6 +2718,14 @@ const CONFLICT_EXPLAIN_BUDGET: usize = 2_000;
 /// A long clause is a weak one: it rules out a single assignment of many columns and is
 /// checked at every node touching any of them. The cap on the pool bounds what
 /// propagation pays per node once the search has been running a while.
+/// What root probing may spend, in matrix entries: across every probe, and within one.
+///
+/// Spent before the search has had a node, so it is bounded tightly and by work rather
+/// than by finishing. A probe that runs out says less than it could, which costs a clause
+/// and never costs a solve.
+const ROOT_PROBE_TOTAL_BUDGET: usize = 20_000_000;
+const ROOT_PROBE_BUDGET: usize = 20_000;
+
 const LEARNED_CLAUSE_CAPACITY: usize = 20_000;
 const LEARNED_CLAUSE_MAX_LENGTH: usize = 32;
 

@@ -225,70 +225,47 @@ where the closing instances are not uniformly slower than the baseline -- that i
 signal that the machine is comparable, and it is worth checking on the first twenty rows
 rather than at the end.
 
-## Conflict analysis is built, fires, and converts nothing. The source is still the gap.
+## The whole conflict-driven line is built and none of it converts. Read this before adding to it.
 
-Both halves exist now. The analyser (`explain`, `Clauses`) learns a clause from any node
-proved empty and propagates it below. The source is `farkas_conflict`: when a node's LP is
-infeasible, the certificate names which of this node's bounds the proof needed, and those
-walk back to the branchings behind them.
-
-**Getting the certificate is the part worth knowing.** It is not in the dual method where
-it looks like it should be -- `chromaticindex32-8` gives 367 infeasible node LPs and zero
-rays there. Infeasibility is proved in the primal's **phase one**, and the certificate is
-that phase's dual vector. Capturing it there gives 196 rays and 196 clauses on the same
-model. The certificate is then verified rather than trusted, because it is floating point
-from a possibly drifted basis and a bad clause deletes the optimum silently.
-
-**Measured: nothing gained, nothing lost, over sixteen instances**, both arms back to back,
-`docs/baselines/conflict-analysis-ab-2026-09-10.txt`. `Options::conflict_analysis` is
-therefore **off by default** -- it is not wrong, it just does not pay. Do not re-derive
-this; the A/B is on disk.
-
-**Why it does not pay, and what to build.** A clause learned this way comes from a node the
-search has already pruned, so it only stops that conflict being rediscovered elsewhere. A
-reference solver closes `chromaticindex32-8` in **one node**: its conflict analysis happens
-at the root, where it *manufactures* conflicts by probing rather than waiting for the tree
-to produce them. **The next build is root probing that keeps a clause when a pair of
-suppositions conflicts**, feeding the machinery that now exists. `presolve::probe_columns`
-already probes and already refutes single suppositions; the pair case is what is missing.
-
-Three builds this session have each been one level shallower than the answer -- propagation,
-then a tree-sourced analyser, then a certificate for it. **Ablate the reference solver
-first.** `m.setParam('conflict/enable', False)` and its neighbours cost ten minutes and
-would have pointed here directly; the table is under "What the other solvers do".
-
-
-
-The machinery is in and correct -- `explain` and `Clauses` in `propagate.rs`, a clause
-learned from any node propagation proves empty, propagated per worker below, refusing to
-learn through a bound the incumbent earned. **It fires on nothing**: zero conflicts over
-eleven instances. Branching picks an LP-fractional column, fixing one rarely contradicts
-the model's bounds, and it is the LP that proves a node empty. Propagation tightens; it
-does not refute.
-
-**It is still the right thing to want.** SCIP's ablation, one thread:
+Four mechanisms, in the order they were built, each aimed at the instances two open solvers
+close and this one does not. All are correct, tested and measured. **One converts.**
 
 ```text
-    chromaticindex32-8   default 0.88s / 1 node    no conflict analysis 49.55s / 11782
-    acc-tight5           default 20.9s             no conflict analysis TIMELIMIT
-    supportcase4         default  2.2s             no conflict analysis TIMELIMIT
-    neos18               default 16.1s             no conflict analysis 38.8s
+    node propagation     converts neos-3045796-mogo, 1 of 5 runs -> 5 of 5.   ON
+    conflict analysis    fires only on propagation conflicts, of which there   off
+                         are none: zero over eleven instances.
+    Farkas certificates  gives it the conflicts -- 196 clauses on              off
+                         chromaticindex32-8 -- and changes no outcome.
+    root probing         20000 clauses on acc-tight5 in 0.09s, 13279 on        off
+                         neos18, and changes no outcome.
 ```
 
-**The next build is the source, not the analyser.** SCIP closes `chromaticindex32-8` in one
-node, so its conflicts are made at the root by probing, not found in a tree. Its other
-sources are the **infeasible LP**, explained through the dual ray that certifies it, and
-the LP whose bound exceeds the cutoff.
+The A/Bs are on disk and should not be re-derived:
+`docs/baselines/node-propagation-ab-2026-09-09.txt`,
+`conflict-analysis-ab-2026-09-10.txt`, `root-probing-ab-2026-09-10.txt`.
 
-Of those, the one that would make what is already built pay is **conflict analysis on an
-infeasible node LP**: when the node's relaxation is infeasible, the dual ray names a subset
-of the bound changes responsible, and that subset is exactly the clause `explain` already
-knows how to turn into a constraint. It needs the simplex to return a Farkas certificate,
-which it does not today. That is a bounded piece of work in `lp/simplex.rs` and it is the
-next thing.
+**The finding that matters most is the last one, because it closes off the explanation the
+other three rested on.** Root probing learns **zero clauses on `chromaticindex32-8`**. That
+model is pure set packing, so every implication is already an edge of the conflict graph --
+which holds **12642 edges against the reference solver's 8438**. We are not short of
+implications there, and we never were. Whatever gives that solver 56x on it, it is not
+information about which pairs of columns exclude one another.
 
-The one-literal case is already covered and should not be rebuilt: `presolve::probe_columns`
-refutes a supposition and fixes the column to its other value.
+So do not build: more propagation strength, a stronger clause learner, a better conflict
+source, or a richer implication graph. Each has now been tried and measured.
+
+**What is left unexplained, precisely.** That solver closes `chromaticindex32-8` in **one
+node** with a bound of 4, having reduced nothing and separated no cuts. We hold the same
+clique information, the optimum, and a root bound of 3, and 12000 nodes will not lift it.
+The remaining difference has to be in what it does *inside* that one node -- some form of
+repeated propagate-and-learn over a dive or a probing tree that raises the root bound
+itself, rather than anything the tree search does. That is the thing to go and read, and
+`conflict/enable` being worth 56x says the learning is part of it.
+
+**Ablate the reference solver before building anything.** Three of these four builds were
+aimed one level shallower than the answer, and each time ten minutes of
+`m.setParam('conflict/enable', False)` and its neighbours would have said so. The table is
+under "What the other solvers do that this one does not".
 
 ## What propagation did NOT do, which was the reason it was built
 

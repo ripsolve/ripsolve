@@ -401,6 +401,38 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Root probing learns implications, and the instance it was for has none to learn
+
+An implication -- supposing `x_j = v` forces `x_k = w` -- is a two-literal clause, and it
+holds for every feasible point because every step deriving it is one of the model's own.
+`probe_implications` supposes each binary's two values at the root, propagates, and keeps
+what follows, skipping anything the conflict graph already holds. It is cheap:
+
+```text
+    acc-tight5           20000 clauses (the cap)   0.09s
+    neos18               13279                     0.04s
+    neos-633273            956                     0.11s
+    chromaticindex32-8       0                     0.02s
+```
+
+**And it converts nothing.** Eighteen instances A/B'd back to back
+(`docs/baselines/root-probing-ab-2026-09-10.txt`): nothing gained, nothing lost, thirteen
+slightly slower for the propagation a large pool costs at every node, `nw04` worst at 35.3s
+to 48.6. Off by default.
+
+**The zero is the useful number.** `chromaticindex32-8` is the instance this whole line of
+work was aimed at, and probing finds *nothing new* on it: the model is pure set packing, so
+every implication is already an edge of the conflict graph. Ours holds 12642 of them
+against the reference solver's 8438. **We are not short of implications, and three builds
+had assumed we were.**
+
+Two bugs found while building it, both of the kind that make a feature look worthless:
+`spent += per_probe_budget` saturates when handed `usize::MAX`, which stopped probing after
+a single probe; and the first test asserted that probing learns the implications of
+`x + y + z = 1`, which it correctly does not, because those are graph edges already. The
+test now checks a *derived* implication across two rows, with a companion asserting the
+graph's own are not relearned.
+
 ### Conflict analysis fires, and converts nothing
 
 The section below built the analyser and found it had no conflicts to work from:

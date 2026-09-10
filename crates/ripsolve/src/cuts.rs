@@ -1343,7 +1343,7 @@ impl Conflicts {
         }
     }
 
-    fn conflicts(&self, p: u32, q: u32) -> bool {
+    pub fn conflicts(&self, p: u32, q: u32) -> bool {
         if self.neighbours[p as usize].binary_search(&q).is_ok() {
             return true;
         }

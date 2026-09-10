@@ -1,0 +1,30 @@
+instance                 probing OFF            probing ON            
+acc-tight5               TimeLimit  60.0s     50n  TimeLimit  60.1s     38n
+neos18                   TimeLimit  60.2s    729n  TimeLimit  60.2s    703n
+neos-633273              TimeLimit  60.1s      2n  TimeLimit  60.3s      2n
+chromaticindex32-8       TimeLimit  60.2s  12846n  TimeLimit  60.2s  12841n
+air05                    TimeLimit  60.1s   1911n  TimeLimit  60.1s   1679n
+ab71-20-100              TimeLimit  60.1s      2n  TimeLimit  60.3s      2n
+supportcase4             TimeLimit  60.0s      1n  TimeLimit  60.0s      1n
+ex9                      optimal    22.0s      2n  optimal    22.3s      2n
+mitre                    optimal     3.2s      4n  optimal     3.7s      4n
+irp                      optimal    39.2s   4750n  optimal    41.7s   6586n
+nw04                     optimal    35.3s   1318n  optimal    48.6s   1326n
+cap6000                  optimal    19.9s    708n  optimal    17.3s   1027n
+acc-tight2               optimal    35.9s      2n  optimal    38.0s      2n
+n2seq36f                 optimal    10.2s      4n  optimal    10.3s      4n
+neos-1599274             optimal    13.6s    296n  optimal    15.7s    286n
+neos-3045796-mogo        optimal    20.3s      2n  optimal    20.1s      2n
+disctom                  optimal    15.0s      2n  optimal    15.4s      2n
+neos-787933              optimal    39.0s      2n  optimal    41.6s      2n
+PROBEAB-COMPLETE
+
+Clauses root probing learns, and what it costs to find them:
+  acc-tight5           20000 clauses (the cap)   0.09s
+  neos18               13279                     0.04s
+  neos-633273            956                     0.11s
+  chromaticindex32-8       0                     0.02s
+
+Zero on chromaticindex32-8 because that model is pure set packing: every implication is
+already an edge of the conflict graph, which holds 12642 of them against the reference
+solver's 8438. Whatever its 56x advantage there is, it is not implications we lack.
