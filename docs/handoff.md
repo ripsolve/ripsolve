@@ -188,6 +188,42 @@ twenty minutes when this was written. Something in that model defeats the deadli
 the checks are every 256 iterations in each simplex loop, so the time is going somewhere
 that is not those loops. Nobody has looked; `pb-fit2d` appears nowhere else in these notes.
 
+## The next build is node propagation, and this is measured rather than argued
+
+SCIP was run on the instances this solver loses and asked which of its components did the
+work. The answer is not cuts and it is mostly not the LP.
+
+**This solver does no propagation at a node.** `search.rs` applies the branch's bound
+changes and calls `solve_warm`; the LP relaxation is the only inference a node makes. SCIP
+propagates every constraint to a fixpoint at every node against a global clique table.
+
+`chromaticindex32-8` isolates it, because every other explanation is ruled out on that
+model: SCIP **reduces nothing** (2304 columns and 2111 rows in and out), separates **no
+cuts**, and closes it in **0.71 seconds** against our sixty and 3959 nodes. We already hold
+its optimum and cannot prove the bound.
+
+**We already build the information and never propagate it.** `examples/conflictstats`:
+
+```text
+    chromaticindex32-8   12642 edges   2111 cliques      (SCIP's clique table: 8438)
+    acc-tight5           20095 edges    490 cliques
+```
+
+The conflict graph feeds clique cuts, the feasibility heuristic and root probing. No node
+uses it. Fixing a column to 1 on a colouring model forces every clique-mate to 0, and the
+subtree a bound change would close instead costs an LP solve here. **Build node
+propagation: bound propagation plus the conflict graph, at every node, to a fixpoint.**
+
+Second, and independently worth it: **set-packing presolve**. On `neos-633273` SCIP's
+`setppc` fixes **5107 of 11154 columns** where our presolve fixes zero, and it separates no
+cuts on that model at all. Its `linear` presolver's 484 aggregations and 11132 deleted rows
+are exactly what `aggregate.rs` already does, so that half is matched.
+
+Third, a long tail this file should not start with: `domcol`, dual fixing and inference,
+`gateextraction`, `sparsify`, `stuffing`, `tworowbnd`, `components`. Individually small.
+The full write-up is under "What the other solvers do that this one does not" in
+`design-notes.md`.
+
 ## Doubleton aggregation is built, measured, and neutral
 
 `crates/ripsolve/src/aggregate.rs` substitutes out equality rows on two columns, removing

@@ -401,6 +401,67 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### What the other solvers do that this one does not, read off their own statistics
+
+Asked directly, rather than inferred: SCIP was run on the instances this solver loses and
+told to report which of its components did the work. That is better evidence than reading
+their source, because it names what mattered *on these models*.
+
+**1. They propagate at every node. This solver does not.** `search.rs` applies a branch's
+bound changes and goes straight to `solve_warm`: the LP relaxation is the only inference
+made at a node. SCIP runs domain propagation over every constraint to a fixpoint at each
+node, backed by a global clique table.
+
+`chromaticindex32-8` is the clean experiment, because it removes every other explanation.
+SCIP **reduces nothing** on it (2304 columns and 2111 rows in, the same out), separates
+**no cuts**, and closes it in **0.71s** against our sixty seconds and 3959 nodes -- while
+holding a clique table of 8438 entries. We already hold the optimal solution (4) and
+cannot prove the bound is not 3.
+
+And the information is not what we are missing. `examples/conflictstats` on the same model:
+
+```text
+    chromaticindex32-8   12642 edges   2111 cliques   longest 4
+    acc-tight5           20095 edges    490 cliques   longest 18
+```
+
+**We build a conflict graph of comparable size and use it only to separate clique cuts, to
+seed heuristics, and to probe at the root.** Nothing propagates it at a node. On a colouring
+model, fixing one column to 1 forces every clique-mate to 0, and a subtree that propagation
+would close in a bound change instead costs an LP solve here. That is the single largest
+architectural difference found, and it is the recommended next build.
+
+**2. They recognise constraint *types* and presolve each one specially.** SCIP converts
+linear rows into set-packing/partitioning/covering, logic-or, knapsack and AND-gate
+constraints, each with its own presolver and propagator. On `neos-633273`:
+
+```text
+    setppc   fixed 5107 of 11154 columns,  aggregated 462,  deleted 44 rows
+    linear   aggregated 484,               deleted 11132 rows
+    logicor  aggregated 22,                deleted 5107 rows
+```
+
+`linear`'s 484 aggregations and ~11000 deleted rows are **exactly what `aggregate.rs` now
+does** -- we match that part. `setppc` fixing 5107 columns is what we do not have: our
+presolve fixes **zero** on this model. And SCIP separates **no cuts at all** on it, where
+we spend the budget on 925.
+
+**3. Their presolve suite is much wider.** Firing on these instances and absent here:
+`domcol` (dominated columns), `dualfix`/`dualagg`/`dualinfer` (dual reductions),
+`gateextraction`, `sparsify`/`dualsparsify`, `stuffing`, `tworowbnd`, `implics`, `vbounds`,
+and `components` (solving independent blocks separately). The sizes it reaches:
+
+```text
+    neos18         3312 x 11402  ->   735 x 3227    closed 14.5s
+    supportcase4   3162 x  9492  ->  1112 x 4370    closed  2.0s
+    neos-633273   11154 x 21781  ->  5079 x 5498    closed  0.5s
+```
+
+**The order this argues for.** Node propagation first: it is one mechanism, the data is
+already built, and it is what `chromaticindex32-8` isolates. Then set-packing presolve,
+which is worth 5107 columns on `neos-633273` alone. The wider presolve suite is a long tail
+of individually small reductions and should come last, whatever its total.
+
 ### The root cut loop's final purge was unbounded, and it cost the whole run
 
 The loop that separates at the root is budgeted by `ROOT_CUT_SHARE`, a third of the run.
