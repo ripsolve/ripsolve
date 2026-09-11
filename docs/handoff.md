@@ -225,47 +225,46 @@ where the closing instances are not uniformly slower than the baseline -- that i
 signal that the machine is comparable, and it is worth checking on the first twenty rows
 rather than at the end.
 
-## The rapid learning dive is built. Finish its A/B first.
+## The conflict-driven line is finished. Do not extend it; the next lever is elsewhere.
 
-`propagate::rapid_learn` -- a bounded depth-first walk over bound assignments, no LP, that
-learns a clause wherever the model contradicts itself. It is the source the rest of the
-conflict machinery was missing, and it is **off by default because its A/B was interrupted,
-not because it was rejected**.
+Five mechanisms built over this and the previous session, all sound, all tested, all
+measured. **One converts.**
 
-**Two things had to be right before it learned anything, and both are easy to get wrong.**
+```text
+    node propagation     neos-3045796-mogo, 1 of 5 runs -> 5 of 5          ON
+    conflict analysis    no conflicts to work from at 16 threads           off
+    Farkas certificates  196 clauses on chromaticindex32-8, no change      off
+    root probing         20000 clauses on acc-tight5, no change            off
+    rapid learning dive  19915 clauses, zero gained and zero lost          off
+```
 
-*It needs an objective cutoff.* Diving on the model alone finds **solutions**, not
-conflicts: `chromaticindex32-8` gave 20000 decisions and **zero** clauses because a
-4-colouring exists and the dive kept finding one. Diving against "strictly better than the
-incumbent" gives 19915. Note *strictly*: a cutoff of 4 on a model whose optimum is 4 also
-yields nothing, because the incumbent still satisfies it.
+A/Bs on disk, not to be re-derived: `node-propagation-ab-2026-09-09.txt`,
+`conflict-analysis-ab-2026-09-10.txt`, `root-probing-ab-2026-09-10.txt`,
+`rapid-learning-ab-2026-09-11.txt`, and the unbounded dive as a cautionary one.
 
-*It needs a clock.* The decision and work budgets bound it on a small model and not on a
-large one. Unbounded it **cost `irp` and `nw04` their solves** and ran `n2seq36f` past 200
-seconds. `RAPID_LEARN_SHARE` fixes that, and with it: `n2seq36f` 9.6s against 10.5,
-`mitre` 3.3 against 4.4, `nw04` 48.9 against 49.5, `irp` 45.5 against 41.0. **That is the
-third time in this file's history that something running before the search got the whole
-clock.** Look for it first in anything new.
+**The closing argument, measured rather than argued.** The reference solver's
+`rapidlearning` returns 200 conflict constraints *and* 620 global domain reductions on
+`chromaticindex32-8`. We now produce the clauses and they do not move the bound --
+`examples/divebound` puts the best 500 into the relaxation as rows and the root stays at 3
+against its 4. So it is the fixings that matter, and `examples/cutoffprobe` shows where
+they cannot come from: probing every column against the objective cutoff decides **zero**,
+with or without the cutoff row. **Propagation cannot derive them** -- "objective at most 3
+and this column is one is infeasible" is an LP statement.
 
-**What to do:** re-run the 18-instance A/B (`/tmp/diveab.sh` pattern, both arms back to
-back) and set the default by it. The unbounded run is kept as
-`docs/baselines/rapid-learning-ab-unbounded-2026-09-10.txt` and is **not** evidence about
-the bounded version; it is there to show what the missing clock cost.
+So anything further here needs a sub-search that *solves LPs* -- the solver run recursively
+under a node limit on the cutoff model, importing the bounds it proves. That is a large
+build and it is the only remaining form of this idea. Weigh it against the rest of the
+board before starting, because five mechanisms on this axis have now returned one instance.
 
-## And the thing the dive still does not do
-
-On `chromaticindex32-8` the clauses do not move the bound. `examples/divebound` adds the
-best 500 of them to the relaxation as rows and the root stays at **3**, where the reference
-solver's 200 constraints take it to **4**. It is not clause length -- ours run median 9
-against its average 4.1.
-
-The measured difference is in the other column of its statistics: alongside 200 constraints
-it applies **620 global domain reductions**, and this dive produces **none**. A domain
-reduction is a fixing, which strengthens everything at once; a clause only forbids a
-combination. So the question to answer next is where those 620 come from -- almost
-certainly from its sub-search proving a bound at the root rather than from conflict clauses
-at all. **Read that before building more clause machinery**, which is now extensive and
-converts nothing.
+**Where the board actually stands.** The standing is 34 of 140, held across
+`binary-2026-09-12/13/14` and unchanged by any of the above except `mogo`. The instances
+two open solvers close and this one does not are nine, and their failure modes are in
+"Where the nine instances two open solvers close actually fail". Of those, the ones nothing
+here has touched are the two whose **root relaxation never finishes** (`supportcase4`,
+`neos-780889`) and `neos-633273`, whose gap is presolve: **10648 of its 21781 rows are the
+identical doubleton `x_p - x_q = 0`**, `aggregate.rs` already removes them, and it is
+neutral because the model that remains is still too hard. Those are different problems from
+this one and none of them wants another clause.
 
 ## The whole conflict-driven line is built and none of it converts
 

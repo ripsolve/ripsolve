@@ -401,6 +401,48 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### The dive is built, measured, and the clause line is closed
+
+`propagate::rapid_learn` dives on the model's bounds and learns from every contradiction.
+Bounded by `RAPID_LEARN_SHARE`, its A/B over eighteen instances is in
+`docs/baselines/rapid-learning-ab-2026-09-11.txt`: **zero gained, zero lost**, every closing
+instance still closing within a few seconds. `neos18` goes 355 nodes to 973 without
+changing status. Off by default.
+
+Two things had to be right before it learned at all, and both are cheap to get wrong:
+
+- **An objective cutoff.** Diving on the model alone finds *solutions*: `chromaticindex32-8`
+  gave 20000 decisions and zero clauses, because a 4-colouring exists. Against "strictly
+  better than the incumbent" it gives 19915. *Strictly* -- a cutoff of 4 on a model whose
+  optimum is 4 yields nothing either.
+- **A clock.** Without one the dive cost `irp` and `nw04` their solves and ran `n2seq36f`
+  past 200 seconds. Third occurrence in this file of something before the search taking the
+  whole run.
+
+**And the line stops here, with a clean negative.** The reference solver's `rapidlearning`
+returns two things: 200 conflict constraints and **620 global domain reductions**. The
+clauses are reproduced and do not move the bound -- `examples/divebound` adds the best 500
+to the relaxation as rows and the root stays at 3, against its 4, with our clauses running
+median length 9 to its average 4.1. So the fixings are what matter, and
+`examples/cutoffprobe` settles where they come from:
+
+```text
+    plain model       0 columns decided by refutation
+    with cutoff row   0 columns decided by refutation
+```
+
+**Propagation cannot derive them.** Showing that "objective at most 3, and this column is
+one" has no solution is LP reasoning; bound propagation cannot see it at all, with or
+without the cutoff row. That solver's sub-search is a real MIP solve with LPs, and its
+domain reductions come from there.
+
+So: **propagation-based learning is exhausted.** Node propagation, conflict analysis,
+Farkas certificates, root probing and the dive are all built, all sound, all tested, and
+between them they convert exactly one instance -- `neos-3045796-mogo`, from node
+propagation. Anything further on this axis needs the sub-search to solve LPs, which is a
+different and much larger thing: running the solver recursively under a node limit on the
+cutoff model and importing what it proves.
+
 ### What the reference solver does inside its one node, read off its own log
 
 Asked directly, at `display/verblevel 5`. The whole of `chromaticindex32-8` happens in

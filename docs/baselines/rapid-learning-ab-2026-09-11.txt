@@ -1,0 +1,27 @@
+instance                 dive OFF               dive ON               
+chromaticindex32-8       TimeLimit  60.1s  11266n  TimeLimit  60.2s  11697n
+acc-tight5               TimeLimit  60.0s     36n  TimeLimit  60.0s     47n
+neos18                   TimeLimit  60.2s    355n  TimeLimit  60.2s    973n
+neos-633273              TimeLimit  60.1s      2n  TimeLimit  60.1s      2n
+air05                    TimeLimit  60.1s   1752n  TimeLimit  60.1s   1762n
+supportcase4             TimeLimit  60.0s      1n  TimeLimit  60.0s      1n
+ex9                      optimal    22.9s      2n  optimal    21.7s      2n
+mitre                    optimal     3.5s      4n  optimal     4.2s      4n
+irp                      optimal    39.6s   4826n  optimal    43.5s   7079n
+nw04                     optimal    36.0s   1352n  optimal    35.7s   1314n
+cap6000                  optimal    19.3s   1476n  optimal    20.6s    738n
+acc-tight2               optimal    38.4s      2n  optimal    38.7s      2n
+n2seq36f                 optimal    10.0s      4n  optimal    10.2s      4n
+neos-1599274             optimal    14.8s    202n  optimal    15.4s    246n
+neos-3045796-mogo        optimal    22.7s      2n  optimal    22.5s      2n
+disctom                  optimal    15.2s      2n  optimal    15.3s      2n
+neos-787933              optimal    41.0s      2n  optimal    41.1s      2n
+neos-1516309             optimal     0.6s      4n  optimal     3.0s      4n
+DIVE3-COMPLETE
+
+The dive bounded by RAPID_LEARN_SHARE. Zero gained, zero lost; every closing instance
+still closes, within a few seconds either way. neos18 goes 355 nodes to 973 without
+changing status; neos-1516309 pays the dive's fixed cost, 0.6s to 3.0.
+
+Compare docs/baselines/rapid-learning-ab-unbounded-2026-09-10.txt, the same A/B without
+the clock: irp and nw04 lost outright, n2seq36f past 300s, mitre 3.5s to 19.5.
