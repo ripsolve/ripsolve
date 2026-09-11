@@ -537,12 +537,17 @@ family, and there is no evidence here about which.
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     34        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     35        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
 
-`docs/baselines/binary-2026-09-14.json`, the run that validated the cut-purge bound below:
-the same 34 instances as `binary-2026-09-13.json` and `binary-2026-09-12.json`, none gained
-and none lost across all three. The paragraph below was written
+`docs/baselines/binary-2026-09-15.json`. **35, and the gain is `neos-3045796-mogo`** --
+node propagation converts it, verified separately at five runs of five against one of five
+without, and this is the first full run since that landed. Nothing lost against
+`binary-2026-09-14.json`, which held 34 across three runs.
+
+Adaptive devex pricing is in the same run and converts nothing on its own; it is there
+because it takes `supportcase4`'s root relaxation from 271 seconds to 15.5 and several
+others with it. See "Pricing decides itself" in `design-notes.md`. The paragraph below was written
 against the 09-12 run and still holds instance for instance. **34 is the
 number this file has been saying the standing really is**: the run before it reported 35
 and the 35th was `neos-3045796-mogo`, a coin flip at about two in five, which landed the

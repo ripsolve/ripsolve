@@ -47,6 +47,14 @@ const ETA_GROWTH_LIMIT: f64 = 1.0;
 
 const CLOCK_INTERVAL: usize = 256;
 
+/// Primal iterations after which pricing switches to devex; see [`Solver::consider_devex`].
+///
+/// Above what an ordinary solve takes and far below what a stalled one does. On the binary
+/// set the relaxations that finish do so in a few thousand iterations, and the ones that do
+/// not run to six figures.
+const DEVEX_AFTER: usize = 5_000;
+
+
 /// Share of the row count at or below which `B^-1 a_q` counts as hyper-sparse.
 ///
 /// The usual threshold in the literature, and the one the reverted implementation was
@@ -751,6 +759,16 @@ struct Solver<'a> {
     entering_sparse_solves: usize,
     /// Set when the dual method proves infeasibility; see [`LpSolution::farkas`].
     farkas: Option<Vec<f64>>,
+    /// Whether devex is pricing right now, which is not the same as whether the option
+    /// asked for it; see [`Solver::consider_devex`].
+    devex_active: bool,
+    /// Whether this solve may switch pricing at all.
+    ///
+    /// Only a cold entry may. A cold solve crosses the whole model and is where a
+    /// relaxation that will not converge announces itself; a warm one starts beside its
+    /// parent's optimum and repairs a bound in a few pivots, so a long warm solve is a
+    /// different animal and switching on it is what cost `neos-787933` its solve.
+    devex_switchable: bool,
 }
 
 /// What the ratio test decided.
@@ -874,6 +892,8 @@ impl<'a> Solver<'a> {
             entering_nonzeros: 0,
             entering_sparse_solves: 0,
             farkas: None,
+            devex_active: lp.tol.primal_devex,
+            devex_switchable: true,
         };
         solver.recompute_basic_values();
         solver
@@ -926,6 +946,8 @@ impl<'a> Solver<'a> {
             entering_nonzeros: 0,
             entering_sparse_solves: 0,
             farkas: None,
+            devex_active: lp.tol.primal_devex,
+            devex_switchable: false,
             basic: start.basic.clone(),
             status,
             z,
@@ -1444,8 +1466,36 @@ impl<'a> Solver<'a> {
     }
 
     /// Whether devex is pricing this solve.
+    ///
+    /// Not a constant: see [`Solver::consider_devex`]. Reading a field rather than the
+    /// option is what lets the rule change mid-solve.
     fn devex(&self) -> bool {
-        self.lp.tol.primal_devex
+        self.devex_active
+    }
+
+    /// Switch pricing to devex once the solve has gone on long enough to prove it needs it.
+    ///
+    /// Devex costs a BTRAN per iteration and is not worth it on a model that converges
+    /// anyway; measured over the whole binary set, running it always **lost two
+    /// instances** -- see [`Tolerances::primal_devex`]. Running it never loses a different
+    /// one: `supportcase4`'s relaxation takes 7891 iterations under devex and **146485**
+    /// under Dantzig, 24 times the wall clock, and the search reaches a single node
+    /// because of it. A reference solver needs 953.
+    ///
+    /// So it is neither, and the model decides. A solve that has not finished in
+    /// [`DEVEX_AFTER`] iterations is one Dantzig is not finishing, and the per-iteration
+    /// cost of devex is cheap against not converging. The weights start from a fresh
+    /// reference framework at the switch, which is the same state a devex solve begins in.
+    fn consider_devex(&mut self, iterations: usize) {
+        if !self.devex_switchable
+            || self.devex_active
+            || self.lp.tol.primal_devex
+            || iterations < DEVEX_AFTER
+        {
+            return;
+        }
+        self.devex_active = true;
+        self.col_weights.fill(1.0);
     }
 
     /// Carry the devex reference weights across a pivot.
@@ -2174,6 +2224,10 @@ impl<'a> Solver<'a> {
             let mut y = std::mem::take(&mut self.y);
             self.basis.btran(&self.cost_b, &mut y);
             self.y = y;
+
+            // A solve this long is one Dantzig is not going to finish; see
+            // `Solver::consider_devex`.
+            self.consider_devex(iterations);
 
             let bland = stalled > PRIMAL_STALL_LIMIT;
             if stalled > PRIMAL_STALL_LIMIT + bland_run {

@@ -401,6 +401,57 @@ interact, and measured separately either one reads as a wash:
 On three of these the iteration count is now *below* HiGHS's. `neos-555001` and
 `gasprod1-2` are the two that prefer Dantzig, and both still solve.
 
+### Pricing decides itself, and it is what `supportcase4`'s relaxation was short of
+
+Devex was turned off earlier because, applied always, it **lost two instances**. It turns
+out never applying it loses a different one, and by much more. `supportcase4`'s root
+relaxation:
+
+```text
+    Dantzig     271.1s   146485 iterations
+    devex        15.5s    10312
+    HiGHS         0.23s     953
+```
+
+Twenty-four times the wall clock, on a model whose search then reaches a single node. So
+neither setting is right and the model should decide: `Solver::consider_devex` switches
+pricing once a solve passes `DEVEX_AFTER` iterations, on the grounds that a solve that has
+not finished by then is one Dantzig is not going to finish, and devex's extra BTRAN is
+cheap against not converging.
+
+**Only a cold solve may switch, and that restriction is the whole of the correctness.** A
+cold solve crosses the whole model and is where a stalling relaxation announces itself. A
+warm one starts beside its parent's optimum and repairs a bound in a few pivots, so a long
+warm solve means something else entirely. Measured, over the full set:
+
+```text
+    switch on cold solves only        35, nothing lost
+    switch on warm solves too, 20000  32, losing ex9, neos-787933, neos-913984
+```
+
+The warm variant was tried because `supportcase4`'s *node* LPs take around 46000 iterations
+each, and it does help there -- four nodes to thirty-six in five minutes. It was still
+wrong: `neos-787933`'s node LPs cross twenty thousand in the ordinary course of a healthy
+solve, and switching them costs it the solve. One instance's node LPs are not every
+instance's.
+
+What it is worth on the relaxations that stall, which is the group it was built for:
+
+```text
+                      Dantzig            switched
+    supportcase4      271.1s / 146485    15.5s / 10312
+    cvs16r106-72       13.0s /  22835     6.2s /  12834
+    air04              24.6s /  71115    17.0s /  32670
+    neos-953928        19.0s /  10554    13.7s /   7507
+    cod105              8.3s /   6337     8.5s /   5855
+    cvs16r70-62         3.5s /   8942     3.9s /   9131
+    tanglegram6       222.2s /  10028   247.9s /   9875
+```
+
+**It converts nothing.** `supportcase4` goes from one node to two and stays open; none of
+the rest changes status. The standing moves to 35 for a different reason -- see below --
+and this lands free on top of it.
+
 ### The dive is built, measured, and the clause line is closed
 
 `propagate::rapid_learn` dives on the model's bounds and learns from every contradiction.
