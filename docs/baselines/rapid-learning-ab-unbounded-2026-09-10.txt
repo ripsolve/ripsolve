@@ -1,0 +1,20 @@
+instance                 dive OFF               dive ON               
+chromaticindex32-8       TimeLimit  60.2s  12777n  TimeLimit  60.1s   7846n
+acc-tight5               TimeLimit  60.0s     49n  TimeLimit  60.1s     44n
+neos18                   TimeLimit  60.2s    731n  TimeLimit  60.2s    738n
+neos-633273              TimeLimit  60.1s      2n  TimeLimit  70.9s      2n
+air05                    TimeLimit  60.1s   1691n  TimeLimit  60.1s   1709n
+supportcase4             TimeLimit  60.0s      1n  TimeLimit  60.0s      1n
+ex9                      optimal    21.7s      2n  optimal    23.5s      2n
+mitre                    optimal     3.5s      4n  optimal    19.5s      4n
+irp                      optimal    37.2s   4620n  TimeLimit  60.1s   1770n
+nw04                     optimal    46.3s   1464n  TimeLimit  74.5s      2n
+cap6000                  optimal    20.8s   2816n  optimal    46.9s    816n
+acc-tight2               optimal    37.1s      2n  optimal    38.3s      2n
+n2seq36f                 optimal     9.0s      4n            300.0s       n
+neos-1599274             optimal    15.0s    286n  optimal    54.6s    286n
+
+This run is of the dive WITHOUT a clock bound, and is kept to show what that cost:
+irp and nw04 both lost their solves, n2seq36f ran past 300 seconds, mitre 3.5s -> 19.5.
+With RAPID_LEARN_SHARE in place those become 45.5/41.0, 48.9/49.5, 9.6/10.5 and 3.3/4.4.
+It is NOT evidence about the bounded version. That A/B was interrupted and wants redoing.

@@ -74,6 +74,10 @@ enum Command {
         /// clauses. Off by default: it finds plenty and converts nothing.
         #[arg(long)]
         root_probing: bool,
+        /// Dive at the root and learn a clause from every contradiction. Off by default:
+        /// it learns plenty and has not been shown to convert anything.
+        #[arg(long)]
+        rapid_learning: bool,
         /// Substitute out doubleton equalities before searching. Off by default: the
         /// reduction is correct and tested but has not been validated on the benchmark.
         #[arg(long)]
@@ -176,6 +180,7 @@ fn main() -> Result<()> {
             no_node_propagation,
             conflict_analysis,
             root_probing,
+            rapid_learning,
             aggregate,
             cut_rounds,
             cuts_per_round,
@@ -197,6 +202,7 @@ fn main() -> Result<()> {
                 node_propagation: !no_node_propagation,
                 conflict_analysis,
                 root_probing,
+                rapid_learning,
                 aggregate,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),

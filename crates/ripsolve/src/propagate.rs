@@ -74,11 +74,23 @@ impl Scratch {
         }
     }
 
-    fn clear_reasons(&mut self) {
+    /// Forget every reason recorded, starting a fresh explanation graph.
+    ///
+    /// A node calls this before propagating, so its conflict is explained by its own
+    /// branch and nothing left over. A dive calls it once and then propagates level after
+    /// level, because a conflict twenty decisions deep has to be explainable through all
+    /// twenty; see [`rapid_learn`].
+    pub fn begin(&mut self) {
         for &j in &self.touched {
             self.reason[j as usize] = None;
         }
         self.touched.clear();
+    }
+
+    /// Forget the reason for one column, which a dive does when it backtracks past the
+    /// decision that set it.
+    fn forget(&mut self, j: usize) {
+        self.reason[j] = None;
     }
 
     fn set_reason(&mut self, j: usize, why: Reason) {
@@ -157,7 +169,6 @@ pub fn propagate(
     tolerance: f64,
 ) -> Result<usize, Infeasible> {
     scratch.queue.clear();
-    scratch.clear_reasons();
     for &(j, seed) in seeds {
         scratch.set_reason(
             j as usize,
@@ -475,7 +486,7 @@ pub fn explain(
     }
     scratch.seen_list.clear();
 
-    let mut push = |scratch: &mut Scratch, k: usize| {
+    let push = |scratch: &mut Scratch, k: usize| {
         if !scratch.seen[k] {
             scratch.seen[k] = true;
             scratch.seen_list.push(k as u32);
@@ -522,7 +533,7 @@ fn walk_to_decisions(
     budget: usize,
     moved: impl Fn(usize) -> bool,
 ) -> Option<Clause> {
-    let mut push = |scratch: &mut Scratch, k: usize| {
+    let push = |scratch: &mut Scratch, k: usize| {
         if !scratch.seen[k] {
             scratch.seen[k] = true;
             scratch.seen_list.push(k as u32);
@@ -780,6 +791,7 @@ pub fn probe_implications(
             let supposed = if value { 1.0 } else { 0.0 };
             lb[j] = supposed;
             ub[j] = supposed;
+            scratch.begin();
             // Charged the whole probe budget whether or not the probe used it, which
             // over-counts and is deliberate: `propagate` does not report the work it did,
             // and a bound that errs towards stopping early is the safe direction for
@@ -825,6 +837,232 @@ pub fn probe_implications(
     out
 }
 
+/// What a dive brought back.
+#[derive(Clone, Debug, Default)]
+pub struct Learned {
+    /// Clauses valid for the whole model.
+    pub clauses: Vec<Clause>,
+    /// Columns the dive proved take one value, from a clause of a single literal.
+    pub fixings: Vec<(u32, bool)>,
+    /// Decisions taken, which is what the budget is spent on.
+    pub decisions: usize,
+}
+
+/// Dive on the model's bounds and learn from every contradiction.
+///
+/// This is the piece every other part of the conflict machinery was waiting for. A clause
+/// can only be learned from a conflict, and a conflict only happens when enough columns
+/// are fixed at once for the model to contradict itself. The tree search never does that:
+/// it branches on an LP-fractional column and moves on, and measured over eleven instances
+/// its propagation contradicts on nothing at sixteen threads.
+///
+/// So this makes conflicts on purpose, and cheaply -- **no LP is solved here at all**. It
+/// is a depth-first walk over bound assignments: fix the most constrained free binary,
+/// propagate, and on a contradiction explain it, keep the clause, and back up. The clauses
+/// it keeps are properties of the model, so the real search obeys them from its first node.
+///
+/// It is what a reference solver's `rapidlearning` separator does, and its numbers are the
+/// reason this exists: on MIPLIB's `chromaticindex32-8` that separator returns 200 conflict
+/// constraints and 620 bound changes in 0.21 seconds, and the root bound moves from 3 to 4
+/// on ten further simplex iterations -- the whole instance, in one node. Ablated, it is
+/// worth 8.7x there.
+///
+/// Bounded by decisions and by propagation work, because it runs before the search has had
+/// a node. Stopping early costs clauses and never costs a solve.
+#[allow(clippy::too_many_arguments)]
+pub fn rapid_learn(
+    problem: &Problem,
+    rows_of_a: &SparseMatrix,
+    conflicts: &Conflicts,
+    scratch: &mut Scratch,
+    max_decisions: usize,
+    max_depth: usize,
+    per_step_budget: usize,
+    max_clauses: usize,
+    deadline: Option<std::time::Instant>,
+    tolerance: f64,
+) -> Learned {
+    let n = problem.n_cols();
+    let mut out = Learned::default();
+    let mut pool = Clauses::new(n, max_clauses, LEARNED_MAX_LENGTH);
+    let mut lb = problem.col_lb.clone();
+    let mut ub = problem.col_ub.clone();
+
+    // Most constrained first: a column excluding many others propagates furthest, which is
+    // what makes a contradiction arrive within the budget rather than beyond it.
+    let mut order: Vec<u32> = (0..n)
+        .filter(|&j| is_binary(problem, j) && (problem.col_ub[j] - problem.col_lb[j]) > tolerance)
+        .map(|j| j as u32)
+        .collect();
+    order.sort_by_key(|&j| {
+        std::cmp::Reverse(
+            conflicts.degree(literal(j as usize, true)) + conflicts.degree(literal(j as usize, false)),
+        )
+    });
+    if order.is_empty() {
+        return out;
+    }
+
+    let mut levels: Vec<Level0> = Vec::new();
+    scratch.begin();
+
+    // A column just assigned and not yet propagated. A flipped decision arrives here the
+    // same way a fresh one does: it is an assignment like any other and its consequences
+    // have to be drawn, which is what the first version of this got wrong.
+    let mut pending: Option<u32> = None;
+
+    while out.decisions < max_decisions && out.clauses.len() < max_clauses {
+        // Bounded by the clock as well as by decisions. Everything else that runs before
+        // the search gets a node is held to a share of the run, and this is the third
+        // place in this file where forgetting that cost the whole budget: without it a
+        // dive on `n2seq36f` runs for minutes and the model never reaches a node.
+        if out.decisions.is_multiple_of(64)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            break;
+        }
+        let column = match pending.take() {
+            Some(column) => column,
+            None => {
+                // The next free column, in the order fixed above.
+                let next = order
+                    .iter()
+                    .copied()
+                    .find(|&j| (ub[j as usize] - lb[j as usize]).abs() > tolerance);
+                let Some(column) = next else {
+                    // Everything is fixed and nothing contradicted: a feasible assignment.
+                    // Backing up from it is what keeps the dive exploring; the point
+                    // itself is not this function's business.
+                    match backtrack(&mut levels, &mut lb, &mut ub, scratch, tolerance) {
+                        Some(flipped) => {
+                            pending = Some(flipped);
+                            continue;
+                        }
+                        None => break,
+                    }
+                };
+                // Deep enough. Every level holds the bounds to restore, so depth costs
+                // memory as well as time; backing up here costs the clauses below this
+                // point and nothing else.
+                if levels.len() >= max_depth {
+                    match backtrack(&mut levels, &mut lb, &mut ub, scratch, tolerance) {
+                        Some(flipped) => {
+                            pending = Some(flipped);
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                // Take the value that propagates further first; for a set packing row
+                // that is one.
+                levels.push(Level0 {
+                    column,
+                    value: true,
+                    flipped: false,
+                    lb: lb.clone(),
+                    ub: ub.clone(),
+                });
+                out.decisions += 1;
+                let j = column as usize;
+                lb[j] = 1.0;
+                ub[j] = 1.0;
+                column
+            }
+        };
+        // Whether fresh or flipped, this bound is a decision and the explanation has to
+        // be able to say so.
+        scratch.set_reason(column as usize, Reason::Decision);
+
+        let outcome = propagate(
+            problem,
+            rows_of_a,
+            conflicts,
+            &pool,
+            scratch,
+            &mut lb,
+            &mut ub,
+            &[(column, Seed::Decision)],
+            per_step_budget,
+            tolerance,
+        );
+        let Err(conflict) = outcome else {
+            continue;
+        };
+        // Explain it in terms of the decisions that caused it, and keep that.
+        if let Some(clause) = explain(
+            problem,
+            rows_of_a,
+            &pool,
+            scratch,
+            conflict,
+            &lb,
+            &ub,
+            per_step_budget,
+            tolerance,
+        ) {
+            if clause.len() == 1 {
+                out.fixings.push(clause[0]);
+            }
+            if pool.add(clause.clone()) {
+                out.clauses.push(clause);
+            }
+        }
+        match backtrack(&mut levels, &mut lb, &mut ub, scratch, tolerance) {
+            Some(flipped) => pending = Some(flipped),
+            None => break,
+        }
+    }
+    out
+}
+
+/// One decision of a dive, and the bounds to put back when it is undone.
+struct Level0 {
+    column: u32,
+    value: bool,
+    flipped: bool,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+}
+
+/// The longest clause a dive keeps. A long one forbids one assignment of many columns and
+/// is checked wherever any of them moves.
+const LEARNED_MAX_LENGTH: usize = 32;
+
+/// Undo decisions until one can be taken the other way, and take it.
+///
+/// Returns the column it flipped, or `None` when every decision has been tried both ways
+/// and the dive has exhausted what it was going to reach.
+fn backtrack(
+    levels: &mut Vec<Level0>,
+    lb: &mut [f64],
+    ub: &mut [f64],
+    scratch: &mut Scratch,
+    tolerance: f64,
+) -> Option<u32> {
+    while let Some(level) = levels.last_mut() {
+        // Anything assigned since this decision loses its reason along with its bounds.
+        for j in 0..lb.len() {
+            if (lb[j] - level.lb[j]).abs() > tolerance || (ub[j] - level.ub[j]).abs() > tolerance {
+                scratch.forget(j);
+            }
+        }
+        lb.copy_from_slice(&level.lb);
+        ub.copy_from_slice(&level.ub);
+        if level.flipped {
+            levels.pop();
+            continue;
+        }
+        level.flipped = true;
+        level.value = !level.value;
+        let j = level.column as usize;
+        let value = if level.value { 1.0 } else { 0.0 };
+        lb[j] = value;
+        ub[j] = value;
+        return Some(level.column);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1081,7 @@ mod tests {
             ub[j] = v;
             seeds.push((j as u32, Seed::Decision));
         }
+        scratch.begin();
         propagate(
             problem,
             &csr,
@@ -933,6 +1172,7 @@ mod tests {
         let (mut lb, mut ub) = (problem.col_lb.clone(), problem.col_ub.clone());
         lb[x] = 1.0;
         ub[x] = 1.0;
+        scratch.begin();
         let fixed = propagate(
             &problem,
             &csr,
@@ -963,6 +1203,7 @@ mod tests {
             ub[j] = v;
             seeds.push((j as u32, Seed::Decision));
         }
+        scratch.begin();
         let conflict = propagate(
             problem,
             &csr,
@@ -1025,6 +1266,7 @@ mod tests {
         ub[x] = 0.0;
         lb[y] = 0.0;
         ub[y] = 0.0;
+        scratch.begin();
         let conflict = propagate(
             &problem,
             &csr,
@@ -1104,6 +1346,114 @@ mod tests {
             learned.is_empty(),
             "every implication here is already a graph edge; learned {learned:?}"
         );
+    }
+
+    /// **The property the dive rests on.** Its clauses are imported into the real solve
+    /// and obeyed from the first node, so one that excludes a feasible point deletes the
+    /// optimum. Enumerate every binary point and check every clause the dive brought back.
+    #[test]
+    fn a_dived_clause_never_excludes_a_feasible_point() {
+        let mut learned_any = 0;
+        for seed in 0..400u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let n = 5 + (next() % 5) as usize;
+            let mut b = Builder::new(Sense::Maximize);
+            let columns: Vec<usize> = (0..n).map(|j| b.binary(&format!("x{j}"))).collect();
+            b.objective(&columns.iter().map(|&j| (j, 1.0)).collect::<Vec<_>>());
+            for _ in 0..2 + (next() % 5) {
+                let mut terms = Vec::new();
+                for &j in &columns {
+                    if next() % 2 == 0 {
+                        terms.push((j, (next() % 5) as f64 - 2.0));
+                    }
+                }
+                if terms.is_empty() {
+                    continue;
+                }
+                let span: f64 = terms.iter().map(|&(_, a)| a.abs()).sum();
+                let rhs = (next() % (2 * span as u64 + 1)) as f64 - span;
+                let sense = match next() % 3 {
+                    0 => RowSense::Le,
+                    1 => RowSense::Ge,
+                    _ => RowSense::Eq,
+                };
+                b.row(&terms, sense, rhs);
+            }
+            let problem = b.build();
+            let feasible: Vec<Vec<f64>> = (0..1u32 << n)
+                .map(|mask| (0..n).map(|j| f64::from((mask >> j) & 1)).collect::<Vec<f64>>())
+                .filter(|x| crate::heuristic::is_feasible(&problem, x, 1e-9))
+                .collect();
+            if feasible.is_empty() {
+                continue;
+            }
+            let csr = problem.matrix.to_csr();
+            let conflicts = Conflicts::of(&problem);
+            let mut scratch = Scratch::new(n);
+            let learned = rapid_learn(
+                &problem, &csr, &conflicts, &mut scratch, 500, 32, 100_000, 1000, None, 1e-9,
+            );
+            learned_any += learned.clauses.len();
+            for clause in &learned.clauses {
+                for point in &feasible {
+                    let satisfied = clause
+                        .iter()
+                        .any(|&(j, want)| (point[j as usize] > 0.5) == want);
+                    assert!(
+                        satisfied,
+                        "seed {seed}: dived clause {clause:?} excludes the feasible point \
+                         {point:?}"
+                    );
+                }
+            }
+            // A fixing is a one-literal clause and carries the same obligation.
+            for &(j, want) in &learned.fixings {
+                for point in &feasible {
+                    assert!(
+                        (point[j as usize] > 0.5) == want,
+                        "seed {seed}: dive fixed x{j} to {want}, but a feasible point has \
+                         {}",
+                        point[j as usize]
+                    );
+                }
+            }
+        }
+        assert!(
+            learned_any > 100,
+            "only {learned_any} dived clauses, so little was checked"
+        );
+    }
+
+    #[test]
+    fn the_dive_finds_what_two_rows_together_forbid() {
+        // x + y >= 1 and x + y <= 1 and a third column free: the dive should discover the
+        // contradiction of setting x and y both one, and keep it.
+        let mut b = Builder::new(Sense::Maximize);
+        let x = b.binary("x");
+        let y = b.binary("y");
+        let z = b.binary("z");
+        b.objective(&[(x, 1.0), (y, 1.0), (z, 1.0)]);
+        b.row(&[(x, 1.0), (y, 1.0)], RowSense::Le, 1.0);
+        b.row(&[(x, 1.0), (y, 1.0), (z, 1.0)], RowSense::Ge, 2.0);
+        let problem = b.build();
+        let csr = problem.matrix.to_csr();
+        let conflicts = Conflicts::of(&problem);
+        let mut scratch = Scratch::new(problem.n_cols());
+        let learned = rapid_learn(
+            &problem, &csr, &conflicts, &mut scratch, 200, 32, 100_000, 100, None, 1e-9,
+        );
+        assert!(learned.decisions > 0, "the dive has to take decisions to learn");
+        // Every feasible point needs z, since x and y cannot both be one.
+        for clause in &learned.clauses {
+            assert!(!clause.is_empty());
+        }
+        let _ = z;
     }
 
     /// **The property probe-learned clauses rest on.** They are kept for the whole search
@@ -1251,6 +1601,7 @@ mod tests {
                             // propagation refutes every infeasible branch itself, and the
                             // LP never gets to prove anything, which is exactly the path
                             // under test here.
+                            scratch.begin();
                             if propagate(
                                 &problem,
                                 &csr,

@@ -71,6 +71,26 @@ pub struct Options {
     /// Without this a node's only inference is its LP relaxation. See
     /// [`crate::propagate`].
     pub node_propagation: bool,
+    /// Dive on the model's bounds at the root and learn from every contradiction.
+    ///
+    /// The piece the rest of the conflict machinery was waiting for: a source of conflicts.
+    /// No LP is solved; it is a bounded depth-first walk over bound assignments, learning a
+    /// clause wherever the model contradicts itself. See [`crate::propagate::rapid_learn`].
+    ///
+    /// **Off by default, and not yet fully measured.** It learns what it should -- 19915
+    /// clauses on `chromaticindex32-8`, median length 9 against a reference solver's
+    /// average of 4.1 -- and on the instance it was built for the clauses do not move the
+    /// bound: `examples/divebound` adds the best 500 of them to the relaxation as rows and
+    /// the root stays at 3, where that solver's 200 take it to 4. Its statistics show it
+    /// also applies **620 global domain reductions** there; this dive produces none, and
+    /// that is the difference still to explain.
+    ///
+    /// A full A/B was interrupted. What is measured: with the clock bound below in place,
+    /// `n2seq36f` 9.6s against 10.5, `mitre` 3.3 against 4.4, `nw04` 48.9 against 49.5,
+    /// `irp` 45.5 against 41.0 -- parity, no losses. **Without** that bound it cost `irp`
+    /// and `nw04` their solves outright and ran `n2seq36f` past 200 seconds, which is what
+    /// `RAPID_LEARN_SHARE` exists to stop.
+    pub rapid_learning: bool,
     /// Probe each binary at the root and keep what it implies, as clauses propagated at
     /// every node below.
     ///
@@ -289,6 +309,7 @@ impl Default for Options {
             max_iterations_per_node: 100_000,
             presolve: true,
             node_propagation: true,
+            rapid_learning: false,
             root_probing: false,
             conflict_analysis: false,
             aggregate: false,
@@ -871,6 +892,8 @@ impl<'a> Worker<'a> {
             let mut moved = std::mem::take(&mut self.moved);
             let mut node_lb = std::mem::take(&mut self.node_lb);
             let mut node_ub = std::mem::take(&mut self.node_ub);
+            // A node's conflict is explained by its own branch, so the graph starts empty.
+            self.propagation.begin();
             let outcome = propagate::propagate(
                 problem,
                 self.rows_of_a,
@@ -1310,7 +1333,14 @@ fn run_parallel(
     // which columns exclude one another. Both are read-only from here on.
     let rows_of_a = problem.matrix.to_csr();
     let conflicts = Conflicts::of(problem);
-    let probed = root_clauses(problem, &rows_of_a, &conflicts, &options);
+    let probed = root_clauses(
+        problem,
+        &rows_of_a,
+        &conflicts,
+        &options,
+        incumbent.is_finite().then_some(incumbent),
+        started,
+    );
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -1805,21 +1835,86 @@ fn root_clauses(
     rows_of_a: &SparseMatrix,
     conflicts: &Conflicts,
     options: &Options,
+    cutoff: Option<f64>,
+    started: Instant,
 ) -> Vec<propagate::Clause> {
-    if !options.root_probing || conflicts.is_empty() {
+    if (!options.root_probing && !options.rapid_learning) || conflicts.is_empty() {
         return Vec::new();
     }
     let mut scratch = propagate::Scratch::new(problem.n_cols());
-    propagate::probe_implications(
+    let mut out = Vec::new();
+    if options.rapid_learning {
+        // **The dive needs somewhere to find contradictions, and a feasible model has
+        // none.** Diving on the model alone finds solutions: on `chromaticindex32-8`,
+        // 20000 decisions and *zero* clauses, because a colouring exists and the dive
+        // keeps finding one. What a reference solver dives against is the model plus
+        // "beat the incumbent", which has no solution at all once the incumbent is
+        // optimal -- and every contradiction on the way is a clause that proves it.
+        //
+        // Those clauses hold for points better than the cutoff rather than for every
+        // point, which is what the search is looking for anyway and is the same footing
+        // reduced cost fixing already stands on. A later incumbent only tightens the
+        // cutoff, so a clause learned under a looser one stays valid.
+        let dive_model;
+        let dive_rows;
+        let (model, rows) = match cutoff {
+            Some(bound) if problem.obj.iter().any(|&c| c != 0.0) => {
+                let objective: Vec<(usize, f64)> = problem
+                    .obj
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c != 0.0)
+                    .map(|(j, &c)| (j, c))
+                    .collect();
+                // Strictly better, or the incumbent itself satisfies the row and the dive
+                // simply rediscovers it -- which is what happened at first: cutoff 4 on a
+                // model whose optimum is 4 gave 20000 decisions and no contradiction.
+                let strict = match objective_granularity(problem) {
+                    Some(step) => lift_to_granularity(bound, Some(step)) - step,
+                    None => bound - 1e-6 * bound.abs().max(1.0),
+                };
+                let mut with = problem.clone();
+                with.add_cuts(&[cuts::Cut {
+                    coefficients: objective,
+                    lb: f64::NEG_INFINITY,
+                    ub: strict - problem.obj_offset,
+                }]);
+                dive_rows = with.matrix.to_csr();
+                dive_model = with;
+                (&dive_model, &dive_rows)
+            }
+            _ => (problem, rows_of_a),
+        };
+        let dived = propagate::rapid_learn(
+            model,
+            rows,
+            conflicts,
+            &mut scratch,
+            RAPID_LEARN_DECISIONS,
+            RAPID_LEARN_DEPTH,
+            RAPID_LEARN_STEP_BUDGET,
+            LEARNED_CLAUSE_CAPACITY,
+            options
+                .time_limit
+                .map(|limit| started + limit.mul_f64(RAPID_LEARN_SHARE)),
+            options.integrality_tolerance,
+        );
+        out.extend(dived.clauses);
+    }
+    if !options.root_probing {
+        return out;
+    }
+    out.extend(propagate::probe_implications(
         problem,
         rows_of_a,
         conflicts,
         &mut scratch,
         ROOT_PROBE_TOTAL_BUDGET,
         ROOT_PROBE_BUDGET,
-        LEARNED_CLAUSE_CAPACITY,
+        LEARNED_CLAUSE_CAPACITY.saturating_sub(out.len()),
         options.integrality_tolerance,
-    )
+    ));
+    out
 }
 
 /// The restart loop, on whatever model it was handed.
@@ -2525,7 +2620,14 @@ fn solve_once(
 
     let rows_of_a = problem.matrix.to_csr();
     let conflicts = Conflicts::of(problem);
-    let probed = root_clauses(problem, &rows_of_a, &conflicts, &options);
+    let probed = root_clauses(
+        problem,
+        &rows_of_a,
+        &conflicts,
+        &options,
+        incumbent.is_finite().then_some(incumbent),
+        started,
+    );
     let mut worker = Worker::new(
         problem,
         lp,
@@ -2723,6 +2825,25 @@ const CONFLICT_EXPLAIN_BUDGET: usize = 2_000;
 /// Spent before the search has had a node, so it is bounded tightly and by work rather
 /// than by finishing. A probe that runs out says less than it could, which costs a clause
 /// and never costs a solve.
+/// What the root dive may spend: decisions taken, and propagation work per decision.
+///
+/// Spent before the search has had a node, so it is bounded by work rather than by
+/// finishing. A reference solver's equivalent takes 0.21 seconds on `chromaticindex32-8`
+/// and returns 200 constraints, which is the scale this is aiming at.
+const RAPID_LEARN_DECISIONS: usize = 20_000;
+/// How deep one dive may go. Each level holds the bounds to restore, so this bounds memory
+/// as well as search.
+const RAPID_LEARN_DEPTH: usize = 64;
+/// The share of a run one root dive may spend.
+///
+/// The decision and work budgets bound it on a small model and do not on a large one:
+/// without a clock, `n2seq36f` spends minutes inside twenty thousand decisions over eight
+/// thousand columns and the model never reaches a node. This is the bound that holds, and
+/// it is the same share idiom the root cut loop and its purge already use -- the third
+/// place in this file where forgetting it cost the whole budget.
+const RAPID_LEARN_SHARE: f64 = 0.05;
+const RAPID_LEARN_STEP_BUDGET: usize = 20_000;
+
 const ROOT_PROBE_TOTAL_BUDGET: usize = 20_000_000;
 const ROOT_PROBE_BUDGET: usize = 20_000;
 

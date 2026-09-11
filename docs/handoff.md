@@ -225,45 +225,47 @@ where the closing instances are not uniformly slower than the baseline -- that i
 signal that the machine is comparable, and it is worth checking on the first twenty rows
 rather than at the end.
 
-## What the reference solver does in its one node, and the one thing left to build
+## The rapid learning dive is built. Finish its A/B first.
 
-Read off its own log at `display/verblevel 5`, on `chromaticindex32-8`:
+`propagate::rapid_learn` -- a bounded depth-first walk over bound assignments, no LP, that
+learns a clause wherever the model contradicts itself. It is the source the rest of the
+conflict machinery was missing, and it is **off by default because its A/B was interrupted,
+not because it was rejected**.
 
-```text
- time | node | LP iter | cons | cuts | sepa | confs |  dualbound
- 0.5s |    1 |    7541 | 2125 |    0 |    0 |    13 | 3.000000e+00
- 0.8s |    1 |    7551 | 2326 |    0 |    1 |    14 | 4.000000e+00
-```
+**Two things had to be right before it learned anything, and both are easy to get wrong.**
 
-The bound goes **3 to 4 on ten LP iterations and two hundred extra constraints**, `cuts`
-still zero. The separator that adds them is **`rapidlearning`**: a bounded auxiliary search
-on a copy of the problem, run at the root with conflict analysis turned up, importing **200
-conflict constraints and 620 domain reductions in 0.21 seconds**. Ablated, it is worth
-8.7x on that instance (0.68s and 1 node against 5.91s and 532); conflict analysis overall
-is worth 62x. Its conflicts come from **propagation**, not from infeasible LPs -- 12 calls,
-17 conflicts, 4.3 literals each.
+*It needs an objective cutoff.* Diving on the model alone finds **solutions**, not
+conflicts: `chromaticindex32-8` gave 20000 decisions and **zero** clauses because a
+4-colouring exists and the dive kept finding one. Diving against "strictly better than the
+incumbent" gives 19915. Note *strictly*: a cutoff of 4 on a model whose optimum is 4 also
+yields nothing, because the incumbent still satisfies it.
 
-**So the missing piece is the dive, not the learner.** Everything needed to turn a conflict
-into a clause and propagate it exists and is tested: `propagate`, `explain`, `Clauses`,
-`farkas_conflict`, `probe_implications`. What is absent is something that goes *deep* on
-purpose, somewhere cheap, so that propagation contradicts often enough to be worth
-learning from. **Build that: a bounded depth-first dive on a copy of the model at the root,
-learning on every conflict, importing the clauses and the fixings.** It is `rapidlearning`,
-and this codebase already has every part except the dive itself.
+*It needs a clock.* The decision and work budgets bound it on a small model and not on a
+large one. Unbounded it **cost `irp` and `nw04` their solves** and ran `n2seq36f` past 200
+seconds. `RAPID_LEARN_SHARE` fixes that, and with it: `n2seq36f` 9.6s against 10.5,
+`mitre` 3.3 against 4.4, `nw04` 48.9 against 49.5, `irp` 45.5 against 41.0. **That is the
+third time in this file's history that something running before the search got the whole
+clock.** Look for it first in anything new.
 
-**One measurement to settle first, because it is cheap and it points the same way.**
-Propagation conflicts at one thread and not at sixteen -- 134 conflicts against 0 on the
-same instance and budget, with propagation running *more* often in the parallel case. The
-likely reason is that sixteen workers drawing from one best-bound pool never hold an
-assignment deep enough to contradict. If that is right, it is the same finding twice:
-depth is what produces conflicts. It also bears on `plunge_limit`, which defaults to 0 on
-a measurement taken before conflicts could be learned at all, when a dive bought only
-incumbents. Re-measure that trade with learning switched on.
+**What to do:** re-run the 18-instance A/B (`/tmp/diveab.sh` pattern, both arms back to
+back) and set the default by it. The unbounded run is kept as
+`docs/baselines/rapid-learning-ab-unbounded-2026-09-10.txt` and is **not** evidence about
+the bounded version; it is there to show what the missing clock cost.
 
-**A correction to the section below.** It records conflict analysis as firing on nothing.
-That was measured at sixteen threads; at one thread it fires plentifully and still converts
-nothing -- `chromaticindex32-8` 2560 nodes against 2317, bounds identical. The verdict
-stands, the stated reason was wrong.
+## And the thing the dive still does not do
+
+On `chromaticindex32-8` the clauses do not move the bound. `examples/divebound` adds the
+best 500 of them to the relaxation as rows and the root stays at **3**, where the reference
+solver's 200 constraints take it to **4**. It is not clause length -- ours run median 9
+against its average 4.1.
+
+The measured difference is in the other column of its statistics: alongside 200 constraints
+it applies **620 global domain reductions**, and this dive produces **none**. A domain
+reduction is a fixing, which strengthens everything at once; a clause only forbids a
+combination. So the question to answer next is where those 620 come from -- almost
+certainly from its sub-search proving a bound at the root rather than from conflict clauses
+at all. **Read that before building more clause machinery**, which is now extensive and
+converts nothing.
 
 ## The whole conflict-driven line is built and none of it converts
 
