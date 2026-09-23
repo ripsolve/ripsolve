@@ -137,16 +137,12 @@ pub struct Options {
     /// see [`crate::aggregate`]. It is the only way to reach models built out of "these
     /// two columns are equal" rows -- `neos-633273` is 10648 of them on 21781 rows.
     ///
-    /// **Off by default because it has not been validated, not because it was measured
-    /// and rejected.** The reduction is correct and tested, and on the 26 instances of
-    /// the binary set it touches it is large: `rail02` loses 39086 columns, `neos-780889`
-    /// 26600, `neos-633273` half its rows with its root relaxation going 4.32s to 1.58.
-    /// The one full run made of it scored 33 against 34, and that run is not evidence:
-    /// it was taken with the machine on battery and roughly a tenth slower than the
-    /// baseline it was compared against, and the instances it "lost" -- `ex9` above all
-    /// -- are ones `aggregate` provably never touches, `ex9` failing three runs of three
-    /// on the *committed* build too. Turn it on and benchmark it on a machine on mains
-    /// before believing either number. See `docs/handoff.md`.
+    /// **On by default since it became the thing that closes `neos-633273`.** Merging
+    /// the equal columns puts each `w` into the partitioning row of the column it equals,
+    /// and conflict-aware coefficient tightening in `presolve` then reads every
+    /// `x - y - w <= 0` as `x <= y`, which makes the first relaxation the optimum. Neither
+    /// half converts it alone. Measured neutral before that on the 26 instances it
+    /// touches; see "Doubleton aggregation" in `docs/handoff.md`.
     pub aggregate: bool,
     /// Separate cuts at one node in every `local_cut_frequency`, not only at the
     /// root. Zero disables node-local cutting.
@@ -312,7 +308,7 @@ impl Default for Options {
             rapid_learning: false,
             root_probing: false,
             conflict_analysis: false,
-            aggregate: false,
+            aggregate: true,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
             jump_moves: 200,

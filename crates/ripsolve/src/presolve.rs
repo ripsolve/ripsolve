@@ -81,8 +81,53 @@ pub fn presolve_until(
         })
         .collect();
 
-    for round in 0..max_rounds {
-        stats.rounds = round + 1;
+    // The cheap reductions run to a fixpoint, then the conflict graph is read off what
+    // they left and used to tighten again; anything that finds is fed back through the
+    // cheap reductions, since a smaller coefficient can make a row redundant or forcing.
+    for pass in 0..=CONFLICT_PASSES {
+        if !cheap_reductions(problem, &mut rows, max_rounds, &mut stats) {
+            return Outcome::Infeasible;
+        }
+        rebuild_matrix(problem, &rows);
+        if pass == CONFLICT_PASSES
+            || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+            || !tighten_with_conflicts(problem, &mut rows, &mut stats)
+        {
+            break;
+        }
+    }
+
+    // Probing last, on the model the cheap reductions have already shrunk.
+    if !probe_columns(problem, &mut stats, deadline) {
+        return Outcome::Infeasible;
+    }
+
+    debug_assert_eq!(problem.n_cols(), n);
+    Outcome::Reduced(stats)
+}
+
+/// Rebuild the column-major matrix from the (possibly retightened) rows.
+///
+/// A coefficient tightened all the way to zero is dropped here rather than stored: the
+/// rest of the solver reads an explicit zero as a column the row mentions.
+fn rebuild_matrix(problem: &mut Problem, rows: &[Row]) {
+    let triplets = rows.iter().enumerate().flat_map(|(i, row)| {
+        row.iter()
+            .filter(|&&(_, v)| v != 0.0)
+            .map(move |&(j, v)| (i, j, v))
+    });
+    problem.matrix = SparseMatrix::from_triplets(problem.n_rows(), problem.n_cols(), triplets);
+}
+
+/// The row-at-a-time reductions, to a fixpoint or `max_rounds`. False on infeasibility.
+fn cheap_reductions(
+    problem: &mut Problem,
+    rows: &mut [Row],
+    max_rounds: usize,
+    stats: &mut Stats,
+) -> bool {
+    for _ in 0..max_rounds {
+        stats.rounds += 1;
         let mut changed = false;
 
         for (i, row) in rows.iter().enumerate() {
@@ -92,7 +137,7 @@ pub fn presolve_until(
             let (min_activity, max_activity) = activity(row, &problem.col_lb, &problem.col_ub);
 
             if min_activity > problem.row_ub[i] + TOL || max_activity < problem.row_lb[i] - TOL {
-                return Outcome::Infeasible;
+                return false;
             }
 
             if min_activity >= problem.row_lb[i] - TOL && max_activity <= problem.row_ub[i] + TOL {
@@ -105,8 +150,8 @@ pub fn presolve_until(
             // Forcing rows: the row is satisfiable only at one end of its activity
             // range, which pins every column appearing in it.
             if (max_activity - problem.row_lb[i]).abs() <= TOL {
-                if !pin_row(problem, row, Extreme::Max, &mut stats) {
-                    return Outcome::Infeasible;
+                if !pin_row(problem, row, Extreme::Max, stats) {
+                    return false;
                 }
                 free_row(problem, i);
                 stats.redundant_rows += 1;
@@ -114,8 +159,8 @@ pub fn presolve_until(
                 continue;
             }
             if (problem.row_ub[i] - min_activity).abs() <= TOL {
-                if !pin_row(problem, row, Extreme::Min, &mut stats) {
-                    return Outcome::Infeasible;
+                if !pin_row(problem, row, Extreme::Min, stats) {
+                    return false;
                 }
                 free_row(problem, i);
                 stats.redundant_rows += 1;
@@ -123,24 +168,24 @@ pub fn presolve_until(
                 continue;
             }
 
-            match propagate(problem, row, i, min_activity, max_activity, &mut stats) {
-                Propagation::Infeasible => return Outcome::Infeasible,
+            match propagate(problem, row, i, min_activity, max_activity, stats) {
+                Propagation::Infeasible => return false,
                 Propagation::Changed => changed = true,
                 Propagation::Unchanged => {}
             }
         }
 
         for (i, row) in rows.iter_mut().enumerate() {
-            if tighten_coefficients(problem, row, i, &mut stats) {
+            if tighten_coefficients(problem, row, i, stats) {
                 changed = true;
             }
         }
 
-        if fix_columns_absent_from_every_row(problem, &rows, &mut stats) {
+        if fix_columns_absent_from_every_row(problem, rows, stats) {
             changed = true;
         }
 
-        if fix_singleton_columns(problem, &rows, &mut stats) {
+        if fix_singleton_columns(problem, rows, stats) {
             changed = true;
         }
 
@@ -149,20 +194,7 @@ pub fn presolve_until(
         }
     }
 
-    // Rebuild the column-major matrix from the (possibly retightened) rows.
-    let triplets = rows
-        .iter()
-        .enumerate()
-        .flat_map(|(i, row)| row.iter().map(move |&(j, v)| (i, j, v)));
-    problem.matrix = SparseMatrix::from_triplets(m, n, triplets);
-
-    // Probing last, on the model the cheap reductions have already shrunk.
-    if !probe_columns(problem, &mut stats, deadline) {
-        return Outcome::Infeasible;
-    }
-
-    debug_assert_eq!(problem.n_cols(), n);
-    Outcome::Reduced(stats)
+    true
 }
 
 fn is_free(lb: f64, ub: f64) -> bool {
@@ -502,6 +534,139 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
     }
     changed
 }
+
+/// Times the conflict graph is rebuilt and read for coefficients. Each pass can only
+/// find something the previous one's tightened rows made derivable, and on the models
+/// measured the second pass finds nothing.
+const CONFLICT_PASSES: usize = 2;
+
+/// Pairs of a row a conflict pass may test, as a multiple of the matrix's entries.
+///
+/// A row of length `k` costs `k * k` membership tests, which is nothing on a three-column
+/// row and ruinous on a set partitioning row of thousands; the graph's own reading of
+/// those rows as cliques is already the stronger statement of them.
+const CONFLICT_WORK_PER_ENTRY: usize = 64;
+
+/// Longest row a conflict pass reads. See `CONFLICT_WORK_PER_ENTRY`.
+const CONFLICT_MAX_ROW: usize = 64;
+
+/// Coefficient tightening again, with the columns a binary excludes held at their values.
+///
+/// `tighten_coefficients` shrinks a coefficient to what the row can use when the column
+/// is on (or off), reading every other column's range from its bounds. But setting a
+/// binary also settles every column it conflicts with, and a column so settled cannot
+/// contribute what its bounds say it could. The reasoning is otherwise identical: on a
+/// `<=` row with `a_q < 0`, only the case `x_q = 1` depends on `a_q`, and there the rest
+/// of the row reaches at most `M`, so `a_q` may rise to `min(0, b - M)`; with `a_q > 0`,
+/// the case `x_q = 0` leaves slack `b - M0` that `a_q` and `b` can both give up.
+///
+/// **What it is for.** MIPLIB's `neos-633273` is 10164 rows `x - y - w <= 0` where `x`
+/// and `w` sit in one set partitioning row once aggregation has merged `w` with the
+/// member it is declared equal to. `w = 1` forces `x = 0`, so `w` never helps and the row
+/// is `x <= y`. Bounds alone cannot see that, and the relaxation is 4.68e9 against an
+/// optimum of 6.997e9; with it, the first relaxation *is* the optimum.
+///
+/// Sound for the same reason the bound version is. The new row implies the old, since
+/// the coefficient only moves towards making it harder; and the old model implies the new
+/// row, since the conflicts are implications of the old model. So the integer feasible
+/// set is exactly unchanged, and a conflict derived from the very row being tightened is
+/// no exception: it held before the change, so the change cannot have invalidated it.
+fn tighten_with_conflicts(problem: &mut Problem, rows: &mut [Row], stats: &mut Stats) -> bool {
+    let conflicts = crate::cuts::Conflicts::of(problem);
+    if conflicts.is_empty() {
+        return false;
+    }
+    let free_binary =
+        |p: &Problem, j: usize| p.is_binary(j) && p.col_lb[j] == 0.0 && p.col_ub[j] == 1.0;
+    let mut budget = CONFLICT_WORK_PER_ENTRY.saturating_mul(problem.matrix.nnz());
+    let mut changed = false;
+
+    for (i, row) in rows.iter_mut().enumerate() {
+        let (lb, ub) = (problem.row_lb[i], problem.row_ub[i]);
+        // Single-sided rows only, as in `tighten_coefficients` and for the same reason.
+        let sign = if ub.is_finite() && lb == f64::NEG_INFINITY {
+            1.0
+        } else if lb.is_finite() && ub == f64::INFINITY {
+            -1.0
+        } else {
+            continue;
+        };
+        if row.len() < 2 || row.len() > CONFLICT_MAX_ROW {
+            continue;
+        }
+        let cost = row.len() * row.len();
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        // Written as `sum c_j x_j <= b` whichever side the row is bounded on.
+        let mut b = if sign > 0.0 { ub } else { -lb };
+        let mut row_changed = false;
+
+        for k in 0..row.len() {
+            let (q, a) = row[k];
+            let c = sign * a;
+            if c == 0.0 || !free_binary(problem, q) {
+                continue;
+            }
+            // The case the coefficient matters in: on for a negative one, off for a
+            // positive one.
+            let node = crate::cuts::literal(q, c < 0.0);
+            let mut most = 0.0;
+            for (t, &(j, aj)) in row.iter().enumerate() {
+                if t == k {
+                    continue;
+                }
+                let cj = sign * aj;
+                let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+                let settled = free_binary(problem, j)
+                    && conflicts.conflicts(node, crate::cuts::literal(j, cj > 0.0));
+                most += if settled {
+                    // The value that helps the row most is excluded, so the column takes
+                    // the other one.
+                    if cj > 0.0 { cj * lo } else { cj * hi }
+                } else if cj > 0.0 {
+                    cj * hi
+                } else {
+                    cj * lo
+                };
+            }
+            if !most.is_finite() {
+                continue;
+            }
+            if c < 0.0 {
+                let raised = (b - most).min(0.0);
+                if raised > c + CONFLICT_TIGHTEN_MIN {
+                    row[k].1 = sign * raised;
+                    row_changed = true;
+                    stats.tightened_coefficients += 1;
+                }
+            } else {
+                let slack = (b - most).min(c);
+                if slack > CONFLICT_TIGHTEN_MIN {
+                    row[k].1 = sign * (c - slack);
+                    b -= slack;
+                    row_changed = true;
+                    stats.tightened_coefficients += 1;
+                }
+            }
+        }
+        if row_changed {
+            if sign > 0.0 {
+                problem.row_ub[i] = b;
+            } else {
+                problem.row_lb[i] = -b;
+            }
+            row.retain(|&(_, v)| v != 0.0);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Smallest coefficient change a conflict pass bothers to make. Below this it is
+/// rounding, and taking it would let two passes trade the same row back and forth.
+const CONFLICT_TIGHTEN_MIN: f64 = 1e-7;
 
 /// Matrix entries one probe may read before it is abandoned.
 ///
@@ -1157,6 +1322,60 @@ mod tests {
             for rhs in [-4.0, -1.0, 0.0, 1.0, 3.0] {
                 let p = problem(&[1.0, 2.0, 1.0], &[(&[-6.0, 3.0, -2.0], sense, rhs)]);
                 assert_presolve_is_sound(&p, &format!("{sense:?} rhs {rhs}"));
+            }
+        }
+    }
+
+    /// `neos-633273`'s shape: `x <= y + w` where `x` and `w` share a partitioning row, so
+    /// `w` can never be what satisfies it and the row is really `x <= y`. Bounds alone
+    /// see nothing to tighten; the conflict graph does.
+    #[test]
+    fn conflicts_tighten_a_coefficient_bounds_cannot() {
+        // x0 = x, x1 = y, x2 = w, x3 = the partition's third member.
+        let p = problem(
+            &[-3.0, 2.0, 0.0, 1.0],
+            &[
+                (&[1.0, -1.0, -1.0, 0.0], RowSense::Le, 0.0),
+                (&[1.0, 0.0, 1.0, 1.0], RowSense::Eq, 1.0),
+            ],
+        );
+        assert_presolve_is_sound(&p, "conflict tightening");
+
+        let mut after = p.clone();
+        let Outcome::Reduced(stats) = presolve(&mut after, 20) else {
+            panic!("presolve rejected a feasible model");
+        };
+        assert!(stats.tightened_coefficients >= 1);
+        assert_eq!(coefficient(&after, 0, 2), 0.0, "w should leave the row");
+        assert_eq!(coefficient(&after, 0, 1), -1.0, "y should keep its coefficient");
+
+        use crate::lp::Lp;
+        let (before, reduced) = (Lp::relaxation(&p).solve(), Lp::relaxation(&after).solve());
+        assert!(
+            reduced.objective > before.objective + 1e-9,
+            "relaxation did not improve: {} -> {}",
+            before.objective,
+            reduced.objective
+        );
+    }
+
+    /// The same reasoning on the positive side, and with every row sense, checked
+    /// against enumeration: the conflict pass may never change the integer points.
+    #[test]
+    fn conflict_tightening_is_sound_on_every_sense() {
+        for sense in [RowSense::Ge, RowSense::Le] {
+            for rhs in [-2.0, -1.0, 0.0, 1.0, 2.0] {
+                for signs in [[1.0, -1.0, -1.0], [2.0, 1.0, -3.0], [-2.0, 3.0, 1.0]] {
+                    let p = problem(
+                        &[1.0, -2.0, 1.0, -1.0],
+                        &[
+                            (&[signs[0], signs[1], signs[2], 0.0], sense, rhs),
+                            (&[1.0, 0.0, 1.0, 1.0], RowSense::Le, 1.0),
+                            (&[0.0, 1.0, 0.0, 1.0], RowSense::Le, 1.0),
+                        ],
+                    );
+                    assert_presolve_is_sound(&p, &format!("{sense:?} {rhs} {signs:?}"));
+                }
             }
         }
     }

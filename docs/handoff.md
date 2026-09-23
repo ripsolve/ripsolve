@@ -3,6 +3,54 @@
 Written at the end of a long session so the next one does not start by re-deriving it.
 The reasoning behind every claim here is in `design-notes.md`; this is the index.
 
+## The twelve SCIP closes and this does not, and the first of them
+
+The current goal is the twelve instances of `binary-2026-09-15.json` that SCIP closes and
+this does not. Each was put to SCIP with one component switched off at a time
+(presolve, cuts, conflict analysis, rapid learning, symmetry, heuristics, strong
+branching; pyscipopt 6.2.1, one thread, 120s). A component whose absence makes SCIP time
+out is one that instance needs:
+
+```text
+neos-633273          presolve -- closed here now, see below
+chromaticindex32-8   rapid learning closes it at the root; without it, conflicts + symmetry
+supportcase4         conflict analysis        (objective 0)
+acc-tight5           cuts and conflict analysis (objective 0)
+graph20-20-1rand     presolve and symmetry
+cod105               presolve and symmetry; *faster* with cuts off
+neos-1324574         presolve, conflicts, symmetry and strong branching, all four
+neos-5129192-manaia  objective 0, found by SCIP's vbounds dive after a 70s presolve
+neos18, air05, tanglegram6, ab71-20-100   no single component decides them
+```
+
+**`neos-633273` closes, 13.5s, and the standing is 36.** SCIP's *first* LP is the
+optimum, 6.997e9, where ours was 4.68e9, and with every dual reduction switched off it
+still is -- so it is not the 5107 fixings its log shows. The model is 10164 rows
+`x - y - w <= 0` where `w` is declared equal (22 times over) to a member of `x`'s set
+partitioning row. After aggregation `w` and `x` share that row, `w = 1` forces `x = 0`,
+and the row is `x <= y`. `presolve::tighten_with_conflicts` is coefficient tightening
+with the conflict graph's exclusions held at their values rather than every column
+ranging over its bounds; it tightens exactly those 10164 coefficients and the root
+relaxation becomes the optimum. It needs aggregation, which is now **on by default**
+(`--no-aggregate` to skip). Full run on a quiet machine: gained `neos-633273`, lost
+nothing, median time ratio 1.00 on the 35 both runs close. `binary-2026-09-23.json`.
+
+**A run the day before scored 34 and is void.** `ex9` and `neos-787933` failed in it, and
+the *committed* parent build failed both identically on the same machine at the same
+time -- a browser was taking a share of the cores. Both close on the quiet rerun.
+
+**The rapid-learning line was closed on a misreading.** `fd5cbeb` says SCIP's rapid
+learning "is a real MIP solve with LPs". It is not: `sepa_rapidlearning` runs a sub-SCIP
+with the LP switched off -- a backtracking search on propagation alone, learning a
+conflict from every dead end, under a node limit (5000 by default). What was built here is
+one dive. On `chromaticindex32-8` SCIP's version returns 200 clauses and moves the root
+bound 3 -> 4; switched off, SCIP needs 532 nodes instead of 1. That is the next build.
+
+**The node LPs are not the gap on `chromaticindex32-8`.** SCIP spends 18 iterations a
+node to our 157, but re-solving the children of the root from its basis costs 97.5
+pivots here and 115 in HiGHS (`examples/branchpivots`): SCIP's number is a deep-plunge
+number, not a better simplex. Per pivot we are about twice HiGHS, not nine times.
+
 ## The automorphism group is built, and it is answered
 
 **Do not start here. This was the previous file's "next build" and it is done, measured
@@ -326,8 +374,9 @@ strength.
 
 `crates/ripsolve/src/aggregate.rs` substitutes out equality rows on two columns, removing
 a row *and* a column, and carries the first real postsolve in this solver. It is wired
-around everything in `solve_from`, behind `Options::aggregate` and the CLI's `--aggregate`,
-**off by default**.
+around everything in `solve_from`, behind `Options::aggregate` and the CLI's
+`--no-aggregate`. **On by default since 2026-09-23**, when it became half of what closes
+`neos-633273`; the section below is the measurement that found it neutral on its own.
 
 **Measured properly and it converts nothing and loses nothing.** Aggregation touches 26 of
 the 140 pure binary instances; the other 114 have no doubleton equality and `aggregate`
@@ -537,8 +586,11 @@ family, and there is no evidence here about which.
 Measured over the 140 pure binary MIPLIB instances, 60s, 16 threads:
 
 ```text
-ripsolve     35        HiGHS 46     SCIP 45     CBC 30     commercial 94
+ripsolve     36        HiGHS 46     SCIP 45     CBC 30     commercial 94
 ```
+
+`docs/baselines/binary-2026-09-23.json`: the 35 below plus `neos-633273`, from
+conflict-aware coefficient tightening; see the top of this file.
 
 `docs/baselines/binary-2026-09-15.json`. **35, and the gain is `neos-3045796-mogo`** --
 node propagation converts it, verified separately at five runs of five against one of five
