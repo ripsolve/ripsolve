@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ripsolve"
+description = "A gurobipy-shaped interface to the ripsolve mixed-integer solver"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+# Taken from the workspace Cargo.toml, so the wheel and the crate cannot drift apart.
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+# The crate lives with the rest of the workspace; this directory holds only the
+# Python-facing pieces (README, tests).
+manifest-path = "../crates/ripsolve-py/Cargo.toml"

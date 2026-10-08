@@ -19,12 +19,21 @@ print(m.ObjVal, [x[j].X for j in range(n)])
 
 ## Building
 
+To install it as a package, build a wheel with maturin (via `pyproject.toml`):
+
+```sh
+uvx maturin build --release -o ../target/wheels
+pip install ../target/wheels/ripsolve-*.whl
+```
+
+For development without maturin, `build.sh` writes the module beside this file:
+
 ```sh
 ./build.sh                      # writes ripsolve.so beside this file
 python3 -m pytest tests -q
 ```
 
-Needs a Python with development headers. No maturin required.
+That route needs only cargo and a Python with development headers.
 
 ## What is supported
 
