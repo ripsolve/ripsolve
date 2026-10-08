@@ -1,8 +1,16 @@
 # ripsolve for Python
 
-A `gurobipy`-shaped interface for mixed-integer programs. A gurobipy script that
-stays inside the supported feature set should run unchanged after swapping the
-import.
+A branch-and-cut solver for mixed-integer programs, written in pure Rust, with a
+`gurobipy`-shaped interface. A gurobipy script that stays inside the supported
+feature set should run unchanged after swapping the import.
+
+```sh
+pip install ripsolve
+```
+
+Wheels cover Linux, macOS and Windows for CPython 3.9 and later, and nothing else
+needs installing: the solver is compiled into the module rather than linked against
+another one.
 
 ```python
 import ripsolve as gp
@@ -17,23 +25,23 @@ m.optimize()
 print(m.ObjVal, [x[j].X for j in range(n)])
 ```
 
-## Building
+## Building from source
 
-To install it as a package, build a wheel with maturin (via `pyproject.toml`):
+Where no wheel fits, `pip install ripsolve` builds from the source distribution,
+which needs a Rust toolchain ([rustup.rs](https://rustup.rs)). From a clone of the
+repository the same build is:
 
 ```sh
-uvx maturin build --release -o ../target/wheels
-pip install ../target/wheels/ripsolve-*.whl
+pip install ./python
 ```
 
-For development without maturin, `build.sh` writes the module beside this file:
+For development, `build.sh` writes the module beside this file with nothing but
+cargo and a Python with development headers, and the tests run against it:
 
 ```sh
 ./build.sh                      # writes ripsolve.so beside this file
 python3 -m pytest tests -q
 ```
-
-That route needs only cargo and a Python with development headers.
 
 ## What is supported
 
@@ -60,9 +68,16 @@ this solver's history and is exactly the wrong trade: a ported script calling
 `addVar()` would silently get a different model.
 
 Unknown parameter names raise `KeyError` rather than being ignored, so a
-misspelling fails loudly.
+misspelling fails loudly. Attribute names, as in gurobipy, may be written in any
+case: `model.status` is `model.Status`.
 
 ## Threads
 
 `optimize()` releases the GIL, so a solve does not block other Python threads.
 `Threads` defaults to the machine's parallelism, as Gurobi's does.
+
+## Links
+
+- Project page: <https://ripsolve.org>
+- Source: <https://github.com/ripsolve/ripsolve>
+- The Rust library's API: <https://docs.rs/ripsolve>

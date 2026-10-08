@@ -1,0 +1,229 @@
+# Build the Python module's wheels and source distribution, test each wheel, and
+# publish to PyPI on a version tag.
+#
+# Started from `maturin generate-ci github` (maturin 1.15) and trimmed:
+#
+# - Every step runs in python/, where pyproject.toml is; the crate it builds is
+#   ../crates/ripsolve-py.
+# - The module is built for abi3, so one wheel per platform serves every CPython
+#   from 3.9 on. The generated free-threaded (3.14t) builds are gone: an abi3
+#   wheel cannot serve a free-threaded interpreter, so they could only fail.
+# - Platforms are the common ones. arm64 Linux builds and tests on GitHub's own arm
+#   runners rather than under emulation.
+# - Publishing uses PyPI's trusted publishing, so no token is stored here. On PyPI,
+#   add this repository and this workflow file (python.yml) as a trusted publisher
+#   for the `ripsolve` project, with the environment `pypi`.
+#
+# A run on a tag `vX.Y.Z` publishes, after checking that the tag names the version
+# the wheels were built as (the workspace Cargo.toml's). Run it by hand from the
+# Actions tab to build and test without publishing.
+name: Python wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: auto
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: python/dist
+      - uses: astral-sh/setup-uv@v7
+      - name: pytest
+        working-directory: python
+        shell: bash
+        run: |
+          set -e
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install ripsolve --no-index --no-deps --find-links dist --reinstall
+          uv pip install pytest
+          pytest tests -q
+
+  musllinux:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: musllinux_1_2
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: python/dist
+      - name: pytest
+        run: |
+          set -e
+          docker run --rm -v ${{ github.workspace }}:/io -w /io/python alpine:latest sh -c '
+            apk add py3-pip py3-virtualenv
+            python3 -m virtualenv .venv
+            source .venv/bin/activate
+            pip install ripsolve --no-index --no-deps --find-links dist --force-reinstall
+            pip install pytest
+            pytest tests -q
+          '
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: x64
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-x64
+          path: python/dist
+      - uses: astral-sh/setup-uv@v7
+      - name: pytest
+        working-directory: python
+        shell: bash
+        run: |
+          set -e
+          uv venv .venv
+          source .venv/Scripts/activate
+          uv pip install ripsolve --no-index --no-deps --find-links dist --reinstall
+          uv pip install pytest
+          pytest tests -q
+
+  macos:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: python/dist
+      - uses: astral-sh/setup-uv@v7
+      - name: pytest
+        working-directory: python
+        run: |
+          set -e
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install ripsolve --no-index --no-deps --find-links dist --reinstall
+          uv pip install pytest
+          pytest tests -q
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: python/dist
+
+  release:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [linux, musllinux, windows, macos, sdist]
+    environment: pypi
+    permissions:
+      # Trusted publishing: PyPI accepts the run's identity instead of a token.
+      id-token: write
+      # Artifact attestation.
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+      - name: Check the tag names the built version
+        shell: bash
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME#v}"
+          sdist=$(ls wheels-sdist/ripsolve-*.tar.gz)
+          version=$(basename "$sdist" .tar.gz)
+          version="${version#ripsolve-}"
+          if [[ "$tag" != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the built version $version"
+            exit 1
+          fi
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: "wheels-*/*"
+      - uses: astral-sh/setup-uv@v7
+      - name: Publish
+        run: uv publish --trusted-publishing always 'wheels-*/*'
