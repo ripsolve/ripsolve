@@ -23,7 +23,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyIndexError, PyKeyError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -140,6 +142,35 @@ impl Grb {
     const TIME_LIMIT: i32 = STATUS_TIME_LIMIT;
     #[classattr]
     const INFINITY: f64 = f64::INFINITY;
+    #[classattr]
+    const LESS_EQUAL: char = '<';
+    #[classattr]
+    const GREATER_EQUAL: char = '>';
+    #[classattr]
+    const EQUAL: char = '=';
+}
+
+/// Look up a Gurobi attribute whatever its capitalisation, as gurobipy does: a script
+/// may read `model.status` or `v.x` for `Status` and `X`. Only capitalised names are
+/// attributes in gurobipy's convention, so methods (`addVar`) stay case-sensitive.
+/// Called from `__getattr__`, which Python reaches only when the exact name failed.
+fn attribute_ignoring_case<'py>(
+    object: &Bound<'py, PyAny>,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    for entry in object.get_type().as_any().dir()? {
+        let candidate: String = entry.extract()?;
+        if candidate.starts_with(|c: char| c.is_ascii_uppercase())
+            && candidate != name
+            && candidate.eq_ignore_ascii_case(name)
+        {
+            return object.getattr(candidate.as_str());
+        }
+    }
+    Err(PyAttributeError::new_err(format!(
+        "'{}' object has no attribute '{name}'",
+        object.get_type().qualname()?
+    )))
 }
 
 /// A linear expression: a weighted sum of variables plus a constant.
@@ -367,6 +398,25 @@ impl Var {
         self.data.lock().expect("model lock").upper[self.index] = value;
     }
 
+    fn __getattr__<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        attribute_ignoring_case(slf.as_any(), name)
+    }
+
+    /// Assignment ignores case too (`v.lb = 0`). Defining `__setattr__` replaces the
+    /// generated setters' dispatch, so the writable attributes are routed by hand.
+    fn __setattr__(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if name.eq_ignore_ascii_case("LB") {
+            self.set_lb(value.extract()?);
+        } else if name.eq_ignore_ascii_case("UB") {
+            self.set_ub(value.extract()?);
+        } else {
+            return Err(PyAttributeError::new_err(format!(
+                "attribute '{name}' of 'Var' cannot be set"
+            )));
+        }
+        Ok(())
+    }
+
     fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<LinExpr> {
         Ok(self.expr().add(&LinExpr::extract(other)?))
     }
@@ -432,6 +482,10 @@ impl Constr {
             .clone()
     }
 
+    fn __getattr__<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        attribute_ignoring_case(slf.as_any(), name)
+    }
+
     fn __repr__(&self) -> String {
         format!("<Constr {}>", self.constr_name())
     }
@@ -444,6 +498,28 @@ struct Model {
 }
 
 impl Model {
+    /// Append a row, naming it `R<index>` when the caller gave no name.
+    fn push_row(&self, constraint: &TempConstr, name: &str) -> Constr {
+        let mut data = self.data.lock().expect("model lock");
+        let index = data.rows.len();
+        let name = if name.is_empty() {
+            format!("R{index}")
+        } else {
+            name.to_string()
+        };
+        data.rows.push(Row {
+            terms: constraint.terms.clone(),
+            sense: constraint.sense,
+            rhs: constraint.rhs,
+            name,
+        });
+        data.solution = None;
+        Constr {
+            data: Arc::clone(&self.data),
+            index,
+        }
+    }
+
     /// Translate the model as built into the solver's own representation.
     fn to_problem(data: &ModelData) -> PyResult<Problem> {
         let n = data.var_names.len();
@@ -614,24 +690,41 @@ impl Model {
     /// Add a constraint built by comparing expressions, as in `x + y <= 1`.
     #[pyo3(signature = (constraint, name = ""))]
     fn addConstr(&self, constraint: PyRef<TempConstr>, name: &str) -> PyResult<Constr> {
-        let mut data = self.data.lock().expect("model lock");
-        let index = data.rows.len();
-        let name = if name.is_empty() {
-            format!("R{index}")
-        } else {
-            name.to_string()
+        Ok(self.push_row(&constraint, name))
+    }
+
+    /// Add a linear constraint given as `lhs, sense, rhs`, or as a single
+    /// comparison in `lhs` with `sense` and `rhs` left out, as gurobipy allows.
+    #[pyo3(signature = (lhs, sense = None, rhs = None, name = ""))]
+    fn addLConstr(
+        &self,
+        lhs: &Bound<'_, PyAny>,
+        sense: Option<&str>,
+        rhs: Option<&Bound<'_, PyAny>>,
+        name: &str,
+    ) -> PyResult<Constr> {
+        let constraint = match (sense, rhs) {
+            (None, None) => lhs.extract::<PyRef<TempConstr>>()?.clone(),
+            (Some(sense), Some(rhs)) => {
+                let sense = match sense {
+                    "<" | "<=" => RowSense::Le,
+                    ">" | ">=" => RowSense::Ge,
+                    "=" | "==" => RowSense::Eq,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown constraint sense {other:?}"
+                        )));
+                    }
+                };
+                LinExpr::extract(lhs)?.compare(rhs, sense)?
+            }
+            _ => {
+                return Err(PyTypeError::new_err(
+                    "addLConstr needs both sense and rhs, or neither",
+                ));
+            }
         };
-        data.rows.push(Row {
-            terms: constraint.terms.clone(),
-            sense: constraint.sense,
-            rhs: constraint.rhs,
-            name,
-        });
-        data.solution = None;
-        Ok(Constr {
-            data: Arc::clone(&self.data),
-            index,
-        })
+        Ok(self.push_row(&constraint, name))
     }
 
     /// Add several constraints from an iterable of comparisons.
@@ -816,6 +909,10 @@ impl Model {
             Sense::Minimize => 1,
             Sense::Maximize => -1,
         }
+    }
+
+    fn __getattr__<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        attribute_ignoring_case(slf.as_any(), name)
     }
 
     fn __repr__(&self) -> String {

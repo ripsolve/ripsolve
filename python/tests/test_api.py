@@ -110,6 +110,76 @@ def test_expression_arithmetic():
     assert y.X == pytest.approx(1.0)
 
 
+def test_addlconstr_takes_lhs_sense_rhs():
+    m = ripsolve.Model()
+    x = m.addVar(vtype=GRB.BINARY, name="x")
+    y = m.addVar(vtype=GRB.BINARY, name="y")
+    m.setObjective(2 * x + 3 * y - 1, GRB.MINIMIZE)
+    # The same model as test_expression_arithmetic, in the explicit form, with a
+    # bare Var on one side and an expression on the other.
+    m.addLConstr(x + y, GRB.GREATER_EQUAL, 1)
+    m.addLConstr(-x + 2 * y, GRB.LESS_EQUAL, 1, name="second")
+    c = m.addLConstr(x, GRB.EQUAL, y)
+    m.optimize()
+    assert m.ObjVal == pytest.approx(4.0)
+    assert c.ConstrName == "R2"
+    assert m.NumConstrs == 3
+
+
+def test_addlconstr_takes_a_comparison():
+    m = ripsolve.Model()
+    x = m.addVar(vtype=GRB.BINARY)
+    m.setObjective(x, GRB.MINIMIZE)
+    m.addLConstr(x >= 1, name="force")
+    m.optimize()
+    assert x.X == pytest.approx(1.0)
+
+
+def test_addlconstr_rejects_half_a_constraint():
+    m = ripsolve.Model()
+    x = m.addVar(vtype=GRB.BINARY)
+    with pytest.raises(TypeError):
+        m.addLConstr(x, GRB.LESS_EQUAL)
+    with pytest.raises(ValueError):
+        m.addLConstr(x, "!", 1)
+
+
+def test_attribute_names_ignore_case():
+    # gurobipy accepts any capitalisation of an attribute name.
+    m = ripsolve.Model("cased")
+    x = m.addVar(vtype=GRB.BINARY, name="x")
+    m.setObjective(x, GRB.MAXIMIZE)
+    c = m.addLConstr(x, GRB.LESS_EQUAL, 1)
+    m.optimize()
+    assert m.status == m.STATUS == m.Status == GRB.OPTIMAL
+    assert m.objval == pytest.approx(1.0)
+    assert m.modelname == "cased"
+    assert x.x == pytest.approx(1.0)
+    assert x.varname == "x"
+    assert c.constrname == c.ConstrName
+
+
+def test_bounds_can_be_set_in_any_case():
+    m = ripsolve.Model()
+    x = m.addVar(vtype=GRB.INTEGER, ub=10)
+    x.lb = 2
+    x.Ub = 5
+    assert (x.LB, x.UB) == (2.0, 5.0)
+    x.LB = 3
+    assert x.lb == 3.0
+
+
+def test_unknown_or_read_only_attributes_still_fail():
+    m = ripsolve.Model()
+    x = m.addVar()
+    with pytest.raises(AttributeError):
+        _ = m.NoSuchAttr
+    with pytest.raises(AttributeError):
+        _ = m.addvar  # methods stay case-sensitive, as in gurobipy
+    with pytest.raises(AttributeError):
+        x.VarName = "renamed"
+
+
 def test_repeated_terms_accumulate():
     m = ripsolve.Model()
     x = m.addVar(vtype=GRB.BINARY)

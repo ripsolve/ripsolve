@@ -42,7 +42,7 @@ That route needs only cargo and a Python with development headers.
 | Model | `Model(name)`, `optimize`, `getVars`, `write`, `setParam` |
 | Variables | `addVar`, `addVars`, `.X`, `.VarName`, `.VType`, `.Obj`, `.LB`, `.UB` |
 | Expressions | `+ - *`, unary `-`, `<= >= ==`, `quicksum` |
-| Constraints | `addConstr`, `addConstrs`, `.ConstrName` |
+| Constraints | `addConstr`, `addConstrs`, `addLConstr`, `.ConstrName` |
 | Objective | `setObjective(expr, GRB.MINIMIZE / GRB.MAXIMIZE)` |
 | Attributes | `ObjVal`, `ObjBound`, `Status`, `SolCount`, `NodeCount`, `Runtime`, `MIPGap`, `NumVars`, `NumConstrs`, `ModelName`, `ModelSense` |
 | Parameters | `TimeLimit`, `Threads`, `MIPGap`, `OutputFlag` |

@@ -16,4 +16,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ripsolve.workspace = true
-pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
