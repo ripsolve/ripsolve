@@ -14,11 +14,13 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::aggregate;
+use crate::cdcl;
 use crate::propagate;
 use crate::branch::{self, Pseudocosts};
 use crate::cuts::{self, Conflicts};
@@ -144,6 +146,9 @@ pub struct Options {
     /// half converts it alone. Measured neutral before that on the 26 instances it
     /// touches; see "Doubleton aggregation" in `docs/handoff.md`.
     pub aggregate: bool,
+    /// Run the conflict-driven search of [`crate::cdcl`] before the relaxation, to find a
+    /// point and, if it can, prove it optimal without one.
+    pub cdcl: bool,
     /// Separate cuts at one node in every `local_cut_frequency`, not only at the
     /// root. Zero disables node-local cutting.
     ///
@@ -309,6 +314,7 @@ impl Default for Options {
             root_probing: false,
             conflict_analysis: false,
             aggregate: true,
+            cdcl: true,
             local_cut_frequency: 10,
             local_cuts_per_node: 8,
             jump_moves: 200,
@@ -1307,6 +1313,7 @@ fn run_parallel(
     threads: usize,
     lurking: &Lurking,
     symmetry: &Symmetry,
+    mailbox: Option<&Mailbox>,
 ) -> TreeResult {
     let shared = Shared {
         pool: Mutex::new(SharedPool {
@@ -1371,6 +1378,18 @@ fn run_parallel(
                         shared.stopped.store(STOP_TIME, Ordering::Relaxed);
                         shared.give_back(vec![node]);
                         continue;
+                    }
+                    // The search beside the tree: its points prune here like any
+                    // other, and its proof ends the search.
+                    if let Some(m) = mailbox {
+                        if m.is_proved() {
+                            shared.stopped.store(STOP_TIME, Ordering::Relaxed);
+                            shared.give_back(vec![node]);
+                            continue;
+                        }
+                        if let Some((value, x)) = m.take() {
+                            shared.offer(value, x);
+                        }
                     }
                     // Whatever the incumbent has proved since this pass began is worth
                     // more spent on a smaller model than on this one; see `solve`.
@@ -1913,9 +1932,159 @@ fn root_clauses(
     out
 }
 
-/// The restart loop, on whatever model it was handed.
+/// The restart loop, with the conflict-driven search running beside it.
+///
+/// The search gets its own thread for the whole solve rather than a turn before the
+/// relaxation. Run first, it cost every model whatever share of the run it was given,
+/// and the models it could not crack paid in full: `neos-787933`, which closes at 42
+/// seconds, lost its solve to six seconds spent before the root; `app2-1` went from 0.9
+/// seconds to 16. Beside the tree it delays nothing. What it finds goes into a
+/// [`Mailbox`] the root and the tree read as they go, and a proof stops them.
 fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
     let started = Instant::now();
+    let beside = options.cdcl && (0..problem.n_cols()).any(|j| problem.is_binary(j));
+    let mailbox = Mailbox::default();
+    let mut solution = std::thread::scope(|scope| {
+        if beside {
+            let mailbox = &mailbox;
+            scope.spawn(move || search_beside(problem, options, started, mailbox));
+        }
+        let solution = restart_loop(problem, options, start, started, beside.then_some(&mailbox));
+        mailbox.cancel.store(true, Ordering::Relaxed);
+        solution
+    });
+    if !beside {
+        return solution;
+    }
+
+    // Whichever side holds the better point reports it, and a proof from the search is
+    // a proof of the whole solve: nothing beats its point, and the tree's point cannot be
+    // better than something nothing beats.
+    let proved = mailbox.proved.load(Ordering::Relaxed);
+    let offered = mailbox.best.into_inner().expect("mailbox lock");
+    if let Some((value, x)) = offered {
+        let held = (!solution.x.is_empty()).then(|| objective_at(problem, &solution.x));
+        if held.is_none_or(|held| value < held) {
+            debug_assert!(
+                solution.status != Status::Optimal || held.is_none(),
+                "the search beside the tree beat an optimum the tree proved"
+            );
+            solution.objective = Some(problem.objective_value(value));
+            solution.x = x;
+            solution.heuristic_solutions += 1;
+        }
+    }
+    if proved {
+        match solution.objective {
+            Some(objective) => {
+                solution.status = Status::Optimal;
+                solution.bound = objective;
+            }
+            None => solution.status = Status::Infeasible,
+        }
+    }
+    solution
+}
+
+/// What the conflict-driven search beside the tree has found, for the tree to read.
+#[derive(Default)]
+struct Mailbox {
+    /// The best point it has, in the internal objective.
+    best: Mutex<Option<(f64, Vec<f64>)>>,
+    /// Whether `best` has changed since the tree last took it.
+    fresh: AtomicBool,
+    /// Nothing beats `best` -- or, with no `best`, the model has no point. Shared with
+    /// every LP of the solve as its interrupt, so a relaxation still running when the
+    /// answer arrives stops at its next clock check.
+    proved: Arc<AtomicBool>,
+    /// Set by the solve when it has finished, so the search stops too.
+    cancel: AtomicBool,
+}
+
+impl Mailbox {
+    fn post(&self, value: f64, x: &[f64]) {
+        let mut best = self.best.lock().expect("mailbox lock");
+        if best.as_ref().is_none_or(|(held, _)| value < *held) {
+            *best = Some((value, x.to_vec()));
+            self.fresh.store(true, Ordering::Release);
+        }
+    }
+
+    /// The point, if it is new since the last call.
+    fn take(&self) -> Option<(f64, Vec<f64>)> {
+        if !self.fresh.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.best.lock().expect("mailbox lock").clone()
+    }
+
+    fn is_proved(&self) -> bool {
+        self.proved.load(Ordering::Relaxed)
+    }
+}
+
+/// The conflict-driven search, run on its own thread for the length of a solve.
+///
+/// On a presolved copy of the model: presolve only tightens, so a point of the copy is a
+/// point of the model, and it keeps the optimum, so a proof on the copy is a proof on the
+/// model. Every point is checked against the model itself before it is posted.
+fn search_beside(problem: &Problem, options: Options, started: Instant, mailbox: &Mailbox) {
+    let mut model = problem.clone();
+    let presolve_deadline = options
+        .time_limit
+        .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
+    if options.presolve
+        && presolve::presolve_until(&mut model, 20, presolve_deadline) == Outcome::Infeasible
+    {
+        // The solve will find that out for itself; this is not the place to report it.
+        return;
+    }
+    let granularity = objective_granularity(&model);
+    let next = |v: f64| match granularity {
+        Some(g) => lift_to_granularity(v, granularity) - g,
+        None => v - (options.gap_tolerance * v.abs()).max(1e-9),
+    };
+    let conflicts = Conflicts::of(&model);
+    let found = cdcl::optimize(
+        &model,
+        &conflicts,
+        None,
+        next,
+        cdcl::Limits {
+            max_conflicts: CDCL_CONFLICTS,
+            deadline: options.time_limit.map(|limit| started + limit),
+            export_length: 0,
+            export_count: 0,
+            stall_conflicts: CDCL_STALL,
+            stall_seconds: CDCL_STALL_SECONDS,
+            cancel: Some(&mailbox.cancel),
+        },
+        |value, x| {
+            if heuristic::is_feasible(problem, x, options.heuristic_limits.feasibility_tolerance) {
+                mailbox.post(value, x);
+            }
+        },
+    );
+    // A proof counts only for a point that was posted, or for no point at all.
+    let posted = mailbox.best.lock().expect("mailbox lock").clone();
+    let consistent = match (&found.best, &posted) {
+        (Some((value, _)), Some((held, _))) => held <= value,
+        (None, None) => true,
+        _ => false,
+    };
+    if found.proved && consistent {
+        mailbox.proved.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The restart loop, on whatever model it was handed.
+fn restart_loop(
+    problem: &Problem,
+    options: Options,
+    start: Option<&[f64]>,
+    started: Instant,
+    mailbox: Option<&Mailbox>,
+) -> Solution {
     let mut model: Option<Problem> = None;
     let mut seed: Option<(f64, Vec<f64>)> = start
         .filter(|x| {
@@ -1933,7 +2102,7 @@ fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>
     let (mut nodes, mut iterations, mut heuristics) = (0usize, 0usize, 0usize);
     for _ in 0..=MAX_RESTARTS {
         let current = model.as_ref().unwrap_or(problem);
-        let attempt = solve_once(current, options, started, seed.take());
+        let attempt = solve_once(current, options, started, seed.take(), mailbox);
         // The counters belong to the whole solve, not to the last pass of it.
         nodes += attempt.solution.nodes;
         iterations += attempt.solution.simplex_iterations;
@@ -1945,7 +2114,8 @@ fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>
         let out_of_time = options
             .time_limit
             .is_some_and(|limit| started.elapsed() >= limit);
-        let Some(narrowed) = attempt.restart.filter(|_| !out_of_time) else {
+        let settled = mailbox.is_some_and(Mailbox::is_proved);
+        let Some(narrowed) = attempt.restart.filter(|_| !out_of_time && !settled) else {
             return solution;
         };
         // Nothing carries over but the point, which is still feasible: the narrowed
@@ -1963,6 +2133,7 @@ fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>
         options,
         started,
         seed,
+        mailbox,
     );
     let mut solution = attempt.solution;
     solution.nodes += nodes;
@@ -1976,6 +2147,7 @@ fn solve_once(
     options: Options,
     started: Instant,
     seed: Option<(f64, Vec<f64>)>,
+    mailbox: Option<&Mailbox>,
 ) -> Attempt {
 
     // Presolve reduces in place and introduces no renumbering, so the reduced
@@ -2047,6 +2219,9 @@ fn solve_once(
     // nodes is no limit at all once a single solve outlives the whole budget.
     let deadline = options.time_limit.map(|limit| started + limit);
     lp.set_deadline(deadline);
+    // A proof from the search beside the tree stops every LP of this solve, the node LPs
+    // included, since the workers' LPs are clones of this one.
+    lp.set_interrupt(mailbox.map(|m| m.proved.clone()));
     // Cuts add rows but never columns, so `n` stays valid across the cut loop.
 
     let mut nodes = 0usize;
@@ -2119,6 +2294,12 @@ fn solve_once(
             state
         };
         for attempt in 0..JUMP_RESTARTS {
+            // The search beside the tree may settle the model while this is still
+            // restarting. On `easter_monster` it proves the sudoku in ten milliseconds,
+            // and the restarts went on for two and a half seconds without noticing.
+            if mailbox.is_some_and(Mailbox::is_proved) {
+                break;
+            }
             let from: Vec<f64> = if attempt == 0 {
                 start.clone()
             } else {
@@ -2130,6 +2311,19 @@ fn solve_once(
                     })
                     .collect()
             };
+            // Attempts follow the Luby sequence, in units of four flips a column and
+            // capped at the full budget: mostly short, with a long one now and then.
+            // An attempt that succeeds does so within a millisecond or two, and one
+            // that fails runs until a cutoff stops it, so short attempts buy more
+            // starts for the same time. On sudokus, across five seeds each, the median
+            // fell from 10.6s to 2.5s on the hardest and from 1.6s to 0.29s on
+            // `escargot`. The long ones are for `neos-3226448-wkra`, which needs full
+            // length attempts: the plain Luby sequence, which never exceeds 64 flips a
+            // column in 200 starts, took it from 9.3s to 33s; in units of four it takes
+            // 7.2s.
+            let moves = options
+                .jump_moves
+                .min(JUMP_UNIT << luby_exponent(attempt).min(usize::BITS as usize - 8));
             let found = heuristic::feasibility_jump(
                 problem,
                 &from,
@@ -2142,7 +2336,7 @@ fn solve_once(
                 // what bounds the whole of it is the deadline; this is the third guard
                 // and it should not be the binding one. `neos-3226448-wkra` closes at
                 // two hundred flips a column and does not at two and a half.
-                options.jump_moves.saturating_mul(problem.n_cols().max(1)),
+                moves.saturating_mul(problem.n_cols().max(1)),
                 jump_deadline,
             );
             if found.is_some() {
@@ -2264,6 +2458,23 @@ fn solve_once(
         }
     }
     nodes += 1;
+
+    // The search beside the tree may already hold a point, or the answer. The status is
+    // settled by the caller from the mailbox; all that matters here is stopping.
+    if let Some(m) = mailbox {
+        if m.is_proved() {
+            return Attempt {
+                solution: Solution::without_solution(Status::TimeLimit, nodes, iterations, presolve_stats),
+                restart: None,
+            };
+        }
+        if let Some((value, x)) = m.take()
+            && value < incumbent
+        {
+            incumbent = value;
+            incumbent_x = Some(x);
+        }
+    }
 
     if root.status != LpStatus::Optimal {
         // The LP reports only that it gave up, not why. If the budget has run out,
@@ -2576,6 +2787,7 @@ fn solve_once(
             threads,
             &lurking,
             &symmetry,
+            mailbox,
         );
         nodes += result.nodes;
         iterations += result.iterations;
@@ -2637,6 +2849,19 @@ fn solve_once(
     let mut restart_wanted = false;
 
     while let Some(node) = open.pop() {
+        if let Some(m) = mailbox {
+            if m.is_proved() {
+                status = Status::TimeLimit;
+                open.push(node);
+                break;
+            }
+            if let Some((value, x)) = m.take()
+                && value < incumbent
+            {
+                incumbent = value;
+                incumbent_x = Some(x);
+            }
+        }
         if nodes >= options.max_nodes {
             status = Status::NodeLimit;
             open.push(node);
@@ -3283,6 +3508,35 @@ fn fix_by_reduced_cost(
 /// is what actually bounds it; this is the backstop.
 const JUMP_SHARE: f64 = 0.05;
 
+/// Conflicts without a better point or a proof before the search beside the tree gives
+/// up. It costs the tree one thread for as long as it runs, not the run itself, so this
+/// is generous: the instances it closes need at most 13007, `supportcase3`'s.
+const CDCL_STALL: usize = 100_000;
+
+/// Seconds without a better point or a proof, once there is a point, before it gives up.
+/// The longest such wait among the instances it closes is 2.7 seconds.
+const CDCL_STALL_SECONDS: f64 = 10.0;
+
+/// Conflicts it may spend in all.
+const CDCL_CONFLICTS: usize = 2_000_000;
+
+/// Flips a column in the shortest feasibility search attempt; see `luby_exponent`.
+const JUMP_UNIT: usize = 4;
+
+/// The exponent of the `i`th term of the Luby sequence 1, 1, 2, 1, 1, 2, 4, ..., so
+/// the term itself is `2^luby_exponent(i)`.
+fn luby_exponent(i: usize) -> usize {
+    let mut i = i + 1;
+    loop {
+        // The smallest k with 2^k - 1 >= i.
+        let k = (usize::BITS - i.leading_zeros()) as usize;
+        if i == (1 << k) - 1 {
+            return k - 1;
+        }
+        i -= (1 << (k - 1)) - 1;
+    }
+}
+
 /// Randomised starts the feasibility search may take before giving up.
 ///
 /// It stops when it has settled, and where it settles is decided by where it began, so
@@ -3608,6 +3862,12 @@ fn integral_solution(problem: &Problem, x: &[f64], tolerance: f64) -> Option<Vec
 mod tests {
     use super::*;
     use crate::lp::Lp;
+
+    #[test]
+    fn luby_exponents_give_the_luby_sequence() {
+        let terms: Vec<usize> = (0..15).map(|i| 1 << luby_exponent(i)).collect();
+        assert_eq!(terms, [1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
+    }
     use crate::model::{RowSense, Sense};
     use crate::sparse::SparseMatrix;
 

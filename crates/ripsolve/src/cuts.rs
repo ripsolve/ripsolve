@@ -671,10 +671,17 @@ pub fn separate_mod2(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
 
     let mut found: Vec<Cut> = Vec::new();
     let mut summed: Vec<i64> = vec![0; problem.n_cols()];
+    // Whether a column is already in `touched`. Asking whether its running sum is zero
+    // instead is wrong: rows can cancel a column back to zero part way through, the next
+    // row then lists it a second time, and the cut carries its halved coefficient twice.
+    // That is a cut stronger than the combination supports, and it removed the optimum of
+    // a generated signed model outright -- 1188 reported as infeasible.
+    let mut listed: Vec<bool> = vec![false; problem.n_cols()];
     let mut touched: Vec<usize> = Vec::new();
     for combination in &combinations {
         for &j in &touched {
             summed[j] = 0;
+            listed[j] = false;
         }
         touched.clear();
         let mut rhs = 0i64;
@@ -682,7 +689,8 @@ pub fn separate_mod2(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
             let (row, b) = &tight[i];
             rhs += b;
             for &(j, a) in row {
-                if summed[j] == 0 {
+                if !listed[j] {
+                    listed[j] = true;
                     touched.push(j);
                 }
                 summed[j] += a;
@@ -2745,6 +2753,38 @@ mod tests {
         }
         // A test that never separates anything proves nothing at all.
         assert!(total > 0, "no mod-2 cut was generated, so nothing was checked");
+    }
+
+    /// The generated model on which a mod-2 cut removed the optimum, and the search then
+    /// reported it infeasible where the optimum is 1188. Rows cancelled a column back to
+    /// zero part way through a combination, the column was listed twice, and the cut
+    /// carried its coefficient twice. The cut arises only after other families have moved
+    /// the relaxation for several rounds, so this checks the whole root loop against the
+    /// same search with cutting switched off.
+    #[test]
+    fn mod2_cuts_do_not_remove_the_optimum_of_signed_68() {
+        use crate::generate::{Kind, Spec};
+        use crate::search::{Options, Status, solve};
+        use lp_parser_rs::problem::LpProblem;
+        let spec = Spec {
+            kind: Kind::Signed,
+            n_cols: 40,
+            n_rows: 25,
+            seed: 68,
+        };
+        let p = Problem::from_lp(&LpProblem::parse(&spec.to_lp()).unwrap()).unwrap();
+        // The default gap is exact here: the objective moves in whole steps and a
+        // ten-thousandth of 1188 is less than one of them.
+        let exact = |cut_rounds: usize| Options {
+            cut_rounds,
+            threads: 1,
+            cdcl: false,
+            ..Default::default()
+        };
+        // 1188 is what Gurobi and HiGHS both report for it.
+        let cut = solve(&p, exact(50));
+        assert_eq!(cut.status, Status::Optimal, "the root cuts made a feasible model look empty");
+        assert!((cut.objective.unwrap() - 1188.0).abs() < 1e-6);
     }
 
     #[test]

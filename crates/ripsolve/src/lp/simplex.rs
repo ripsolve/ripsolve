@@ -274,6 +274,11 @@ pub struct Lp {
     /// columns) the solver ran four times past a sixty-second limit because nothing
     /// below the node loop had any notion of time.
     deadline: Option<Instant>,
+    /// Set by someone else to stop this solve as though its deadline had passed. The
+    /// conflict-driven search beside the tree sets it when it proves the incumbent
+    /// optimal, and a relaxation that was never going to finish -- `neos-5129192-manaia`'s
+    /// -- has nothing left to contribute.
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     tol: Tolerances,
     /// Recently used factorizations, most recent first, keyed by basis columns.
     ///
@@ -304,6 +309,7 @@ impl Clone for Lp {
             matrix: self.matrix.clone(),
             integer: self.integer.clone(),
             deadline: self.deadline,
+            interrupt: self.interrupt.clone(),
             tol: self.tol,
             factors: Vec::new(),
         }
@@ -338,6 +344,7 @@ impl Lp {
             matrix: problem.matrix.clone(),
             integer,
             deadline: None,
+            interrupt: None,
             tol: Tolerances::default(),
             factors: Vec::new(),
         }
@@ -396,9 +403,18 @@ impl Lp {
         self.deadline = deadline;
     }
 
-    /// Has the budget run out?
+    /// Stop any solve once `flag` is set, as if the deadline had passed.
+    pub fn set_interrupt(&mut self, flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+        self.interrupt = flag;
+    }
+
+    /// Has the budget run out, or has someone asked this to stop?
     pub fn out_of_time(&self) -> bool {
         self.deadline.is_some_and(|d| Instant::now() >= d)
+            || self
+                .interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Discard any cached factorization.

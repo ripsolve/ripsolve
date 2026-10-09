@@ -102,6 +102,7 @@
 pub mod aggregate;
 pub mod branch;
 pub mod compact;
+pub mod cdcl;
 pub mod cuts;
 pub mod generate;
 pub mod heuristic;
