@@ -159,6 +159,23 @@ def test_attribute_names_ignore_case():
     assert c.constrname == c.ConstrName
 
 
+def test_model_lists_variable_and_constraint_attributes():
+    # gurobipy answers a variable attribute on the model with every variable's.
+    m = ripsolve.Model()
+    a = m.addVar(vtype=GRB.BINARY, name="a")
+    b = m.addVar(vtype=GRB.INTEGER, ub=4, name="b")
+    m.setObjective(a + b, GRB.MAXIMIZE)
+    m.addConstr(a + b <= 3, name="cap")
+    m.optimize()
+    assert m.X == pytest.approx([1.0, 2.0])
+    assert m.x == m.X
+    assert m.VarName == ["a", "b"]
+    assert m.UB == [1.0, 4.0]
+    assert m.ConstrName == ["cap"]
+    # The model's own attributes still win.
+    assert m.ModelName == ""
+
+
 def test_bounds_can_be_set_in_any_case():
     m = ripsolve.Model()
     x = m.addVar(vtype=GRB.INTEGER, ub=10)

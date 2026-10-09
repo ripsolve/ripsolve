@@ -23,11 +23,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{
-    PyAttributeError, PyIndexError, PyKeyError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyAttributeError, PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 
 use ripsolve::model::{Problem, RowSense, Sense, VarType};
 use ripsolve::search::{self, Options, Status as SearchStatus};
@@ -150,27 +148,40 @@ impl Grb {
     const EQUAL: char = '=';
 }
 
-/// Look up a Gurobi attribute whatever its capitalisation, as gurobipy does: a script
-/// may read `model.status` or `v.x` for `Status` and `X`. Only capitalised names are
-/// attributes in gurobipy's convention, so methods (`addVar`) stay case-sensitive.
-/// Called from `__getattr__`, which Python reaches only when the exact name failed.
+/// The spelling a class gives a Gurobi attribute, matched whatever its
+/// capitalisation, as gurobipy does: a script may read `model.status` or `v.x` for
+/// `Status` and `X`. Only capitalised names are attributes in gurobipy's
+/// convention, so methods (`addVar`) stay case-sensitive.
+fn canonical_attribute(class: &Bound<'_, PyType>, name: &str) -> PyResult<Option<String>> {
+    for entry in class.as_any().dir()? {
+        let candidate: String = entry.extract()?;
+        if candidate.starts_with(|c: char| c.is_ascii_uppercase())
+            && candidate.eq_ignore_ascii_case(name)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Look up an attribute whatever its capitalisation. Called from `__getattr__`,
+/// which Python reaches only when the exact name failed.
 fn attribute_ignoring_case<'py>(
     object: &Bound<'py, PyAny>,
     name: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    for entry in object.get_type().as_any().dir()? {
-        let candidate: String = entry.extract()?;
-        if candidate.starts_with(|c: char| c.is_ascii_uppercase())
-            && candidate != name
-            && candidate.eq_ignore_ascii_case(name)
-        {
-            return object.getattr(candidate.as_str());
-        }
+    match canonical_attribute(&object.get_type(), name)? {
+        Some(canonical) if canonical != name => object.getattr(canonical.as_str()),
+        _ => Err(no_such_attribute(object, name)),
     }
-    Err(PyAttributeError::new_err(format!(
-        "'{}' object has no attribute '{name}'",
-        object.get_type().qualname()?
-    )))
+}
+
+fn no_such_attribute(object: &Bound<'_, PyAny>, name: &str) -> PyErr {
+    let class = object
+        .get_type()
+        .qualname()
+        .map_or_else(|_| "object".to_string(), |q| q.to_string());
+    PyAttributeError::new_err(format!("'{class}' object has no attribute '{name}'"))
 }
 
 /// A linear expression: a weighted sum of variables plus a constant.
@@ -911,8 +922,35 @@ impl Model {
         }
     }
 
+    /// Besides its own attributes, a gurobipy model answers a variable or constraint
+    /// attribute with that attribute of every variable or constraint, in order:
+    /// `model.X` is the whole solution vector.
     fn __getattr__<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
-        attribute_ignoring_case(slf.as_any(), name)
+        let py = slf.py();
+        if let Some(canonical) = canonical_attribute(&slf.get_type(), name)?
+            && canonical != name
+        {
+            return slf.getattr(canonical.as_str());
+        }
+        let model = slf.borrow();
+        let objects: Vec<Bound<'py, PyAny>> =
+            if let Some(canonical) = canonical_attribute(&py.get_type::<Var>(), name)? {
+                model
+                    .getVars(py)?
+                    .into_iter()
+                    .map(|var| var.into_bound(py).getattr(canonical.as_str()))
+                    .collect::<PyResult<_>>()?
+            } else if let Some(canonical) = canonical_attribute(&py.get_type::<Constr>(), name)? {
+                (0..model.num_constrs())
+                    .map(|index| {
+                        let data = Arc::clone(&model.data);
+                        Bound::new(py, Constr { data, index })?.getattr(canonical.as_str())
+                    })
+                    .collect::<PyResult<_>>()?
+            } else {
+                return Err(no_such_attribute(slf.as_any(), name));
+            };
+        Ok(PyList::new(py, objects)?.into_any())
     }
 
     fn __repr__(&self) -> String {
