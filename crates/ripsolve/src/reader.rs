@@ -19,6 +19,50 @@ use lp_parser_rs::problem::LpProblem;
 use crate::model::{Problem, RowSense, Sense, VarType};
 use crate::sparse::SparseMatrix;
 
+/// The magnitude from which a bound is read as infinite.
+const INFINITE_BOUND: f64 = 1e30;
+
+/// Headers that begin a list of integral variables in an LP file.
+const INTEGRAL_HEADERS: [&str; 9] = [
+    "binaries", "binary", "bin", "generals", "general", "gen", "integers", "integer", "int",
+];
+/// Headers that begin the bounds section.
+const BOUNDS_HEADERS: [&str; 2] = ["bounds", "bound"];
+/// Every other header. `subject` and `such` cover the two spellings of the
+/// constraint header without matching a variable named `st`.
+const OTHER_HEADERS: [&str; 10] = [
+    "end", "maximize", "maximise", "minimize", "minimise", "max", "min", "subject", "such",
+    "sos",
+];
+
+/// The lines of an LP file's sections that begin with one of `wanted`, comments
+/// stripped. A header may carry content on its own line, so that part is kept too.
+fn section_lines<'a>(text: &'a str, wanted: &[&str]) -> Vec<&'a str> {
+    let mut lines = Vec::new();
+    let mut collecting = false;
+    for line in text.lines() {
+        // Strip comments, which run from a backslash to the end of the line.
+        let line = line.split('\\').next().unwrap_or("").trim();
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        let header = first.trim_end_matches(':').to_ascii_lowercase();
+        let header = header.as_str();
+        if wanted.contains(&header) {
+            collecting = true;
+            lines.push(line[first.len()..].trim());
+        } else if INTEGRAL_HEADERS.contains(&header)
+            || BOUNDS_HEADERS.contains(&header)
+            || OTHER_HEADERS.contains(&header)
+        {
+            collecting = false;
+        } else if collecting {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
 /// Names declared integral by an LP file's `Binary`, `General` or `Integer`
 /// sections, recovered from the source text.
 ///
@@ -28,50 +72,33 @@ use crate::sparse::SparseMatrix;
 /// gone. The bounds it reports are right; only the type is lost. Rather than
 /// re-parse the file, this recovers the one fact the parser drops and leaves
 /// everything else to it.
-///
-/// Section headers end the list, so it stops at `Bounds`, `End`, and the rest.
 fn declared_integer(text: &str) -> HashSet<String> {
-    // Headers that begin a list of integral variables.
-    const INTEGRAL: [&str; 9] = [
-        "binaries", "binary", "bin", "generals", "general", "gen", "integers", "integer", "int",
-    ];
-    // Any other header ends one. `subject` and `such` cover the two spellings of
-    // the constraint header without matching a variable named `st`.
-    const OTHER: [&str; 12] = [
-        "bounds", "bound", "end", "maximize", "maximise", "minimize", "minimise", "max", "min",
-        "subject", "such", "sos",
-    ];
+    section_lines(text, &INTEGRAL_HEADERS)
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(str::to_string)
+        .collect()
+}
 
-    let mut names = HashSet::new();
-    let mut collecting = false;
-    for line in text.lines() {
-        // Strip comments, which run from a backslash to the end of the line.
-        let line = line.split('\\').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let first = line
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let first = first.trim_end_matches(':').to_string();
-
-        if INTEGRAL.contains(&first.as_str()) {
-            collecting = true;
-            // A header may carry names on the same line.
-            names.extend(line.split_whitespace().skip(1).map(str::to_string));
-            continue;
-        }
-        if OTHER.contains(&first.as_str()) {
-            collecting = false;
-            continue;
-        }
-        if collecting {
-            names.extend(line.split_whitespace().map(str::to_string));
-        }
-    }
-    names
+/// Names an LP file's `Bounds` section mentions, recovered from the source text.
+///
+/// Another workaround for `lp_parser_rs`, which reports a variable the file never
+/// bounds as `Free`, the same as one the file declares free. The LP format gives
+/// an undeclared variable `[0, inf)`, as Gurobi and CPLEX read it, so only a name
+/// this finds may be taken at its word. Reading every `Free` as free turned
+/// `Minimize dummy` over an otherwise bounded model into an unbounded one.
+fn named_in_bounds(text: &str) -> HashSet<String> {
+    section_lines(text, &BOUNDS_HEADERS)
+        .into_iter()
+        .flat_map(|line| line.split(|c: char| c.is_whitespace() || "<>=".contains(c)))
+        .filter(|token| {
+            !token.is_empty()
+                && !token.eq_ignore_ascii_case("free")
+                // Numbers, including `inf` and `-infinity`, which `f64` parses.
+                && token.parse::<f64>().is_err()
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Names declared integral by an MPS file, recovered from the source text.
@@ -219,23 +246,30 @@ impl Problem {
     /// Read a mixed-integer program from a file in an explicitly given format.
     pub fn from_file_as(path: &Path, format: Format) -> Result<Problem, ReadError> {
         let content = parse_file(path).map_err(|e| ReadError::Parse(e.to_string()))?;
+        Problem::from_text(&content, format)
+    }
+
+    /// Read a mixed-integer program from the text of a file in the given format.
+    pub fn from_text(content: &str, format: Format) -> Result<Problem, ReadError> {
         let lp = match format {
-            Format::Lp => LpProblem::parse(&content),
-            Format::Mps => LpProblem::parse_mps(&content),
+            Format::Lp => LpProblem::parse(content),
+            Format::Mps => LpProblem::parse_mps(content),
         }
         .map_err(|e| ReadError::Parse(e.to_string()))?;
-        // The LP source is consulted only to recover integrality the parser drops;
-        // see `declared_integer`.
-        let integral = match format {
-            Format::Lp => declared_integer(&content),
+        // The LP source is consulted only to recover what the parser drops: which
+        // names are integral (see `declared_integer`) and which `Free` columns the
+        // file really declared free (see `named_in_bounds`). MPS needs only the
+        // first; its parser gives an unbounded column the format's default itself.
+        let (integral, bounded) = match format {
+            Format::Lp => (declared_integer(content), Some(named_in_bounds(content))),
             Format::Mps => {
-                if let Some(section) = unsupported_section(&content) {
+                if let Some(section) = unsupported_section(content) {
                     return Err(ReadError::UnsupportedSection(section));
                 }
-                declared_integer_mps(&content)
+                (declared_integer_mps(content), None)
             }
         };
-        Problem::from_lp_with_integrality(&lp, &integral)
+        Problem::from_parsed(&lp, &integral, bounded.as_ref())
     }
 
     /// Translate an already-parsed [`LpProblem`].
@@ -244,13 +278,25 @@ impl Problem {
     /// minimization form; [`Problem::sense`] records what was asked for and
     /// [`Problem::objective_value`] converts results back.
     pub fn from_lp(lp: &LpProblem) -> Result<Problem, ReadError> {
-        Problem::from_lp_with_integrality(lp, &HashSet::new())
+        Problem::from_parsed(lp, &HashSet::new(), None)
     }
 
     /// As [`Problem::from_lp`], with extra names known to be integral.
     pub fn from_lp_with_integrality(
         lp: &LpProblem,
         integral: &HashSet<String>,
+    ) -> Result<Problem, ReadError> {
+        Problem::from_parsed(lp, integral, None)
+    }
+
+    /// The translation itself. `bounded`, when given, names the columns an LP
+    /// file's `Bounds` section mentions; a `Free` column outside it was never
+    /// declared at all and takes the format's default `[0, inf)`. Without it every
+    /// `Free` column is taken as declared.
+    fn from_parsed(
+        lp: &LpProblem,
+        integral: &HashSet<String>,
+        bounded: Option<&HashSet<String>>,
     ) -> Result<Problem, ReadError> {
         // MPS marks the objective as a free row, and files routinely carry more than
         // one: the first is the objective and the rest are free rows kept for other
@@ -283,6 +329,9 @@ impl Problem {
                 VariableType::Integer | VariableType::General => {
                     (VarType::Integer, 0.0, f64::INFINITY)
                 }
+                VariableType::Free if bounded.is_some_and(|b| !b.contains(&label)) => {
+                    (VarType::Continuous, 0.0, f64::INFINITY)
+                }
                 VariableType::Free => (VarType::Continuous, f64::NEG_INFINITY, f64::INFINITY),
                 VariableType::LowerBound(lo) => (VarType::Continuous, *lo, f64::INFINITY),
                 VariableType::UpperBound(hi) => (VarType::Continuous, 0.0, *hi),
@@ -291,6 +340,11 @@ impl Problem {
                     return Err(ReadError::UnsupportedVariable(label, other.to_string()));
                 }
             };
+            // Gurobi and CPLEX read a bound at or beyond 1e30 as infinite, and files
+            // write it that way. Kept finite, it is a number presolve may fix a
+            // column at.
+            let lo = if lo <= -INFINITE_BOUND { f64::NEG_INFINITY } else { lo };
+            let hi = if hi >= INFINITE_BOUND { f64::INFINITY } else { hi };
             // A `Bounds` entry replaces the declared type, so the section lists are
             // the only surviving evidence that the column is integral.
             if integral.contains(&label) {
@@ -521,6 +575,37 @@ End
         assert!(p.is_integer(0));
         assert!(!p.is_binary(0), "an unbounded integer is not binary");
         assert_eq!((p.col_lb[0], p.col_ub[0]), (0.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn an_undeclared_continuous_variable_is_nonnegative() {
+        // The LP format's default is [0, inf). Read as free, `Minimize dummy` over a
+        // column no row mentions was unbounded, and a sudoku file whose objective
+        // was a placeholder hit the node limit instead of solving.
+        let text = "Minimize\n dummy\nSubject To\n c1: x + y = 1\nBinary\n x y\nEnd\n";
+        let p = Problem::from_text(text, Format::Lp).unwrap();
+        assert_eq!(p.col_names[0], "dummy");
+        assert_eq!((p.col_lb[0], p.col_ub[0]), (0.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn a_variable_the_bounds_section_frees_stays_free() {
+        let text = "Minimize\n a + b + c + d\nSubject To\n c1: a + b + c + d >= -10\n\
+                    Bounds\n a free\n b >= -inf\n -inf <= c <= +inf\n d <= 3\nEnd\n";
+        let p = Problem::from_text(text, Format::Lp).unwrap();
+        let bounds: Vec<_> = (0..4).map(|j| (p.col_lb[j], p.col_ub[j])).collect();
+        let free = (f64::NEG_INFINITY, f64::INFINITY);
+        // `d <= 3` sets only the upper bound, so the lower keeps its default.
+        assert_eq!(bounds, vec![free, free, free, (0.0, 3.0)]);
+    }
+
+    #[test]
+    fn a_bound_of_1e30_is_infinite() {
+        let text = "Minimize\n x\nSubject To\n c1: x + y >= 1\nBounds\n\
+                    x >= -1e30\n -1e30 <= y <= 1e30\nEnd\n";
+        let p = Problem::from_text(text, Format::Lp).unwrap();
+        assert_eq!(p.col_lb, vec![f64::NEG_INFINITY; 2]);
+        assert_eq!(p.col_ub, vec![f64::INFINITY; 2]);
     }
 
     #[test]
