@@ -2523,21 +2523,29 @@ fn solve_once(
             _ if deadline.is_some_and(|d| Instant::now() >= d) => Status::TimeLimit,
             _ => Status::NodeLimit,
         };
-        // A point found before the relaxation survives the relaxation failing. It is
-        // not proven optimal and never claims to be, but reporting nothing when
-        // something feasible is in hand throws away the only result there was.
+        // A point found before the relaxation survives the relaxation failing: the
+        // caller's start, a restart's seed or the search beside the tree's, or failing
+        // those one found now. It is not proven optimal and never claims to be, but
+        // reporting nothing when something feasible is in hand throws away the only
+        // result there was.
         let rescued = if status == Status::Infeasible {
             None
         } else {
             jump(None, JUMP_SHARE)
         };
-        let solution = match rescued {
-            Some(found) if status != Status::Infeasible => {
+        let held = incumbent_x.take().map(|x| (incumbent, x, false));
+        let found = rescued.map(|found| (found.objective, found.x, true));
+        let best = match (held, found) {
+            (Some(h), Some(f)) => Some(if f.0 < h.0 { f } else { h }),
+            (h, f) => h.or(f),
+        };
+        let solution = match best {
+            Some((objective, x, heuristic)) if status != Status::Infeasible => {
                 let mut solution =
                     Solution::without_solution(status, nodes, iterations, presolve_stats);
-                solution.objective = Some(problem.objective_value(found.objective));
-                solution.x = found.x;
-                solution.heuristic_solutions = 1;
+                solution.objective = Some(problem.objective_value(objective));
+                solution.x = x;
+                solution.heuristic_solutions = usize::from(heuristic);
                 solution
             }
             _ => Solution::without_solution(status, nodes, iterations, presolve_stats),
