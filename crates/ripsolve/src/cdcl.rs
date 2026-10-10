@@ -1031,10 +1031,13 @@ pub fn optimize(
     let began = Instant::now();
     let mut proved = !s.start(problem) || (start_cutoff.is_some() && !s.tighten(row.1));
     while !proved {
-        let patience = result
-            .trace
-            .last()
-            .map(|&(_, at)| began + std::time::Duration::from_secs_f64(at + limits.stall_seconds));
+        // An infinite `stall_seconds` means no patience limit. `from_secs_f64` panics on
+        // it, so the conversion is the checked one and an unrepresentable span is none.
+        let patience = result.trace.last().and_then(|&(_, at)| {
+            std::time::Duration::try_from_secs_f64(at + limits.stall_seconds)
+                .ok()
+                .and_then(|span| began.checked_add(span))
+        });
         let this_run = Limits {
             max_conflicts: limits
                 .max_conflicts

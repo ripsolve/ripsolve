@@ -287,12 +287,19 @@ fn cuts_do_not_change_any_optimum() {
         let file = entry["file"].as_str().unwrap();
         let problem = Problem::from_file(&samples_dir().join(file)).unwrap();
 
-        let with = search::solve(&problem, Options::default());
+        // The conflict-driven search beside the tree closes most of these samples
+        // before the root relaxation is solved, which leaves no root bound to compare
+        // and no cut to test. It is switched off so the cuts are what gets exercised.
+        let base = Options {
+            cdcl: false,
+            ..Options::default()
+        };
+        let with = search::solve(&problem, base);
         let without = search::solve(
             &problem,
             Options {
                 cut_rounds: 0,
-                ..Options::default()
+                ..base
             },
         );
 
@@ -507,6 +514,8 @@ fn branching_on_an_orbit_does_not_change_any_optimum() {
         heuristic_frequency: 0,
         improvement_frequency: 0,
         jump_moves: 0,
+        // The search beside the tree would close these models before any branching.
+        cdcl: false,
         ..Options::default()
     };
 

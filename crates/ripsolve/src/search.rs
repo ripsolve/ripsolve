@@ -946,10 +946,36 @@ impl<'a> Worker<'a> {
         }
 
         let cutoff = incumbent.is_finite().then_some(incumbent);
-        let solved = self
+        let mut solved = self
             .lp
             .solve_warm(&node.basis, cutoff, options.max_iterations_per_node);
         self.iterations += solved.iterations;
+        // A node LP that gives up with time still on the clock has usually not run out
+        // of iterations at all: the basis it inherited would not factorize, and the
+        // repair gave up after a few pivots. On the home/away balance model from the
+        // soccer scheduler (119 columns, 170 rows) that happened to a handful of nodes
+        // in a run of two million, the same LP solved cold in under a hundred dual
+        // iterations, and the skipped nodes alone turned a finished search into a
+        // `NodeLimit` with nothing proved. So the root's rescues are tried here too,
+        // cold dual first, then cold primal, before the node is given up on.
+        //
+        // Only for a solve that stopped short of its budget. One that really spent
+        // `max_iterations_per_node` is a different failure, and rescuing it would cost up
+        // to twice that again at every such node of a large model.
+        if solved.status == LpStatus::IterationLimit
+            && solved.iterations < options.max_iterations_per_node
+            && !self.lp.out_of_time()
+        {
+            let rescued = self.lp.solve_cold_dual(options.max_iterations_per_node);
+            self.iterations += rescued.iterations;
+            if rescued.status == LpStatus::IterationLimit && !self.lp.out_of_time() {
+                let primal = self.lp.solve_with_limit(options.max_iterations_per_node);
+                self.iterations += primal.iterations;
+                solved = primal;
+            } else {
+                solved = rescued;
+            }
+        }
 
         // Whatever this node's LP turned out to be, it is the measured consequence
         // of the branch that created it; feed that back before doing anything else.
@@ -1484,11 +1510,15 @@ fn run_parallel(
         nodes: shared.nodes.load(Ordering::Relaxed).min(options.max_nodes),
         iterations: shared.iterations.load(Ordering::Relaxed),
         heuristic_hits: shared.heuristic_hits.load(Ordering::Relaxed),
+        // A node skipped unresolved is still open as far as the bound is concerned. Left
+        // out, a tree exhausted apart from such a node reports a bound equal to its
+        // incumbent -- a gap of zero -- beside a status that says nothing was proved.
         open_bound: if pool.open.is_empty() {
             f64::INFINITY
         } else {
             pool.open.best_bound()
-        },
+        }
+        .min(f64::from_bits(shared.unresolved_bound.load(Ordering::Relaxed))),
         wants_restart: shared.stopped.load(Ordering::Relaxed) == STOP_RESTART,
     }
 }
@@ -2115,7 +2145,15 @@ fn restart_loop(
             .time_limit
             .is_some_and(|limit| started.elapsed() >= limit);
         let settled = mailbox.is_some_and(Mailbox::is_proved);
+        let wanted_restart = attempt.restart.is_some();
         let Some(narrowed) = attempt.restart.filter(|_| !out_of_time && !settled) else {
+            // A pass that stopped to restart says NodeLimit, which is true only if the
+            // restart then happens. When the clock has run out instead, what ended the
+            // solve was the time limit, and a caller told NodeLimit goes looking for a
+            // node limit they never set.
+            if wanted_restart && out_of_time && solution.status == Status::NodeLimit {
+                solution.status = Status::TimeLimit;
+            }
             return solution;
         };
         // Nothing carries over but the point, which is still feasible: the narrowed
@@ -2939,14 +2977,15 @@ fn solve_once(
 
     // The best bound is the weakest still-open node; with none left, the incumbent
     // is proven and the bound is the incumbent itself.
+    // A node skipped unresolved counts as open here; see `TreeResult::open_bound`.
     let internal_bound = if open.is_empty() {
         if incumbent.is_finite() {
-            incumbent
+            incumbent.min(unresolved_bound)
         } else {
             root_bound
         }
     } else {
-        open.best_bound().min(incumbent)
+        open.best_bound().min(incumbent).min(unresolved_bound)
     };
 
     let status = match (status, &incumbent_x) {
