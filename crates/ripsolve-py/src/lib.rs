@@ -858,7 +858,7 @@ impl Model {
     fn write(&self, path: &str) -> PyResult<()> {
         let data = self.data.lock().expect("model lock");
         let problem = Model::to_problem(&data)?;
-        std::fs::write(path, problem_to_lp(&problem))
+        std::fs::write(path, problem.to_lp())
             .map_err(|e| PyValueError::new_err(format!("writing {path}: {e}")))
     }
 
@@ -961,90 +961,6 @@ impl Model {
             self.num_constrs()
         )
     }
-}
-
-/// Render a problem back to LP format, for `Model.write`.
-fn problem_to_lp(problem: &Problem) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "\\ {}", problem.name);
-    out.push_str(if problem.sense == Sense::Maximize {
-        "Maximize\n obj:"
-    } else {
-        "Minimize\n obj:"
-    });
-    // The stored objective is in minimization form; undo that for the file.
-    let flip = |v: f64| {
-        if problem.sense == Sense::Maximize {
-            -v
-        } else {
-            v
-        }
-    };
-    for (j, &c) in problem.obj.iter().enumerate() {
-        if c != 0.0 {
-            let _ = write!(out, " + {} {}", flip(c), problem.col_names[j]);
-        }
-    }
-    out.push_str("\nSubject To\n");
-    let csr = problem.matrix.to_csr();
-    for i in 0..problem.n_rows() {
-        let (cols, vals) = csr.column(i);
-        if cols.is_empty() {
-            continue;
-        }
-        // A range row needs one line per finite side.
-        for (bound, op) in [(problem.row_lb[i], ">="), (problem.row_ub[i], "<=")] {
-            if !bound.is_finite() {
-                continue;
-            }
-            let _ = write!(out, " {}: ", problem.row_names[i]);
-            for (&j, &v) in cols.iter().zip(vals) {
-                let _ = write!(out, "+ {v} {} ", problem.col_names[j]);
-            }
-            let _ = writeln!(out, "{op} {bound}");
-            if problem.row_lb[i] == problem.row_ub[i] {
-                break;
-            }
-        }
-    }
-    // Bounds first, then integrality: every column needs its range stated, and only
-    // the integer ones get declared.
-    out.push_str("Bounds\n");
-    for (j, name) in problem.col_names.iter().enumerate() {
-        let lo = problem.col_lb[j];
-        let hi = problem.col_ub[j];
-        match (lo.is_finite(), hi.is_finite()) {
-            (true, true) => {
-                let _ = writeln!(out, " {lo} <= {name} <= {hi}");
-            }
-            (true, false) => {
-                let _ = writeln!(out, " {name} >= {lo}");
-            }
-            (false, true) => {
-                let _ = writeln!(out, " -inf <= {name} <= {hi}");
-            }
-            (false, false) => {
-                let _ = writeln!(out, " {name} free");
-            }
-        }
-    }
-    let integers: Vec<&String> = problem
-        .col_names
-        .iter()
-        .enumerate()
-        .filter(|&(j, _)| problem.is_integer(j))
-        .map(|(_, n)| n)
-        .collect();
-    if !integers.is_empty() {
-        out.push_str("General\n");
-        for name in integers {
-            let _ = write!(out, " {name}");
-        }
-        out.push('\n');
-    }
-    out.push_str("End\n");
-    out
 }
 
 /// Sum an iterable of variables or expressions.

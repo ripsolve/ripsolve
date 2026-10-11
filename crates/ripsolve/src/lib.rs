@@ -114,6 +114,7 @@ pub mod reader;
 pub mod search;
 pub mod sparse;
 pub mod symmetry;
+mod writer;
 
 pub use model::{Builder, ModelError, Problem, RowSense, Sense, VarType};
 pub use reader::{Format, ReadError};
