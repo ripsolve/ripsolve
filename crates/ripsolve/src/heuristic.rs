@@ -736,6 +736,32 @@ End
         assert_valid(&p, &found, "partitioning");
     }
 
+    /// Only binaries are decided, so a general integer column is left where the
+    /// relaxation put it. A fractional value there is not a solution, however well it
+    /// sits in the rows.
+    #[test]
+    fn fix_and_propagate_never_returns_a_fractional_integer() {
+        use crate::model::{Builder, RowSense, Sense};
+        let mut model = Builder::new(Sense::Minimize);
+        let b = model.binary("b");
+        let n = model.integer("n", 0.0, 3.0);
+        model.objective(&[(b, -1.0), (n, -1.0)]);
+        model.row(&[(b, 1.0), (n, 1.0)], RowSense::Le, 2.5);
+        let p = model.build();
+        assert!(p.is_integer(n) && !is_binary_column(&p, n));
+        let conflicts = Conflicts::of(&p);
+        let mut relaxation = vec![0.0; 2];
+        relaxation[b] = 1.0;
+        relaxation[n] = 1.5;
+        if let Some(found) = fix_and_propagate(&p, &conflicts, &relaxation, &Limits::default()) {
+            assert!(
+                (found.x[n] - found.x[n].round()).abs() < 1e-9,
+                "fractional point {:?}",
+                found.x
+            );
+        }
+    }
+
     /// A model with no feasible point must produce none, rather than a point that
     /// propagation merely failed to refute.
     #[test]
@@ -1443,7 +1469,14 @@ pub fn fix_and_propagate(
             x[j].clamp(state.lower(j), state.upper(j))
         };
     }
-    is_feasible(problem, &point, limits.feasibility_tolerance).then(|| Incumbent {
+    // Only binaries are decided above, so a general integer column left free is still
+    // at its relaxation value. `is_feasible` reads rows and bounds, not integrality, and
+    // let such a point through as an incumbent: on MIPLIB's `neos-3381206-awhea`, 259
+    // integer columns fractional, reported optimal at 452 against an optimum of 453.
+    let integral = problem
+        .integer_columns()
+        .all(|j| (point[j] - point[j].round()).abs() <= limits.feasibility_tolerance);
+    (integral && is_feasible(problem, &point, limits.feasibility_tolerance)).then(|| Incumbent {
         objective: objective_of(problem, &point),
         x: point,
     })
