@@ -68,6 +68,23 @@ pub fn presolve_until(
     max_rounds: usize,
     deadline: Option<std::time::Instant>,
 ) -> Outcome {
+    presolve_with(problem, max_rounds, deadline, true)
+}
+
+/// Presolve, with or without the reductions that read the objective.
+///
+/// Two reductions fix a column by its cost rather than by the rows: a column in no row,
+/// and a column in a single row. Each keeps *an* optimum rather than every feasible
+/// point, which is sound only when the rows in the model are all the rows there are.
+/// A search with a [`crate::search::Separator`] has rows the model does not show, and
+/// the column one of these fixes can be the one those rows need, so it presolves with
+/// `dual` off.
+pub fn presolve_with(
+    problem: &mut Problem,
+    max_rounds: usize,
+    deadline: Option<std::time::Instant>,
+    dual: bool,
+) -> Outcome {
     let n = problem.n_cols();
     let m = problem.n_rows();
     let mut stats = Stats::default();
@@ -85,7 +102,7 @@ pub fn presolve_until(
     // they left and used to tighten again; anything that finds is fed back through the
     // cheap reductions, since a smaller coefficient can make a row redundant or forcing.
     for pass in 0..=CONFLICT_PASSES {
-        if !cheap_reductions(problem, &mut rows, max_rounds, &mut stats) {
+        if !cheap_reductions(problem, &mut rows, max_rounds, dual, &mut stats) {
             return Outcome::Infeasible;
         }
         rebuild_matrix(problem, &rows);
@@ -124,6 +141,7 @@ fn cheap_reductions(
     problem: &mut Problem,
     rows: &mut [Row],
     max_rounds: usize,
+    dual: bool,
     stats: &mut Stats,
 ) -> bool {
     for _ in 0..max_rounds {
@@ -181,11 +199,11 @@ fn cheap_reductions(
             }
         }
 
-        if fix_columns_absent_from_every_row(problem, rows, stats) {
+        if dual && fix_columns_absent_from_every_row(problem, rows, stats) {
             changed = true;
         }
 
-        if fix_singleton_columns(problem, rows, stats) {
+        if dual && fix_singleton_columns(problem, rows, stats) {
             changed = true;
         }
 

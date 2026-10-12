@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `search::solve_with` and the `Separator` trait: rows supplied while the search runs,
+  asked for at the root, at every node, and of every point before it may become the
+  incumbent. It serves as a cut callback and as lazy constraints at once. A clique
+  partitioning model whose 52000 transitivity rows are left to the separator solves in
+  one call rather than in an outer loop of whole MIP solves.
+- `Lp::fit`, `BasisState::without_rows` and `lu::Scratch`.
+- `presolve::presolve_with`, which can leave out the reductions that fix a column by
+  its cost.
+
+### Performance
+
+- Refactorization is triggered by what the eta file has cost against what the last
+  factorization cost, not by the eta file's size against the factors'. With the
+  factorization's working memory kept between calls, root relaxations over the cached
+  MIPLIB set are 25% faster by geometric mean on those taking half a second or more,
+  identical in value on all 128 both finish, and five more finish inside 20 seconds.
+- Dropping a slack cut at the root keeps the basis instead of re-solving cold, in the
+  ageing and in the final purge.
+- Warm-started dual solves price their leaving row by steepest edge
+  (`Options::warm_steepest_edge`, on by default). Over the cached MIPLIB set at thirty
+  seconds it closes `n9-3` and `ex9` and is 12% slower by geometric mean on the 32
+  instances both settings close.
+
+### Correctness
+
+- Fixing with propagation decides only binaries, and returned general integer columns
+  at their fractional relaxation values; nothing downstream checked integrality.
+  `neos-3381206-awhea` was reported optimal at 452 against an optimum of 453, and
+  `neos-3024952-loue` optimal at a different wrong value on each run.
+- An LP built for a round of root cutting did not inherit the flag the search beside
+  the tree raises when it proves its point, so cutting ran on after the answer was
+  known: `bnatt400` took 28 seconds where it takes 1.5.
+- An integral node's incumbent is scored from its rounded point, as the root's is,
+  rather than from the relaxation's objective.
+
 ## 0.3.0
 
 Neither 0.2.0 nor 0.1.x is affected by the correctness fixes below in the sense that

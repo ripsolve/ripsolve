@@ -23,6 +23,11 @@
 //! step would itself be quadratic.
 
 /// The factorization `P B Q = L U`, with `L` unit lower triangular.
+///
+/// Both factors are held flat, one array of entries with a start offset per pivot
+/// step, rather than as a vector per step. A factorization produces its steps in
+/// order, so flat storage is what it writes naturally, and a vector per step was two
+/// allocations per row of the basis every time it was refactorized.
 #[derive(Clone)]
 pub struct Lu {
     m: usize,
@@ -30,12 +35,86 @@ pub struct Lu {
     prow: Vec<usize>,
     /// Basis position of pivot `k`.
     pcol: Vec<usize>,
-    /// `L` by pivot step, in permuted index space: `(k', multiplier)` with `k' > k`.
-    l_cols: Vec<Vec<(usize, f64)>>,
-    /// `U` by pivot step, in permuted index space: `(k', value)` with `k' > k`.
-    u_rows: Vec<Vec<(usize, f64)>>,
+    /// `L` by pivot step, in permuted index space: step `k`'s entries are
+    /// `l_entries[l_start[k]..l_start[k + 1]]`, each `(k', multiplier)` with `k' > k`.
+    l_start: Vec<usize>,
+    l_entries: Vec<(usize, f64)>,
+    /// `U` by pivot step, in permuted index space, laid out the same way: `(k', value)`
+    /// with `k' > k`.
+    u_start: Vec<usize>,
+    u_entries: Vec<(usize, f64)>,
     /// Diagonal of `U`.
     diag: Vec<f64>,
+    /// What producing these factors cost, in the units [`Lu::cost`] describes.
+    cost: usize,
+}
+
+/// Working memory for [`Lu::factor`], kept between factorizations.
+///
+/// A factorization's bookkeeping is a vector per row and a vector per column of the
+/// active submatrix, and allocating them afresh cost more than the elimination on a
+/// sparse basis: 160 microseconds to factorize the 1830-row identity, against 1.2
+/// milliseconds for the basis an optimal vertex of the same model has. A simplex solve
+/// refactorizes every few dozen pivots, so the memory is worth keeping.
+#[derive(Default)]
+pub struct Scratch {
+    cols: Vec<Vec<(usize, f64)>>,
+    row_cols: Vec<Vec<usize>>,
+    row_nz: Vec<usize>,
+    row_done: Vec<bool>,
+    col_done: Vec<bool>,
+    scatter: Vec<f64>,
+    present: Vec<bool>,
+    held: Vec<u32>,
+    stamp: u32,
+    updated: Vec<(usize, f64)>,
+    buckets: Vec<Vec<usize>>,
+    col_len: Vec<usize>,
+    shortlist: Vec<usize>,
+    pivot_col: Vec<(usize, f64)>,
+    touching: Vec<usize>,
+    row_pos: Vec<usize>,
+    col_pos: Vec<usize>,
+}
+
+impl Clone for Scratch {
+    /// Working memory, not state: a clone starts empty and grows its own.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl Scratch {
+    /// Size every buffer for a basis of `m` rows and clear what the last factorization
+    /// left, keeping the allocations.
+    fn reset(&mut self, m: usize) {
+        fn lists<T>(v: &mut Vec<Vec<T>>, len: usize) {
+            v.truncate(len);
+            for inner in v.iter_mut() {
+                inner.clear();
+            }
+            v.resize_with(len, Vec::new);
+        }
+        fn fill<T: Clone>(v: &mut Vec<T>, len: usize, value: T) {
+            v.clear();
+            v.resize(len, value);
+        }
+        lists(&mut self.cols, m);
+        lists(&mut self.row_cols, m);
+        lists(&mut self.buckets, m + 1);
+        fill(&mut self.row_nz, m, 0);
+        fill(&mut self.row_done, m, false);
+        fill(&mut self.col_done, m, false);
+        fill(&mut self.scatter, m, 0.0);
+        fill(&mut self.present, m, false);
+        // Stamps only ever have to differ from the live one, so they carry over.
+        self.held.resize(m, 0);
+        fill(&mut self.col_len, m, 0);
+        self.updated.clear();
+        self.shortlist.clear();
+        self.pivot_col.clear();
+        self.touching.clear();
+    }
 }
 
 /// The basis could not be factored.
@@ -93,6 +172,19 @@ const MAX_COLUMN_SEARCH: usize = 8;
 /// Elimination steps between clock reads during a factorization.
 const FACTOR_CLOCK_INTERVAL: usize = 1024;
 
+/// A factorization's cost in eta replays: per entry an elimination touches, and per
+/// row of the basis.
+///
+/// Measured rather than reasoned, because the two sides of the comparison they feed run
+/// at very different speeds per entry. An eta entry replays in about 1.5ns, a scatter
+/// and a multiply. An elimination step costs about 10ns per entry it touches, the stamp
+/// and the column rebuild included, and a factorization pays about 100ns per row before
+/// it eliminates anything. Fitted on three bases, from 823 to 5904 rows: the clique
+/// partitioning model behind `alta_divisions` (1830 rows, 56000 entries touched, 740us),
+/// `cod105` (823, 248000, 2.6ms) and `air04` (5904, 220000, 2.6ms).
+const FACTOR_ENTRY_COST: usize = 7;
+const FACTOR_ROW_COST: usize = 70;
+
 impl Lu {
     pub fn dimension(&self) -> usize {
         self.m
@@ -105,22 +197,49 @@ impl Lu {
         zero_tol: f64,
         deadline: Option<std::time::Instant>,
     ) -> Result<Lu, FactorError> {
+        Self::factor_with(m, columns, zero_tol, deadline, &mut Scratch::default())
+    }
+
+    /// [`Lu::factor`], in working memory kept from an earlier factorization.
+    pub fn factor_with(
+        m: usize,
+        columns: &[(Vec<usize>, Vec<f64>)],
+        zero_tol: f64,
+        deadline: Option<std::time::Instant>,
+        scratch: &mut Scratch,
+    ) -> Result<Lu, FactorError> {
         debug_assert_eq!(columns.len(), m);
+        scratch.reset(m);
+        let Scratch {
+            cols,
+            row_cols,
+            row_nz,
+            row_done,
+            col_done,
+            scatter,
+            present,
+            held,
+            stamp,
+            updated,
+            buckets,
+            col_len,
+            shortlist,
+            pivot_col,
+            touching,
+            row_pos,
+            col_pos,
+        } = scratch;
 
         // Active submatrix, column-major by basis position.
-        let mut cols: Vec<Vec<(usize, f64)>> = columns
-            .iter()
-            .map(|(rows, vals)| {
+        for (col, (rows, vals)) in cols.iter_mut().zip(columns) {
+            col.extend(
                 rows.iter()
                     .copied()
                     .zip(vals.iter().copied())
-                    .filter(|&(_, v)| v != 0.0)
-                    .collect()
-            })
-            .collect();
+                    .filter(|&(_, v)| v != 0.0),
+            );
+        }
         // Which columns touch each row. Entries may go stale; readers filter.
-        let mut row_cols: Vec<Vec<usize>> = vec![Vec::new(); m];
-        let mut row_nz = vec![0usize; m];
         for (j, col) in cols.iter().enumerate() {
             for &(i, _) in col {
                 row_cols[i].push(j);
@@ -128,25 +247,20 @@ impl Lu {
             }
         }
 
-        let mut row_done = vec![false; m];
-        let mut col_done = vec![false; m];
         let mut prow = Vec::with_capacity(m);
         let mut pcol = Vec::with_capacity(m);
         // Collected in original index space; permuted once the order is known.
-        let mut l_raw: Vec<Vec<(usize, f64)>> = Vec::with_capacity(m);
-        let mut u_raw: Vec<Vec<(usize, f64)>> = Vec::with_capacity(m);
+        let mut l_start = Vec::with_capacity(m + 1);
+        let mut l_entries: Vec<(usize, f64)> = Vec::new();
+        let mut u_start = Vec::with_capacity(m + 1);
+        let mut u_entries: Vec<(usize, f64)> = Vec::new();
         let mut diag = Vec::with_capacity(m);
+        l_start.push(0);
+        u_start.push(0);
 
-        // Reused scatter buffers, so column updates never allocate.
-        let mut scatter = vec![0.0f64; m];
-        let mut present = vec![false; m];
-        // Which rows the column being updated already holds, stamped per column so
-        // that it never has to be cleared. See the fill-in step below for why.
-        let mut held = vec![0u32; m];
-        let mut stamp = 0u32;
-        // Reused for every column update. Allocating one of these per touched
-        // column per elimination step put ~18% of a solve in the allocator.
-        let mut updated: Vec<(usize, f64)> = Vec::new();
+        // `held` records which rows the column being updated already holds, stamped
+        // per column so that it never has to be cleared. See the fill-in step below
+        // for why.
 
         // Columns bucketed by nonzero count, so the search reaches the sparsest few
         // without ordering the rest.
@@ -156,18 +270,17 @@ impl Lu {
         // first `MAX_COLUMN_SEARCH` entries. On a 3186-row basis that was a third of
         // the solve. Entries are left in place when a column's length changes and
         // skipped on the way past, so an update costs a push rather than a search.
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); m + 1];
-        let mut col_len: Vec<usize> = (0..m).map(|j| cols[j].len()).collect();
         for j in 0..m {
+            col_len[j] = cols[j].len();
             buckets[col_len[j].min(m)].push(j);
         }
-        // Reused across steps so the shortlist does not allocate per pivot.
-        let mut shortlist: Vec<usize> = Vec::with_capacity(MAX_COLUMN_SEARCH);
         // Lower bound on any live column's length. Scanning from zero each step would
         // walk `m` empty buckets per pivot and cost exactly what the sort did.
         // Elimination can only shorten a column by removing the pivot row, so this
         // moves down by one at a time and is corrected on the way past.
         let mut min_len = 0usize;
+        // Entries the elimination reads or writes, for [`Lu::cost`].
+        let mut touched = 0usize;
 
         for step in 0..m {
             // One factorization is a single call to the caller, so the deadline has to
@@ -246,7 +359,7 @@ impl Lu {
 
             // Candidates that were looked at but not pivoted are still live and were
             // taken out of their bucket by the pop, so they go back.
-            for &j in &shortlist {
+            for &j in shortlist.iter() {
                 if j != pj {
                     buckets[col_len[j].min(m)].push(j);
                 }
@@ -259,25 +372,21 @@ impl Lu {
             diag.push(pivot);
 
             // Scatter the pivot column, dropping its own pivot row.
-            let pivot_col: Vec<(usize, f64)> =
-                cols[pj].iter().copied().filter(|&(i, _)| i != pi).collect();
-            for &(i, v) in &pivot_col {
+            pivot_col.clear();
+            pivot_col.extend(cols[pj].iter().copied().filter(|&(i, _)| i != pi));
+            for &(i, v) in pivot_col.iter() {
                 scatter[i] = v;
                 present[i] = true;
             }
 
             // L takes the multipliers below the pivot.
-            let l_entries: Vec<(usize, f64)> =
-                pivot_col.iter().map(|&(i, v)| (i, v / pivot)).collect();
+            l_entries.extend(pivot_col.iter().map(|&(i, v)| (i, v / pivot)));
+            l_start.push(l_entries.len());
 
             // Eliminate the pivot row from every other active column.
-            let mut u_entries: Vec<(usize, f64)> = Vec::new();
-            let touching: Vec<usize> = row_cols[pi]
-                .iter()
-                .copied()
-                .filter(|&j| !col_done[j])
-                .collect();
-            for j in touching {
+            touching.clear();
+            touching.extend(row_cols[pi].iter().copied().filter(|&j| !col_done[j]));
+            for &j in touching.iter() {
                 let Some(pos) = cols[j].iter().position(|&(i, _)| i == pi) else {
                     continue;
                 };
@@ -285,6 +394,7 @@ impl Lu {
                 if alpha == 0.0 {
                     continue;
                 }
+                touched += cols[j].len() + pivot_col.len();
                 u_entries.push((j, alpha));
                 let factor = alpha / pivot;
 
@@ -294,9 +404,9 @@ impl Lu {
                 // ask in constant time. Wrapping is safe because a wrap can only make a
                 // stale stamp collide with the live one, and every row of the live
                 // column is restamped before it is read.
-                stamp = stamp.wrapping_add(1);
+                *stamp = stamp.wrapping_add(1);
                 for &(i, _) in &cols[j] {
-                    held[i] = stamp;
+                    held[i] = *stamp;
                 }
                 for &(i, v) in &cols[j] {
                     if i == pi {
@@ -326,8 +436,8 @@ impl Lu {
                 // million in the elimination it belongs to, and 92% of the whole
                 // relaxation. The stamp makes it 689 million and the same 8000
                 // iterations go from 57.8 seconds to 9.0.
-                for &(i, v) in &pivot_col {
-                    if held[i] != stamp {
+                for &(i, v) in pivot_col.iter() {
+                    if held[i] != *stamp {
                         let value = -factor * v;
                         if value.abs() > zero_tol {
                             updated.push((i, value));
@@ -339,7 +449,7 @@ impl Lu {
                 row_nz[pi] -= 1;
                 // Swap rather than assign: `cols[j]`'s allocation becomes the next
                 // iteration's buffer instead of being freed.
-                std::mem::swap(&mut cols[j], &mut updated);
+                std::mem::swap(&mut cols[j], updated);
                 if cols[j].len() != col_len[j] {
                     col_len[j] = cols[j].len();
                     let bucket = col_len[j].min(m);
@@ -347,49 +457,64 @@ impl Lu {
                     min_len = min_len.min(bucket);
                 }
             }
+            u_start.push(u_entries.len());
 
-            for &(i, _) in &pivot_col {
+            for &(i, _) in pivot_col.iter() {
                 scatter[i] = 0.0;
                 present[i] = false;
                 row_nz[i] -= 1;
             }
             row_nz[pi] = 0;
             cols[pj].clear();
-
-            l_raw.push(l_entries);
-            u_raw.push(u_entries);
         }
 
+        let cost = FACTOR_ENTRY_COST * touched + FACTOR_ROW_COST * m;
+
         // Translate to permuted index space, now that the pivot order is known.
-        let mut row_pos = vec![usize::MAX; m];
-        let mut col_pos = vec![usize::MAX; m];
+        row_pos.clear();
+        row_pos.resize(m, usize::MAX);
+        col_pos.clear();
+        col_pos.resize(m, usize::MAX);
         for k in 0..m {
             row_pos[prow[k]] = k;
             col_pos[pcol[k]] = k;
         }
-        // Renumber in place. Collecting into fresh vectors here allocated 2m of
-        // them per factorization to change nothing but the indices.
-        let mut l_cols = l_raw;
-        for entries in &mut l_cols {
-            for (i, _) in entries.iter_mut() {
-                *i = row_pos[*i];
-            }
+        for (i, _) in l_entries.iter_mut() {
+            *i = row_pos[*i];
         }
-        let mut u_rows = u_raw;
-        for entries in &mut u_rows {
-            for (j, _) in entries.iter_mut() {
-                *j = col_pos[*j];
-            }
+        for (j, _) in u_entries.iter_mut() {
+            *j = col_pos[*j];
         }
 
         Ok(Lu {
             m,
             prow,
             pcol,
-            l_cols,
-            u_rows,
+            l_start,
+            l_entries,
+            u_start,
+            u_entries,
             diag,
+            cost,
         })
+    }
+
+    /// What these factors cost to produce, counted in eta entries replayed.
+    ///
+    /// This is the number a refactorization policy has to weigh, and the factors' own
+    /// size is not it: the 1830-row basis above touches 56000 entries to produce 8000,
+    /// so a policy that refactorized once the eta file outgrew the factors did so every
+    /// six pivots, and spent 56% of a relaxation factorizing.
+    pub fn cost(&self) -> usize {
+        self.cost
+    }
+
+    fn l_col(&self, k: usize) -> &[(usize, f64)] {
+        &self.l_entries[self.l_start[k]..self.l_start[k + 1]]
+    }
+
+    fn u_row(&self, k: usize) -> &[(usize, f64)] {
+        &self.u_entries[self.u_start[k]..self.u_start[k + 1]]
     }
 
     /// Solve `B d = a`, writing `d` (indexed by basis position) into `out`.
@@ -401,7 +526,7 @@ impl Lu {
         for k in 0..m {
             let z = work[k];
             if z != 0.0 {
-                for &(k2, mult) in &self.l_cols[k] {
+                for &(k2, mult) in self.l_col(k) {
                     work[k2] -= mult * z;
                 }
             }
@@ -409,7 +534,7 @@ impl Lu {
         // Back-substitute U w = z.
         for k in (0..m).rev() {
             let mut acc = work[k];
-            for &(k2, v) in &self.u_rows[k] {
+            for &(k2, v) in self.u_row(k) {
                 acc -= v * work[k2];
             }
             work[k] = acc / self.diag[k];
@@ -431,7 +556,7 @@ impl Lu {
             let v = work[k] / self.diag[k];
             work[k] = v;
             if v != 0.0 {
-                for &(k2, u) in &self.u_rows[k] {
+                for &(k2, u) in self.u_row(k) {
                     work[k2] -= u * v;
                 }
             }
@@ -439,7 +564,7 @@ impl Lu {
         // Then L' u = v, which is upper triangular in this ordering.
         for k in (0..m).rev() {
             let mut acc = work[k];
-            for &(k2, mult) in &self.l_cols[k] {
+            for &(k2, mult) in self.l_col(k) {
                 acc -= mult * work[k2];
             }
             work[k] = acc;
@@ -453,9 +578,7 @@ impl Lu {
 
     /// Stored nonzeros in both factors, for diagnostics and refactorization policy.
     pub fn nnz(&self) -> usize {
-        self.m
-            + self.l_cols.iter().map(Vec::len).sum::<usize>()
-            + self.u_rows.iter().map(Vec::len).sum::<usize>()
+        self.m + self.l_entries.len() + self.u_entries.len()
     }
 }
 

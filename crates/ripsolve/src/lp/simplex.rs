@@ -122,6 +122,22 @@ pub struct Tolerances {
     /// every FTRAN including the dense `B^-1 b` and read 95% everywhere, which decides
     /// nothing. See `examples/spikedensity.rs`.
     pub entering_density_stats: bool,
+    /// Price a warm-started dual solve's leaving row by steepest edge, with every
+    /// weight starting at one, rather than by the largest violation.
+    ///
+    /// A cold dual entry always does; this is the warm one, which repairs a node's
+    /// branched bound or a cut's violation from its parent's basis. The largest
+    /// violation was thought good enough there, on the grounds that the repair takes a
+    /// few pivots and the row choice barely matters. On the clique partitioning model
+    /// behind `alta_divisions` it takes thousands, 4000 to 11000 per node, and steepest
+    /// edge takes 500 to 3000; the B-1 level's proof goes from 77 seconds to 43.
+    ///
+    /// **On by default, as a trade.** At thirty seconds a model over the cached MIPLIB
+    /// set it closes `n9-3` and `ex9`, which the largest violation does not, and is
+    /// 12% slower by geometric mean on the 32 both close; `n2seq36f` is the worst of
+    /// them, 11.7 seconds to 29.7. Instances closed count for more than time on those
+    /// already closed, which is what decides it.
+    pub warm_steepest_edge: bool,
 }
 
 impl Default for Tolerances {
@@ -133,6 +149,7 @@ impl Default for Tolerances {
             refactor_interval: 200,
             primal_devex: false,
             entering_density_stats: false,
+            warm_steepest_edge: true,
         }
     }
 }
@@ -186,6 +203,66 @@ impl BasisState {
             self.basic.push(logical);
             self.status.push(Status::Basic { row: old_rows + i });
         }
+    }
+
+    /// This basis for the same LP with the rows `removed` taken out, the rest keeping
+    /// their order. `None` unless each removed row's logical is basic.
+    ///
+    /// A row whose logical is basic can go with its logical and leave a basis behind:
+    /// one row and one basic variable fewer, every other column of the basis matrix
+    /// losing only its entry in that row, which is the logical's own pivot row. That is
+    /// the case for a cut gone slack, the only kind anyone removes, and the basis left
+    /// is still optimal: the removed row bound nothing. Without this, dropping a cut
+    /// cost a cold solve of the whole relaxation.
+    pub fn without_rows(&self, n_structural: usize, removed: &[usize]) -> Option<BasisState> {
+        let m = self.status.len() - n_structural;
+        let mut gone = vec![false; m];
+        for &i in removed {
+            gone[i] = true;
+        }
+        // Where each surviving row lands, and which basis positions empty.
+        let mut row_to = vec![usize::MAX; m];
+        let mut next = 0;
+        for i in 0..m {
+            if !gone[i] {
+                row_to[i] = next;
+                next += 1;
+            }
+        }
+        let mut position_gone = vec![false; self.basic.len()];
+        for &i in removed {
+            let Status::Basic { row } = self.status[n_structural + i] else {
+                return None;
+            };
+            position_gone[row] = true;
+        }
+        let rename = |j: usize| {
+            if j < n_structural {
+                j
+            } else {
+                n_structural + row_to[j - n_structural]
+            }
+        };
+        let basic: Vec<usize> = self
+            .basic
+            .iter()
+            .zip(&position_gone)
+            .filter(|&(_, &gone)| !gone)
+            .map(|(&j, _)| rename(j))
+            .collect();
+        let mut status = vec![Status::NonBasic(At::Lower); n_structural + next];
+        for (j, st) in self.status.iter().enumerate() {
+            if j >= n_structural && gone[j - n_structural] {
+                continue;
+            }
+            if let Status::NonBasic(at) = st {
+                status[rename(j)] = Status::NonBasic(*at);
+            }
+        }
+        for (row, &j) in basic.iter().enumerate() {
+            status[j] = Status::Basic { row };
+        }
+        Some(BasisState { basic, status })
     }
 }
 
@@ -384,6 +461,19 @@ impl Lp {
         self.invalidate_factors();
     }
 
+    /// Extend a basis saved before rows were appended to this LP so it applies now.
+    ///
+    /// Rows are only ever appended, so a basis from fewer rows describes a prefix of
+    /// this LP and needs only the new rows' logicals; see
+    /// [`BasisState::extend_for_rows`].
+    pub fn fit(&self, basis: &mut BasisState) {
+        let rows = basis.status.len() - self.n_structural;
+        debug_assert!(rows <= self.m, "a basis from more rows than the LP has");
+        if rows < self.m {
+            basis.extend_for_rows(self.n_structural, rows, self.m - rows);
+        }
+    }
+
     pub fn with_tolerances(mut self, tol: Tolerances) -> Self {
         self.tol = tol;
         self
@@ -406,6 +496,16 @@ impl Lp {
     /// Stop any solve once `flag` is set, as if the deadline had passed.
     pub fn set_interrupt(&mut self, flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.interrupt = flag;
+    }
+
+    /// The tolerances this LP solves with, for an LP built to replace it.
+    pub fn tolerances(&self) -> Tolerances {
+        self.tol
+    }
+
+    /// The flag [`Lp::set_interrupt`] installed, for an LP built to replace this one.
+    pub fn interrupt(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.interrupt.clone()
     }
 
     /// Has the budget run out, or has someone asked this to stop?
@@ -754,6 +854,10 @@ struct Solver<'a> {
     /// there and the extra FTRAN per iteration is pure cost; a cold one crosses the
     /// whole model and the choice is most of the solve.
     dual_steepest: bool,
+    /// Price the dual method's leaving row by steepest edge rather than by the largest
+    /// violation. Set by a cold dual entry with the rest of `dual_steepest`, and by a
+    /// warm start alone; see [`Solver::warm`].
+    steepest_rows: bool,
     /// Dual steepest edge weights, one per basis row; see [`Solver::leaving_row`].
     row_weights: Vec<f64>,
     /// Scratch for the steepest edge update, `B^-1` applied to the pivot row.
@@ -898,6 +1002,7 @@ impl<'a> Solver<'a> {
             factorized: false,
             basic_values: Vec::new(),
             dual_steepest: dual_ready,
+            steepest_rows: dual_ready,
             row_weights: vec![1.0; m],
             tau: Vec::new(),
             col_weights: vec![1.0; lp.n_total()],
@@ -952,7 +1057,8 @@ impl<'a> Solver<'a> {
             factorized,
             basic_values: Vec::new(),
             dual_steepest: false,
-            row_weights: Vec::new(),
+            steepest_rows: lp.tol.warm_steepest_edge,
+            row_weights: vec![1.0; m],
             tau: Vec::new(),
             col_weights: vec![1.0; lp.n_total()],
             rho: Vec::new(),
@@ -1438,7 +1544,7 @@ impl<'a> Solver<'a> {
                 if found.is_none_or(|(prev, _)| j < self.basic[prev]) {
                     found = Some((i, side));
                 }
-            } else if !self.dual_steepest {
+            } else if !self.steepest_rows {
                 if violation > worst {
                     worst = violation;
                     found = Some((i, side));
@@ -1873,7 +1979,7 @@ impl<'a> Solver<'a> {
 
             // Before the basis moves: the update reads `alpha` and the pivot row
             // against the factorization they were computed from.
-            if self.dual_steepest {
+            if self.steepest_rows {
                 self.update_row_weights(r, &rho);
             }
 
@@ -2425,6 +2531,102 @@ mod tests {
         // And the cut actually bit: the bound is worse than before it was added.
         assert!(warm.objective > first.objective + 1e-9);
         assert!(cut.violation(&warm.x) <= 1e-9);
+    }
+
+    /// `fit` is `extend_for_rows` with the count read off the basis, so a basis saved
+    /// before two rounds of growth fits the LP after both.
+    #[test]
+    fn a_basis_from_before_rows_were_added_fits_the_grown_lp() {
+        let base = problem(
+            &[-1.0, -2.0],
+            &[
+                (&[1.0, 1.0], RowSense::Le, 3.5),
+                (&[2.0, 1.0], RowSense::Le, 5.0),
+            ],
+        );
+        let mut lp = Lp::relaxation(&base);
+        let first = lp.solve();
+        lp.add_rows(&[(vec![(0, 1.0), (1, 1.0)], f64::NEG_INFINITY, 2.5)]);
+        lp.add_rows(&[(vec![(1, 1.0)], f64::NEG_INFINITY, 1.5)]);
+
+        let mut basis = first.basis.clone();
+        lp.fit(&mut basis);
+        let warm = lp.solve_warm(&basis, None, 10_000);
+
+        let mut rebuilt = base.clone();
+        rebuilt.add_cuts(&[
+            crate::cuts::Cut {
+                coefficients: vec![(0, 1.0), (1, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 2.5,
+            },
+            crate::cuts::Cut {
+                coefficients: vec![(1, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 1.5,
+            },
+        ]);
+        let cold = Lp::relaxation(&rebuilt).solve();
+        assert_eq!(warm.status, LpStatus::Optimal);
+        assert!((warm.objective - cold.objective).abs() < 1e-9);
+    }
+
+    /// Taking out a slack row with its basic logical leaves the optimal basis of the
+    /// smaller LP, which a warm start then confirms without a pivot.
+    #[test]
+    fn removing_slack_rows_leaves_an_optimal_basis() {
+        use crate::cuts::Cut;
+
+        let base = problem(
+            &[-3.0, -2.0, -4.0],
+            &[
+                (&[1.0, 1.0, 1.0], RowSense::Le, 2.5),
+                (&[2.0, 1.0, 0.0], RowSense::Le, 2.0),
+            ],
+        );
+        // A binding cut between two slack ones, so the survivors are renumbered on
+        // both sides of a gap.
+        let cuts = [
+            Cut {
+                coefficients: vec![(0, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 10.0,
+            },
+            Cut {
+                coefficients: vec![(2, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 1.0,
+            },
+            Cut {
+                coefficients: vec![(1, 1.0), (2, 1.0)],
+                lb: f64::NEG_INFINITY,
+                ub: 50.0,
+            },
+        ];
+        let mut with = base.clone();
+        with.add_cuts(&cuts);
+        let solved = Lp::relaxation(&with).solve();
+        assert_eq!(solved.status, LpStatus::Optimal);
+        assert!(!cuts[0].is_tight(&solved.x, 1e-9) && !cuts[2].is_tight(&solved.x, 1e-9));
+        assert!(cuts[1].is_tight(&solved.x, 1e-9));
+
+        let n = base.n_cols();
+        let rows = base.n_rows();
+        let basis = solved
+            .basis
+            .without_rows(n, &[rows, rows + 2])
+            .expect("slack rows have basic logicals");
+
+        let mut trimmed = base.clone();
+        trimmed.add_cuts(std::slice::from_ref(&cuts[1]));
+        let mut lp = Lp::relaxation(&trimmed);
+        let warm = lp.solve_warm(&basis, None, 10_000);
+        assert_eq!(warm.status, LpStatus::Optimal);
+        assert_eq!(warm.iterations, 0);
+        assert!((warm.objective - solved.objective).abs() < 1e-9);
+
+        // A binding row's logical is nonbasic, and then there is no basis to give back.
+        assert!(solved.basis.without_rows(n, &[rows + 1]).is_none());
     }
 
     /// Reusing the parent factorization must land exactly where refactorizing does.

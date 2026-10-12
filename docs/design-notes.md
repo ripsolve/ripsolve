@@ -185,6 +185,59 @@ factorization:
 | 1000 | `v064c1000n100` | 6.64s | 9.83s | 1.48x |
 | | total, eight models | 35.90s | 42.29s | 1.18x |
 
+### Rows supplied during the search
+
+`search::solve_with` takes a `Separator`, asked for rows at the root between rounds of
+cutting, at every node, and of every point before it may become the incumbent. The last
+is what makes it a lazy-constraint mechanism as well as a cut callback: a model may leave
+out any number of rows its separator can find when a point breaks them.
+
+It was built for the clique partitioning model behind the tennis division proposer
+(`alta_divisions`): 1128 pair columns over 48 teams, a degree row per team, and some
+52000 transitivity rows of which a couple of thousand ever matter. Gurobi solves that
+model, with the transitivity rows an LP stage generated, in 2.4 seconds at one node.
+ripsolve took 52 seconds and a hundred nodes, and the proposer wrapped it in an outer
+loop that re-solved the whole MIP whenever its answer broke a missing row.
+
+What it took, beyond the plumbing:
+
+- **Rows go to a pool kept in one order**, and every worker's LP is the model followed by
+  a prefix of it. A node's saved basis, made by any worker, then fits whichever worker
+  takes the node once the new rows' logicals are appended (`Lp::fit`).
+- **Dual reductions are off.** Presolve's two cost-based fixings, doubleton aggregation,
+  symmetry and the conflict-driven search beside the tree all reason from the rows they
+  can see to something only the complete model would justify.
+- **The caller's rows never age out at the root.** Ageing a transitivity row out cost a
+  rebuild and a cold solve, and a node found it broken again; with 48 base rows the
+  ageing threshold was reached at once. Root cutting went from 5.9 to 0.6 seconds.
+- **The nested searches get the separator**, or are skipped where the columns are
+  renumbered. Without it the reduced-cost neighbourhood search spent 40 seconds on a
+  model missing its transitivity rows, finding points the separator then rejected.
+
+Three things found on the way were not about separation at all, and help everything:
+
+- **The refactorization trigger read the wrong size.** It refactorized once the eta file
+  outgrew the factors, but the factors' size says little about their cost: this model's
+  1830-row basis touches 56000 entries to produce 8000, so it refactorized every six
+  pivots and spent 56% of a relaxation factorizing. It now refactorizes when the replay
+  work accumulated since the last factorization reaches that factorization's own cost,
+  measured in the same units (`Lu::cost`). The factorization also keeps its working
+  memory between calls and stores both factors flat; allocation had been a fifth of the
+  relaxation. Root relaxation 4.25s to 1.72s.
+- **Removing a slack cut no longer costs a cold solve.** A slack row's logical is basic,
+  so the row and its logical can leave together and the basis stays optimal
+  (`BasisState::without_rows`). The final purge had been five of the seven seconds of
+  this model's root.
+- **Warm dual solves price rows by steepest edge**, with weights starting at one.
+  Largest-violation pricing took 4000 to 11000 pivots per node here; this takes 500 to
+  3000.
+
+The B-8 level end to end, 64.6 seconds before and 10 after, of which the MIP is about
+nine and a half against Gurobi's 2.4. C-5 went from 23.9 seconds to 1.5, B-1 from 82.5 to
+32. What is left is per-iteration cost: half a millisecond a pivot
+at 2300 rows, in dense triangular solves and factorizations, which is the LP engine
+rather than anything the search decides.
+
 ## Node selection
 
 The open node set is a depth-first plunge stack plus a best-bound pool. By default

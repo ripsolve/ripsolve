@@ -22,7 +22,7 @@
 //! replaced, so Forrest-Tomlin can supersede product form later without the simplex
 //! driver noticing, exactly as this change did.
 
-use crate::lp::lu::{FactorError, Lu};
+use crate::lp::lu::{FactorError, Lu, Scratch};
 
 /// Why a refactorization could not produce a usable basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +80,17 @@ pub struct Basis {
     ext: Vec<Extension>,
     /// Pivots recorded after the extension, applied on top of it.
     post: Vec<Eta>,
+    /// Working memory for the next refactorization.
+    scratch: Scratch,
+    /// Nonzeros in `etas` and `post`, and the replay work they have cost since the last
+    /// refactorization; see [`Basis::eta_file_is_expensive`].
+    eta_nnz: usize,
+    replayed: usize,
 }
+
+/// Solves a pivot asks of the basis, each of which replays the whole eta file: the
+/// entering column, the pivot row, and the pricing update's own.
+const SOLVES_PER_PIVOT: usize = 3;
 
 /// Entries smaller than this are treated as structurally absent.
 const ZERO_TOL: f64 = 1e-12;
@@ -96,6 +106,9 @@ impl Basis {
             etas: Vec::new(),
             ext: Vec::new(),
             post: Vec::new(),
+            scratch: Scratch::default(),
+            eta_nnz: 0,
+            replayed: 0,
         }
     }
 
@@ -179,27 +192,26 @@ impl Basis {
         self.etas.len() + self.post.len()
     }
 
-    /// Nonzeros held in the factors, for diagnostics.
-    /// Whether the eta file has grown expensive enough to be worth rebuilding.
+    /// Whether the eta file has cost enough to be worth rebuilding.
     ///
-    /// Every solve replays the whole eta file, so its cost is its nonzero count, while
-    /// refactorizing costs roughly the factors' own. Comparing the two directly is what
-    /// makes this self-tuning, where a fixed pivot count cannot be: the same interval
-    /// that suits one model starves another. On MIPLIB's neos-555001, 3474 rows, an
-    /// interval of 200 pivots managed 328 nodes in twenty seconds where 50 managed 700,
-    /// and on neos-3048764-nadi, 3186 rows, the ordering is the other way round.
+    /// Every solve replays the whole eta file, and the file grows by a pivot's worth each
+    /// iteration, so the work it adds over a run of `k` pivots grows as `k^2` while a
+    /// refactorization costs the same whenever it happens. The average cost per pivot is
+    /// least when the replay work accumulated since the last refactorization reaches
+    /// that refactorization's own cost, which is the test, at `growth` 1.
+    ///
+    /// Self-tuning, where a fixed pivot count cannot be: the same interval that suits
+    /// one model starves another. On MIPLIB's neos-555001, 3474 rows, an interval of 200
+    /// pivots managed 328 nodes in twenty seconds where 50 managed 700, and on
+    /// neos-3048764-nadi, 3186 rows, the ordering is the other way round.
+    ///
+    /// It compared the eta file's size with the factors' until the factors' size turned
+    /// out to say little about their cost; see [`Lu::cost`].
     pub fn eta_file_is_expensive(&self, growth: f64) -> bool {
-        let etas: usize = self
-            .etas
-            .iter()
-            .chain(&self.post)
-            .map(|e| e.column.len() + 1)
-            .sum();
-        // A basis of logicals factorizes to almost nothing, so the ratio is measured
-        // against a floor rather than against zero.
-        etas as f64 > growth * (self.lu.nnz().max(self.m) as f64)
+        self.replayed as f64 > growth * self.lu.cost() as f64
     }
 
+    /// Nonzeros held in the factors and the updates on top of them, for diagnostics.
     pub fn nnz(&self) -> usize {
         self.lu.nnz()
             + self
@@ -303,6 +315,8 @@ impl Basis {
             pivot,
             column,
         };
+        self.eta_nnz += eta.column.len() + 1;
+        self.replayed += SOLVES_PER_PIVOT * self.eta_nnz;
         // A pivot taken after the basis grew sits above the extension, not beneath it.
         if self.ext.is_empty() {
             self.etas.push(eta);
@@ -322,15 +336,19 @@ impl Basis {
             self.etas.clear();
             self.ext.clear();
             self.post.clear();
+            self.eta_nnz = 0;
+            self.replayed = 0;
             return Ok(());
         }
-        match Lu::factor(self.m, columns, ZERO_TOL, deadline) {
+        match Lu::factor_with(self.m, columns, ZERO_TOL, deadline, &mut self.scratch) {
             Ok(lu) => {
                 self.lu = lu;
                 self.etas.clear();
                 // A fresh factorization covers the appended rows like any other.
                 self.ext.clear();
                 self.post.clear();
+                self.eta_nnz = 0;
+                self.replayed = 0;
                 Ok(())
             }
             Err(FactorError::Singular { position }) => Err(BasisError::Singular { row: position }),

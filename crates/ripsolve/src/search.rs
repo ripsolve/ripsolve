@@ -229,6 +229,9 @@ pub struct Options {
     /// Product-form updates before refactorizing the basis; see
     /// [`crate::lp::Tolerances::refactor_interval`].
     pub refactor_interval: usize,
+    /// Price warm-started dual solves by steepest edge; see
+    /// [`crate::lp::Tolerances::warm_steepest_edge`].
+    pub warm_steepest_edge: bool,
     /// Worker threads for the tree search. One (or zero) runs the serial driver.
     ///
     /// Only the tree is parallel: presolve, cut generation and the root heuristics
@@ -324,6 +327,7 @@ impl Default for Options {
             cut_rounds: 50,
             cuts_per_round: 64,
             refactor_interval: 200,
+            warm_steepest_edge: true,
             threads: 1,
             plunge_limit: 0,
             improvement_frequency: 500,
@@ -405,6 +409,119 @@ impl Solution {
             _ => f64::INFINITY,
         }
     }
+}
+
+/// Where the point handed to a [`Separator`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Point {
+    /// The root relaxation, between rounds of cutting.
+    Root,
+    /// A node's relaxation, not integral.
+    Node,
+    /// A point that satisfies every row of the model and is integral where it must be:
+    /// it becomes the incumbent unless the separator returns a row it breaks.
+    Candidate,
+}
+
+/// Rows the model leaves out, supplied while the search runs.
+///
+/// One mechanism serves both of the things solvers usually keep apart. A *cut* is a row
+/// every solution satisfies anyway, offered because it tightens the relaxation; a *lazy
+/// constraint* is a row the model needs and does not hold, because there are too many of
+/// them to write down. The search asks at the root, at every node, and of every point
+/// before it may become the incumbent, so a separator that returns every row a point
+/// breaks has, in effect, added all of them, and one that only ever offers cuts costs
+/// nothing in correctness when it misses some.
+///
+/// `x` is indexed by the model's own columns. The rows returned are in the form
+/// [`cuts::Cut`] holds them, `lb <= a'x <= ub`, and only those `x` breaks by more than
+/// the feasibility tolerance are kept. They must hold for every solution of the full
+/// model: they are added to the relaxation everywhere, not at one node.
+///
+/// Because some rows are missing, the search turns off what reasons from the rows it can
+/// see to fix a column by its cost: presolve's dual reductions, doubleton aggregation,
+/// symmetry, and the conflict-driven search beside the tree.
+///
+/// Any `Fn(&[f64], Point) -> Vec<Cut> + Sync` is a separator.
+pub trait Separator: Sync {
+    fn separate(&self, x: &[f64], point: Point) -> Vec<cuts::Cut>;
+}
+
+impl<F: Fn(&[f64], Point) -> Vec<cuts::Cut> + Sync> Separator for F {
+    fn separate(&self, x: &[f64], point: Point) -> Vec<cuts::Cut> {
+        self(x, point)
+    }
+}
+
+/// A caller's separator, and every row it has produced in the tree.
+///
+/// The rows are kept in one order for the whole search, and each worker's LP carries the
+/// model's rows followed by a prefix of them. That is what lets a node's saved basis,
+/// made by any worker at any earlier point, be extended to fit whichever worker picks the
+/// node up: its rows are a prefix of that worker's, after a [`Worker::sync`].
+struct Separation<'a> {
+    separator: &'a dyn Separator,
+    pool: Mutex<Vec<cuts::Cut>>,
+    tolerance: f64,
+}
+
+impl<'a> Separation<'a> {
+    fn new(separator: &'a dyn Separator, tolerance: f64) -> Self {
+        Self {
+            separator,
+            pool: Mutex::new(Vec::new()),
+            tolerance,
+        }
+    }
+
+    /// The rows `x` breaks, as the separator gives them, tidied: coefficients sorted by
+    /// column with duplicates merged, which is what [`cuts::Cut`] promises.
+    fn violated(&self, x: &[f64], point: Point) -> Vec<cuts::Cut> {
+        let mut found = self.separator.separate(x, point);
+        for cut in &mut found {
+            cut.coefficients.sort_unstable_by_key(|&(j, _)| j);
+            cut.coefficients.dedup_by(|later, kept| {
+                let same = later.0 == kept.0;
+                if same {
+                    kept.1 += later.1;
+                }
+                same
+            });
+            cut.coefficients.retain(|&(_, a)| a != 0.0);
+        }
+        found.retain(|cut| cut.violation(x) > self.tolerance);
+        found
+    }
+
+    /// Whether `x` may become the incumbent. When it may not, the rows it breaks join
+    /// the pool, so the tree stops proposing it.
+    fn admits(&self, x: &[f64]) -> bool {
+        let found = self.violated(x, Point::Candidate);
+        if found.is_empty() {
+            return true;
+        }
+        self.add(found);
+        false
+    }
+
+    fn add(&self, rows: Vec<cuts::Cut>) {
+        self.pool.lock().expect("separation pool lock").extend(rows);
+    }
+
+    /// The pool's rows from `from` on.
+    fn since(&self, from: usize) -> Vec<crate::lp::RangeRow> {
+        let pool = self.pool.lock().expect("separation pool lock");
+        pool.get(from..)
+            .unwrap_or_default()
+            .iter()
+            .map(|cut| (cut.coefficients.clone(), cut.lb, cut.ub))
+            .collect()
+    }
+}
+
+/// Whether a point found somewhere other than a node's LP may become the incumbent.
+fn admitted(separation: Option<&Separation>, x: &[f64]) -> bool {
+    separation.is_none_or(|s| s.admits(x))
 }
 
 /// A node's key in the best-bound pool: weakest bound first, deeper nodes winning
@@ -590,9 +707,22 @@ struct Worker<'a> {
     /// distinction decides whether a conflict may be learned from; see
     /// [`crate::propagate::Seed`].
     moved: Vec<(u32, propagate::Seed)>,
+    /// The caller's separator, and how much of its pool this worker's LP carries.
+    separation: Option<&'a Separation<'a>>,
+    synced: usize,
 }
 
 impl<'a> Worker<'a> {
+    /// Bring this worker's LP up to the separator's pool.
+    fn sync(&mut self) {
+        let Some(separation) = self.separation else {
+            return;
+        };
+        let rows = separation.since(self.synced);
+        self.synced += rows.len();
+        self.lp.add_rows(&rows);
+    }
+
     /// Has the incumbent decided enough of the model to be worth starting over on?
     ///
     /// The lurking table already knows: the entries in force at a cutoff are a prefix,
@@ -636,6 +766,7 @@ impl<'a> Worker<'a> {
         rows_of_a: &'a SparseMatrix,
         conflicts: &'a Conflicts,
         seed_clauses: &[propagate::Clause],
+        separation: Option<&'a Separation<'a>>,
     ) -> Self {
         let n = problem.n_cols();
         Self {
@@ -675,6 +806,8 @@ impl<'a> Worker<'a> {
             node_lb: problem.col_lb.clone(),
             node_ub: problem.col_ub.clone(),
             moved: Vec::new(),
+            separation,
+            synced: 0,
         }
     }
 
@@ -946,9 +1079,16 @@ impl<'a> Worker<'a> {
         }
 
         let cutoff = incumbent.is_finite().then_some(incumbent);
+        // Rows the separator has added since this node's parent was solved, perhaps by
+        // another worker, extend its basis with their logicals.
+        self.sync();
+        let mut basis = std::borrow::Cow::Borrowed(&node.basis);
+        if self.separation.is_some() {
+            self.lp.fit(basis.to_mut());
+        }
         let mut solved = self
             .lp
-            .solve_warm(&node.basis, cutoff, options.max_iterations_per_node);
+            .solve_warm(&basis, cutoff, options.max_iterations_per_node);
         self.iterations += solved.iterations;
         // A node LP that gives up with time still on the clock has usually not run out
         // of iterations at all: the basis it inherited would not factorize, and the
@@ -1024,9 +1164,52 @@ impl<'a> Worker<'a> {
         // Lifted to the next objective the model can take before it is compared with
         // anything. A relaxation worth 52000.3 on a model whose objectives step by 200
         // is a proof that nothing here beats 52200.
-        let relaxed = lift_to_granularity(solved.objective, self.granularity);
+        let mut relaxed = lift_to_granularity(solved.objective, self.granularity);
         if !improves(relaxed, incumbent, options.gap_tolerance) {
             return out;
+        }
+
+        // The caller's rows. A fractional point gets a few rounds of them; an integral
+        // one gets as many as it takes, because it is about to become the incumbent and
+        // a row it breaks is one the model needs. Each round cuts the point off, so this
+        // ends.
+        if let Some(separation) = self.separation {
+            let mut rounds = 0;
+            loop {
+                let integral = integral_solution(problem, &solved.x, options.integrality_tolerance);
+                if integral.is_none() && rounds >= NODE_SEPARATION_ROUNDS {
+                    break;
+                }
+                let found = match &integral {
+                    Some(x) => separation.violated(x, Point::Candidate),
+                    None => separation.violated(&solved.x, Point::Node),
+                };
+                if found.is_empty() {
+                    break;
+                }
+                separation.add(found);
+                self.sync();
+                let mut basis = solved.basis.clone();
+                self.lp.fit(&mut basis);
+                let resolved = self
+                    .lp
+                    .solve_warm(&basis, cutoff, options.max_iterations_per_node);
+                self.iterations += resolved.iterations;
+                match resolved.status {
+                    LpStatus::Optimal => {}
+                    LpStatus::IterationLimit => {
+                        out.exhausted = true;
+                        return out;
+                    }
+                    LpStatus::Infeasible | LpStatus::CutOff | LpStatus::Unbounded => return out,
+                }
+                solved = resolved;
+                relaxed = lift_to_granularity(solved.objective, self.granularity);
+                if !improves(relaxed, incumbent, options.gap_tolerance) {
+                    return out;
+                }
+                rounds += 1;
+            }
         }
         // Kept only when an improvement search might use it, since it is a copy of the
         // whole column vector at every node otherwise.
@@ -1079,7 +1262,9 @@ impl<'a> Worker<'a> {
                 }
             });
             let improved = match found {
-                Some(found) if found.objective < incumbent => {
+                Some(found)
+                    if found.objective < incumbent && admitted(self.separation, &found.x) =>
+                {
                     out.incumbent = Some((found.objective, found.x));
                     out.heuristic_hits += 1;
                     true
@@ -1091,12 +1276,14 @@ impl<'a> Worker<'a> {
 
         match integral_solution(problem, &solved.x, options.integrality_tolerance) {
             Some(x) => {
-                let better = out
-                    .incumbent
-                    .as_ref()
-                    .is_none_or(|(o, _)| solved.objective < *o);
+                // Scored from the rounded point, as the root's is, rather than taken
+                // from the relaxation: the two differ by the LP's rounding, and the
+                // point is what the caller gets. The soccer scheduler's balance test
+                // read back 39.99999999999999 for a schedule worth 40.
+                let objective = objective_at(problem, &x);
+                let better = out.incumbent.as_ref().is_none_or(|(o, _)| objective < *o);
                 if better {
-                    out.incumbent = Some((solved.objective, x));
+                    out.incumbent = Some((objective, x));
                 }
             }
             None => {
@@ -1340,6 +1527,7 @@ fn run_parallel(
     lurking: &Lurking,
     symmetry: &Symmetry,
     mailbox: Option<&Mailbox>,
+    separation: Option<&Separation>,
 ) -> TreeResult {
     let shared = Shared {
         pool: Mutex::new(SharedPool {
@@ -1386,6 +1574,7 @@ fn run_parallel(
                 &rows_of_a,
                 &conflicts,
                 &probed,
+                separation,
             );
             let shared = &shared;
             scope.spawn(move || {
@@ -1466,7 +1655,9 @@ fn run_parallel(
                                 relaxation,
                                 &options,
                                 remaining_of(options.time_limit, started),
+                                separation,
                             )
+                            && admitted(separation, &x)
                             && shared.offer(objective, x)
                         {
                             shared.heuristic_hits.fetch_add(1, Ordering::Relaxed);
@@ -1582,6 +1773,7 @@ fn separate_at_root(
     // When to stop cutting and let the search have the rest, distinct from the run's
     // own deadline; see the caller.
     stop_cutting: Option<Instant>,
+    separation: Option<&Separation>,
 ) -> RootCuts {
     // Nothing to do, and in particular no reason to clone the model, which is the
     // common case since root cutting is off by default.
@@ -1612,12 +1804,13 @@ fn separate_at_root(
     let conflicts = cuts::Conflicts::of(problem);
     let mut model: Option<Problem> = None;
     let mut with_cuts;
-    // Cuts currently carried in the model, each with a count of consecutive resolves
-    // it has sat slack through.
-    let mut active: Vec<(cuts::Cut, u32)> = Vec::new();
-    // Whether the last round's ageing removed a row, which is what decides between
-    // growing the model the last solve ran on and rebuilding it from `base`.
-    let mut dropped_a_cut = false;
+    // The rows carried in the model after `base`'s, in the model's order. A cut carries
+    // the count of consecutive resolves it has sat slack through; a caller's row carries
+    // `None`, since it never ages out: some of those are rows the model needs rather
+    // than cuts, and dropping one only means a node finds it broken again later.
+    let mut rows: Vec<(cuts::Cut, Option<u32>)> = Vec::new();
+    // Which of them the last round's ageing condemned, to leave at the next rebuild.
+    let mut doomed: Vec<bool> = Vec::new();
 
     for _ in 0..options.cut_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d)
@@ -1625,72 +1818,30 @@ fn separate_at_root(
         {
             break;
         }
-        if root.status != LpStatus::Optimal
-            || integral_solution(problem, &root.x, options.integrality_tolerance).is_some()
-        {
+        if root.status != LpStatus::Optimal {
             break;
         }
-        // Five families with different reach: covers need a row that reads as a
-        // knapsack, MIR needs a row mixing integer and continuous columns, cliques need
-        // columns that exclude one another, GMI comes off the tableau and applies to any
-        // fractional basic column, and mod-2 combines whole rows. On dense random rows the last is usually the
-        // only one that finds anything; on mixed models from MIPLIB the second carries
-        // most of the bound; and on the pure binary set, where there is no continuous
-        // structure for MIR to reach, the third is the one with anything to say.
-        let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
-        found.extend(cuts::separate_mir(problem, &root.x, options.cuts_per_round));
-        found.extend(cuts::separate_cliques(
-            problem,
-            &conflicts,
-            &root.x,
-            options.cuts_per_round,
-        ));
-        found.extend(cuts::separate_gomory(
-            &lp,
-            &root.basis,
-            &root.x,
-            options.cuts_per_round,
-        ));
-        // Sixth family, and the only one that combines rows. The four above each read a
-        // single row or a single tableau row, and on a model whose optimal face is large
-        // that removes one vertex of it and the relaxation steps to the next one worth
-        // the same. See `separate_mod2`.
-        //
-        // On a smaller allowance than the rest; see `MOD2_SHARE`.
-        found.extend(cuts::separate_mod2(
-            problem,
-            &root.x,
-            options.cuts_per_round / MOD2_SHARE,
-        ));
-        // Separation is deliberately generous; this is where the model's row count is
-        // actually decided. Ranking by efficacy and dropping near-parallel duplicates
-        // keeps the rows that move the bound and discards the ones that only cost an
-        // LP column scan at every node below.
-        let mut found = cuts::select(found, &root.x, options.cuts_per_round);
-
-        // A row aggregated through the variable upper bounds the model implies, and it
-        // is selected on its own rather than against the families above. Efficacy
-        // divides violation by the cut's norm, which prices an aggregated row of six
-        // hundred terms against a two-term clique and loses every time; on
-        // `neos-787933` the two-term cliques win that ranking, move the bound from 8.07
-        // to 8.16, and crowd out the 77 aggregated rows that move it to 30, which is
-        // the optimum. The ranking is not wrong in general -- a short cut really is
-        // cheaper to carry -- so this family gets its own budget instead of a thumb on
-        // the scale. See `separate_implied_aggregations`.
-        found.extend(cuts::select(
-            cuts::separate_implied_aggregations(
-                problem,
-                &conflicts,
-                &root.x,
-                options.cuts_per_round,
-            ),
-            &root.x,
-            options.cuts_per_round / AGGREGATION_SHARE,
-        ));
-        if found.is_empty() {
+        // An integral root is the answer, unless it breaks a row the caller holds.
+        let integral = integral_solution(problem, &root.x, options.integrality_tolerance);
+        if integral.is_some() && separation.is_none() {
             break;
         }
-        added += found.len();
+        // The caller's rows are taken whole rather than selected: the separator decides
+        // how many to return, and at an integral root each is a row the model needs.
+        let caller = match (separation, &integral) {
+            (None, _) => Vec::new(),
+            (Some(separation), Some(x)) => separation.violated(x, Point::Candidate),
+            (Some(separation), None) => separation.violated(&root.x, Point::Root),
+        };
+        let found = if integral.is_some() {
+            Vec::new()
+        } else {
+            root_families(problem, &lp, &root, &conflicts, options, deadline)
+        };
+        if found.is_empty() && caller.is_empty() {
+            break;
+        }
+        added += found.len() + caller.len();
 
         // Adding rows to a solved model is what the dual simplex is for: the point the
         // basis describes violates the new rows, which is what makes them cuts, so the
@@ -1701,30 +1852,37 @@ fn separate_at_root(
         // between two nodes in five minutes and a search: root, one cut round and the
         // purge below came to 51 seconds of a 60 second budget before the tree opened.
         //
-        // The rebuild is still needed when the ageing below has dropped a cut, since
-        // removing a row leaves the saved basis describing different rows than the
-        // model has. Growing is the common case and the only one that has to be quick.
-        let old_rows = problem.n_rows();
-        let warm = if dropped_a_cut {
-            with_cuts = base.clone();
-            let rows: Vec<cuts::Cut> = active
-                .iter()
-                .map(|(c, _)| c.clone())
-                .chain(found.iter().cloned())
-                .collect();
-            with_cuts.add_cuts(&rows);
-            None
-        } else {
+        // When the ageing below has condemned cuts, the model is rebuilt without them,
+        // and the basis follows: a cut gone slack has its logical basic, so taking the
+        // two out together leaves a basis for the smaller model, and only if that fails
+        // does the round start cold. See `BasisState::without_rows`.
+        // Committed only once the round's model has solved; see below.
+        let (mut next_rows, removed) = survivors(&rows, &doomed, base.n_rows());
+        let state = if removed.is_empty() {
             with_cuts = problem.clone();
-            with_cuts.add_cuts(&found);
-            let mut state = root.basis.clone();
-            state.extend_for_rows(with_cuts.n_cols(), old_rows, found.len());
-            Some(state)
+            Some(root.basis.clone())
+        } else {
+            with_cuts = base.clone();
+            with_cuts.add_cuts(&next_rows.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+            root.basis.without_rows(problem.n_cols(), &removed)
         };
-        active.extend(found.into_iter().map(|c| (c, 0)));
+        let old_rows = with_cuts.n_rows();
+        with_cuts.add_cuts(&found);
+        with_cuts.add_cuts(&caller);
+        let warm = state.map(|mut state| {
+            state.extend_for_rows(with_cuts.n_cols(), old_rows, found.len() + caller.len());
+            state
+        });
+        next_rows.extend(found.into_iter().map(|c| (c, Some(0))));
+        next_rows.extend(caller.into_iter().map(|c| (c, None)));
 
-        let mut candidate = Lp::relaxation(&with_cuts);
+        let mut candidate = Lp::relaxation(&with_cuts).with_tolerances(lp.tolerances());
         candidate.set_deadline(deadline);
+        // The flag that stops this solve when the search beside the tree proves its
+        // point. A fresh LP does not inherit it, and without it the cut loop ran on for
+        // 27 seconds after `bnatt400` had been settled; it went unnoticed while the
+        // root relaxation was slow enough to still be running when the proof came.
+        candidate.set_interrupt(lp.interrupt());
         let resolved = match &warm {
             Some(state) => {
                 candidate.solve_warm(state, None, options.max_iterations_per_node)
@@ -1737,15 +1895,18 @@ fn separate_at_root(
             // that does not; the bound already gained is still sound.
             break;
         }
+        rows = next_rows;
 
         // A cut that has gone slack is no longer shaping the relaxation, but it still
         // costs work in every LP below it. Later rounds routinely make earlier rounds'
         // cuts redundant, so age them out rather than accumulating.
-        for (cut, age) in &mut active {
-            if cut.is_tight(&resolved.x, CUT_SLACK_TOLERANCE) {
-                *age = 0;
-            } else {
-                *age += 1;
+        for (cut, age) in &mut rows {
+            if let Some(age) = age {
+                if cut.is_tight(&resolved.x, CUT_SLACK_TOLERANCE) {
+                    *age = 0;
+                } else {
+                    *age += 1;
+                }
             }
         }
         // Dropping a cut costs a rebuild, and a rebuild costs a cold solve of the whole
@@ -1756,11 +1917,13 @@ fn separate_at_root(
         // `cap6000` 26.6 to 20.3, and `neos-633273`'s root bound from 5.060e9 to
         // 5.755e9 on 389 cuts against 156. The final purge below is what actually keeps
         // slack rows out of the search, and it is unchanged.
-        let carried = active.len();
-        if active.len() > base.n_rows() {
-            active.retain(|&(_, age)| age < CUT_MAX_AGE);
-        }
-        dropped_a_cut = active.len() != carried;
+        let cuts_carried = rows.iter().filter(|(_, age)| age.is_some()).count();
+        doomed = rows
+            .iter()
+            .map(|&(_, age)| {
+                cuts_carried > base.n_rows() && age.is_some_and(|age| age >= CUT_MAX_AGE)
+            })
+            .collect();
 
         model = Some(with_cuts);
         problem = model.as_ref().expect("just set");
@@ -1773,19 +1936,21 @@ fn separate_at_root(
     // inactive at the optimum of a convex program cannot be holding the bound up:
     // dropping it leaves the same point optimal. The re-solve is a guard against that
     // reasoning meeting a degenerate basis, not an expectation of change.
-    if root.status == LpStatus::Optimal
-        && active
-            .iter()
-            .any(|(c, _)| !c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
-    {
-        let rows: Vec<cuts::Cut> = active
-            .iter()
-            .filter(|(c, _)| c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
-            .map(|(c, _)| c.clone())
-            .collect();
+    let slack: Vec<bool> = rows
+        .iter()
+        .map(|(c, age)| age.is_some() && !c.is_tight(&root.x, CUT_SLACK_TOLERANCE))
+        .collect();
+    if root.status == LpStatus::Optimal && slack.contains(&true) {
+        let (kept, removed) = survivors(&rows, &slack, base.n_rows());
         let mut trimmed = base.clone();
-        trimmed.add_cuts(&rows);
-        let mut candidate = Lp::relaxation(&trimmed);
+        trimmed.add_cuts(&kept.into_iter().map(|(c, _)| c).collect::<Vec<_>>());
+        // The basis the loop ended on, without the slack rows, is still optimal; see
+        // `BasisState::without_rows`. Re-solved cold, this purge was most of the root on
+        // a model whose relaxation is slow to solve from nothing: five of the seven
+        // seconds it took on a 2262-row clique partitioning model.
+        let warm = root.basis.without_rows(problem.n_cols(), &removed);
+        let mut candidate = Lp::relaxation(&trimmed).with_tolerances(lp.tolerances());
+        candidate.set_interrupt(lp.interrupt());
         // Bounded rather than given the rest of the run; see `ROOT_PURGE_SHARE`.
         candidate.set_deadline(match options.time_limit {
             Some(limit) => {
@@ -1794,7 +1959,10 @@ fn separate_at_root(
             }
             None => deadline,
         });
-        let resolved = candidate.solve_with_limit(options.max_iterations_per_node);
+        let resolved = match &warm {
+            Some(state) => candidate.solve_warm(state, None, options.max_iterations_per_node),
+            None => candidate.solve_with_limit(options.max_iterations_per_node),
+        };
         // The bound above belongs to this one solve. `candidate` may become the LP the
         // whole search then runs on, and leaving the purge's short deadline on it makes
         // every node below give up at a fifth of the run: `p2m2p1m1p0n100` reported the
@@ -1817,6 +1985,94 @@ fn separate_at_root(
         added,
         iterations,
     }
+}
+
+/// One round of the solver's own cut families at the root, selected.
+fn root_families(
+    problem: &Problem,
+    lp: &Lp,
+    root: &LpSolution,
+    conflicts: &Conflicts,
+    options: &Options,
+    deadline: Option<Instant>,
+) -> Vec<cuts::Cut> {
+    // Five families with different reach: covers need a row that reads as a
+    // knapsack, MIR needs a row mixing integer and continuous columns, cliques need
+    // columns that exclude one another, GMI comes off the tableau and applies to any
+    // fractional basic column, and mod-2 combines whole rows. On dense random rows the last is usually the
+    // only one that finds anything; on mixed models from MIPLIB the second carries
+    // most of the bound; and on the pure binary set, where there is no continuous
+    // structure for MIR to reach, the third is the one with anything to say.
+    let mut found = cuts::separate_until(problem, &root.x, options.cuts_per_round, deadline);
+    found.extend(cuts::separate_mir(problem, &root.x, options.cuts_per_round));
+    found.extend(cuts::separate_cliques(
+        problem,
+        conflicts,
+        &root.x,
+        options.cuts_per_round,
+    ));
+    found.extend(cuts::separate_gomory(
+        lp,
+        &root.basis,
+        &root.x,
+        options.cuts_per_round,
+    ));
+    // Sixth family, and the only one that combines rows. The four above each read a
+    // single row or a single tableau row, and on a model whose optimal face is large
+    // that removes one vertex of it and the relaxation steps to the next one worth
+    // the same. See `separate_mod2`.
+    //
+    // On a smaller allowance than the rest; see `MOD2_SHARE`.
+    found.extend(cuts::separate_mod2(
+        problem,
+        &root.x,
+        options.cuts_per_round / MOD2_SHARE,
+    ));
+    // Separation is deliberately generous; this is where the model's row count is
+    // actually decided. Ranking by efficacy and dropping near-parallel duplicates
+    // keeps the rows that move the bound and discards the ones that only cost an
+    // LP column scan at every node below.
+    let mut selected = cuts::select(found, &root.x, options.cuts_per_round);
+
+    // A row aggregated through the variable upper bounds the model implies, and it
+    // is selected on its own rather than against the families above. Efficacy
+    // divides violation by the cut's norm, which prices an aggregated row of six
+    // hundred terms against a two-term clique and loses every time; on
+    // `neos-787933` the two-term cliques win that ranking, move the bound from 8.07
+    // to 8.16, and crowd out the 77 aggregated rows that move it to 30, which is
+    // the optimum. The ranking is not wrong in general -- a short cut really is
+    // cheaper to carry -- so this family gets its own budget instead of a thumb on
+    // the scale. See `separate_implied_aggregations`.
+    selected.extend(cuts::select(
+        cuts::separate_implied_aggregations(
+            problem,
+            conflicts,
+            &root.x,
+            options.cuts_per_round,
+        ),
+        &root.x,
+        options.cuts_per_round / AGGREGATION_SHARE,
+    ));
+    selected
+}
+
+/// The rows carried after a model's first `base_rows` that stay, and the model indices
+/// of those `leaving` marks.
+fn survivors(
+    rows: &[(cuts::Cut, Option<u32>)],
+    leaving: &[bool],
+    base_rows: usize,
+) -> (Vec<(cuts::Cut, Option<u32>)>, Vec<usize>) {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut removed = Vec::new();
+    for (k, row) in rows.iter().enumerate() {
+        if leaving.get(k).copied().unwrap_or(false) {
+            removed.push(base_rows + k);
+        } else {
+            kept.push(row.clone());
+        }
+    }
+    (kept, removed)
 }
 
 /// What one pass at a model produced, and whether it is worth starting over.
@@ -1852,6 +2108,38 @@ pub fn solve(problem: &Problem, options: Options) -> Solution {
 /// asking whether it can then *prove* optimality separates an instance that is short of a
 /// point from one that is short of a bound, and those want completely different work.
 pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
+    solve_separating(problem, options, start, None)
+}
+
+/// Solve with rows supplied as the search goes; see [`Separator`].
+///
+/// The model must be complete enough to bound every column's row activity, which it is
+/// whenever it is a model at all. What it may leave out is any number of rows the
+/// separator can find when a point breaks them: the triangle rows of a clique
+/// partitioning model, the subtour rows of a tour.
+pub fn solve_with(
+    problem: &Problem,
+    options: Options,
+    start: Option<&[f64]>,
+    separator: &dyn Separator,
+) -> Solution {
+    let separation = Separation::new(separator, options.heuristic_limits.feasibility_tolerance);
+    solve_separating(problem, options, start, Some(&separation))
+}
+
+fn solve_separating(
+    problem: &Problem,
+    mut options: Options,
+    start: Option<&[f64]>,
+    separation: Option<&Separation>,
+) -> Solution {
+    // Each of these reasons from the rows it can see to something only the complete
+    // model would justify; see `Separator`.
+    if separation.is_some() {
+        options.aggregate = false;
+        options.symmetry = false;
+        options.cdcl = false;
+    }
     // Aggregation is applied once, around everything: the restart loop, presolve, the
     // cut loop and every node then see only the smaller model, so no index inside the
     // search has to know this happened. The solution comes back through the map at the
@@ -1861,7 +2149,8 @@ pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) ->
             Err(_) => return Solution::without_solution(Status::Infeasible, 0, 0, None),
             Ok(Some((smaller, map))) => {
                 let restricted = start.map(|x| map.restrict(x));
-                let mut solution = solve_all_restarts(&smaller, options, restricted.as_deref());
+                let mut solution =
+                    solve_all_restarts(&smaller, options, restricted.as_deref(), separation);
                 if !solution.x.is_empty() {
                     solution.x = map.expand(&solution.x);
                 }
@@ -1871,7 +2160,7 @@ pub fn solve_from(problem: &Problem, options: Options, start: Option<&[f64]>) ->
             Ok(None) => {}
         }
     }
-    solve_all_restarts(problem, options, start)
+    solve_all_restarts(problem, options, start, separation)
 }
 
 /// Probe the root for implications the conflict graph does not already hold.
@@ -1970,7 +2259,12 @@ fn root_clauses(
 /// seconds, lost its solve to six seconds spent before the root; `app2-1` went from 0.9
 /// seconds to 16. Beside the tree it delays nothing. What it finds goes into a
 /// [`Mailbox`] the root and the tree read as they go, and a proof stops them.
-fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>) -> Solution {
+fn solve_all_restarts(
+    problem: &Problem,
+    options: Options,
+    start: Option<&[f64]>,
+    separation: Option<&Separation>,
+) -> Solution {
     let started = Instant::now();
     let beside = options.cdcl && (0..problem.n_cols()).any(|j| problem.is_binary(j));
     let mailbox = Mailbox::default();
@@ -1979,7 +2273,14 @@ fn solve_all_restarts(problem: &Problem, options: Options, start: Option<&[f64]>
             let mailbox = &mailbox;
             scope.spawn(move || search_beside(problem, options, started, mailbox));
         }
-        let solution = restart_loop(problem, options, start, started, beside.then_some(&mailbox));
+        let solution = restart_loop(
+            problem,
+            options,
+            start,
+            started,
+            beside.then_some(&mailbox),
+            separation,
+        );
         mailbox.cancel.store(true, Ordering::Relaxed);
         solution
     });
@@ -2114,6 +2415,7 @@ fn restart_loop(
     start: Option<&[f64]>,
     started: Instant,
     mailbox: Option<&Mailbox>,
+    separation: Option<&Separation>,
 ) -> Solution {
     let mut model: Option<Problem> = None;
     let mut seed: Option<(f64, Vec<f64>)> = start
@@ -2127,12 +2429,13 @@ fn restart_loop(
                 && problem
                     .integer_columns()
                     .all(|j| (x[j] - x[j].round()).abs() <= options.integrality_tolerance)
+                && admitted(separation, x)
         })
         .map(|x| (objective_at(problem, x), x.to_vec()));
     let (mut nodes, mut iterations, mut heuristics) = (0usize, 0usize, 0usize);
     for _ in 0..=MAX_RESTARTS {
         let current = model.as_ref().unwrap_or(problem);
-        let attempt = solve_once(current, options, started, seed.take(), mailbox);
+        let attempt = solve_once(current, options, started, seed.take(), mailbox, separation);
         // The counters belong to the whole solve, not to the last pass of it.
         nodes += attempt.solution.nodes;
         iterations += attempt.solution.simplex_iterations;
@@ -2172,6 +2475,7 @@ fn restart_loop(
         started,
         seed,
         mailbox,
+        separation,
     );
     let mut solution = attempt.solution;
     solution.nodes += nodes;
@@ -2186,6 +2490,7 @@ fn solve_once(
     started: Instant,
     seed: Option<(f64, Vec<f64>)>,
     mailbox: Option<&Mailbox>,
+    separation: Option<&Separation>,
 ) -> Attempt {
 
     // Presolve reduces in place and introduces no renumbering, so the reduced
@@ -2200,7 +2505,7 @@ fn solve_once(
         let presolve_deadline = options
             .time_limit
             .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
-        match presolve::presolve_until(&mut reduced, 20, presolve_deadline) {
+        match presolve::presolve_with(&mut reduced, 20, presolve_deadline, separation.is_none()) {
             Outcome::Infeasible => {
                 return Attempt {
                     solution: Solution::without_solution(Status::Infeasible, 0, 0, None),
@@ -2251,6 +2556,7 @@ fn solve_once(
     let _ = problem.n_cols();
     let mut lp = Lp::relaxation(problem).with_tolerances(crate::lp::Tolerances {
         refactor_interval: options.refactor_interval,
+        warm_steepest_edge: options.warm_steepest_edge,
         ..Default::default()
     });
     // The budget belongs to the LP as well as the node loop. Checking only between
@@ -2398,6 +2704,7 @@ fn solve_once(
     // seconds on a relaxation whose value it could have written down.
     if objective_is_constant(problem)
         && let Some(found) = jump(None, CONSTANT_OBJECTIVE_SHARE)
+        && admitted(separation, &found.x)
     {
         let value = problem.objective_value(constant_objective(problem));
         let mut solution =
@@ -2531,7 +2838,7 @@ fn solve_once(
         let rescued = if status == Status::Infeasible {
             None
         } else {
-            jump(None, JUMP_SHARE)
+            jump(None, JUMP_SHARE).filter(|found| admitted(separation, &found.x))
         };
         let held = incumbent_x.take().map(|x| (incumbent, x, false));
         let found = rescued.map(|found| (found.objective, found.x, true));
@@ -2571,7 +2878,7 @@ fn solve_once(
     let stop_cutting = options
         .time_limit
         .map(|limit| started + limit.mul_f64(ROOT_CUT_SHARE));
-    let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting);
+    let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting, separation);
     iterations += cut.iterations;
     let cuts_added = cut.added;
     let mut lp = cut.lp;
@@ -2696,6 +3003,7 @@ fn solve_once(
         });
         if let Some(found) = found
             && found.objective < incumbent
+            && admitted(separation, &found.x)
         {
             incumbent = found.objective;
             incumbent_x = Some(found.x);
@@ -2716,7 +3024,7 @@ fn solve_once(
         // `samples/simple.lp` it is — the restarted root is integral at 7 against a
         // seed of 10 — and assigning threw the answer away.
         let objective = objective_at(problem, &x);
-        if objective < incumbent {
+        if objective < incumbent && admitted(separation, &x) {
             incumbent = objective;
             incumbent_x = Some(x);
             open = OpenNodes::new(options.plunge_limit);
@@ -2793,8 +3101,10 @@ fn solve_once(
             root_bound,
             &options,
             remaining_of(options.time_limit, started),
+            separation,
         )
         && objective < incumbent
+        && admitted(separation, &x)
     {
         incumbent = objective;
         incumbent_x = Some(x);
@@ -2810,8 +3120,10 @@ fn solve_once(
             &root.x,
             &options,
             remaining_of(options.time_limit, started),
+            separation,
         )
         && objective < incumbent
+        && admitted(separation, &x)
     {
         incumbent = objective;
         incumbent_x = Some(x);
@@ -2834,6 +3146,7 @@ fn solve_once(
             &lurking,
             &symmetry,
             mailbox,
+            separation,
         );
         nodes += result.nodes;
         iterations += result.iterations;
@@ -2891,6 +3204,7 @@ fn solve_once(
         &rows_of_a,
         &conflicts,
         &probed,
+        separation,
     );
     let mut restart_wanted = false;
 
@@ -2971,7 +3285,9 @@ fn solve_once(
                 relaxation,
                 &options,
                 remaining_of(options.time_limit, started),
+                separation,
             )
+            && admitted(separation, &x)
         {
             incumbent = objective;
             incumbent_x = Some(x);
@@ -3068,6 +3384,14 @@ fn narrow_for_restart(problem: &Problem, lurking: &Lurking, incumbent: f64) -> O
 /// budget. A third leaves the bound most of what cutting was going to give it while
 /// guaranteeing the search two thirds of the run to spend it in.
 const ROOT_CUT_SHARE: f64 = 0.33;
+
+/// Rounds of a caller's separator at a fractional node before it branches.
+///
+/// An integral node is separated until it breaks nothing, however long that takes,
+/// because it is about to become the incumbent. A fractional one only stands to gain a
+/// tighter bound, and past a few rounds the rows it is given mostly shave the vertex
+/// rather than move the bound.
+const NODE_SEPARATION_ROUNDS: usize = 5;
 
 /// Matrix entries one node's propagation may read before it gives up.
 ///
@@ -3675,8 +3999,11 @@ fn aggregated_search(
     relaxation: &[f64],
     options: &Options,
     remaining: Option<Duration>,
+    separation: Option<&Separation>,
 ) -> Option<(f64, Vec<f64>)> {
-    if remaining.is_some_and(|left| left.is_zero()) {
+    // The rewritten model numbers its columns its own way, and a separator reads the
+    // caller's.
+    if separation.is_some() || remaining.is_some_and(|left| left.is_zero()) {
         return None;
     }
     let conflicts = cuts::Conflicts::of(problem);
@@ -3737,6 +4064,7 @@ fn reduced_cost_neighbourhood(
     root_bound: f64,
     options: &Options,
     remaining: Option<Duration>,
+    separation: Option<&Separation>,
 ) -> Option<(f64, Vec<f64>)> {
     if lurking.is_empty() || remaining.is_some_and(|left| left.is_zero()) {
         return None;
@@ -3779,7 +4107,9 @@ fn reduced_cost_neighbourhood(
         return None;
     }
 
-    let found = solve(
+    // With the caller's separator, since the narrowed model is the caller's model with
+    // tighter bounds and its points are the caller's points.
+    let found = solve_separating(
         &narrowed,
         Options {
             improvement_frequency: 0,
@@ -3796,6 +4126,8 @@ fn reduced_cost_neighbourhood(
             time_limit: remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
             ..*options
         },
+        None,
+        separation,
     );
     let x = found.x;
     if x.len() != problem.n_cols() {
@@ -3814,6 +4146,7 @@ fn improve(
     relaxation: &[f64],
     options: &Options,
     remaining: Option<Duration>,
+    separation: Option<&Separation>,
 ) -> Option<(f64, Vec<f64>)> {
     // Out of time is out of time, and a sub-search with nothing left to spend would
     // still pay for the model copy below.
@@ -3837,7 +4170,7 @@ fn improve(
         return None;
     }
 
-    let found = solve(
+    let found = solve_separating(
         &neighbourhood,
         Options {
             improvement_frequency: 0,
@@ -3857,6 +4190,8 @@ fn improve(
             time_limit: remaining,
             ..*options
         },
+        None,
+        separation,
     );
 
     let x = found.x;
@@ -3996,7 +4331,7 @@ mod tests {
         // The relaxation agrees on `x0` and disagrees elsewhere, so `x0` is fixed and
         // the rest is searched. With `x0` at one the best remaining is `x2`, for 4.
         let relaxation = vec![1.0, 0.5, 1.0];
-        let (improved, x) = improve(&p, &incumbent, value, &relaxation, &options, None)
+        let (improved, x) = improve(&p, &incumbent, value, &relaxation, &options, None, None)
             .expect("a better point exists in that neighbourhood");
         assert_eq!(improved, -4.0);
         assert_eq!(x[0], 1.0, "the agreed column stays where both put it");
@@ -4013,10 +4348,10 @@ mod tests {
         // Agreeing on nothing leaves the original problem, which the search is already
         // doing.
         let disagrees = vec![0.0, 0.0, 1.0];
-        assert!(improve(&p, &incumbent, value, &disagrees, &options, None).is_none());
+        assert!(improve(&p, &incumbent, value, &disagrees, &options, None, None).is_none());
 
         // Agreeing on everything leaves the incumbent, which cannot be improved on.
-        assert!(improve(&p, &incumbent, value, &incumbent, &options, None).is_none());
+        assert!(improve(&p, &incumbent, value, &incumbent, &options, None, None).is_none());
     }
 
     /// A time limit is a duration and the sub-search starts its own clock, so it has
@@ -4051,7 +4386,8 @@ mod tests {
                 value,
                 &relaxation,
                 &options,
-                Some(Duration::ZERO)
+                Some(Duration::ZERO),
+                None,
             )
             .is_none(),
             "an exhausted budget still ran a sub-search"
@@ -4065,7 +4401,8 @@ mod tests {
                 value,
                 &relaxation,
                 &options,
-                Some(Duration::from_secs(30))
+                Some(Duration::from_secs(30)),
+                None,
             )
             .is_some(),
             "a funded improvement search found nothing"
