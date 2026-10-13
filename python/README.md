@@ -47,19 +47,24 @@ python3 -m pytest tests -q
 
 | | |
 |---|---|
-| Model | `Model(name)`, `optimize`, `getVars`, `write`, `setParam` |
+| Model | `Model(name)`, `optimize`, `optimize(callback)`, `getVars`, `write`, `setParam`, `Params` |
 | Variables | `addVar`, `addVars`, `.X`, `.VarName`, `.VType`, `.Obj`, `.LB`, `.UB` |
 | Expressions | `+ - *`, unary `-`, `<= >= ==`, `quicksum` |
 | Constraints | `addConstr`, `addConstrs`, `addLConstr`, `.ConstrName` |
 | Objective | `setObjective(expr, GRB.MINIMIZE / GRB.MAXIMIZE)` |
 | Attributes | `ObjVal`, `ObjBound`, `Status`, `SolCount`, `NodeCount`, `Runtime`, `MIPGap`, `NumVars`, `NumConstrs`, `ModelName`, `ModelSense` |
-| Parameters | `TimeLimit`, `Threads`, `MIPGap`, `OutputFlag` |
+| Parameters | `TimeLimit`, `Threads`, `MIPGap`, `OutputFlag`, `LazyConstraints`, `PreCrush` |
+| Callbacks | `GRB.Callback.MIPNODE` / `MIPSOL`, `cbGet` (`MIPSOL_OBJ`, `MIPNODE_STATUS`), `cbGetSolution`, `cbGetNodeRel`, `cbLazy`, `cbCut` |
 | Files | `read(path)` for LP and MPS |
 
 ## What is not
 
-No callbacks, no quadratic terms, no SOS constraints, no lazy constraints, and no
-multi-objective support. `addVar` accepts `GRB.BINARY`, `GRB.INTEGER` and
+No quadratic terms, no SOS constraints, and no multi-objective support. Callbacks are
+called at `MIPNODE`, for the root's and each node's relaxation, and at `MIPSOL`, for
+every point before it may become the incumbent; the other `where` codes, `cbSetSolution`
+and `terminate` are not there. `MIPNODE` runs at every node, so a costly separator
+should return quickly where it finds nothing. One callback runs at a time even with
+several threads, as in gurobipy. `addVar` accepts `GRB.BINARY`, `GRB.INTEGER` and
 `GRB.CONTINUOUS`, and rejects anything else rather than silently solving a model it
 cannot honour.
 

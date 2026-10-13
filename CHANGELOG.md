@@ -10,6 +10,11 @@
   partitioning model whose 52000 transitivity rows are left to the separator solves in
   one call rather than in an outer loop of whole MIP solves.
 - `Lp::fit`, `BasisState::without_rows` and `lu::Scratch`.
+- Python: `Model.optimize(callback)` with gurobipy's callback API for lazy constraints
+  and cuts: `GRB.Callback.MIPNODE` and `MIPSOL`, `cbGetSolution`, `cbGetNodeRel`,
+  `cbLazy`, `cbCut` and `cbGet`, the `LazyConstraints` parameter, `model.Params`, and
+  attributes set on the model for the callback to read (`model._vars`). The same
+  lazy-constraint script returns Gurobi's answer under either module.
 - `presolve::presolve_with`, which can leave out the reductions that fix a column by
   its cost.
 

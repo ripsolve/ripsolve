@@ -17,18 +17,24 @@
 //! ```
 //!
 //! Binary, general-integer and continuous variables are all supported, so the
-//! models this accepts are ordinary MIPs rather than pure BIPs. Quadratic terms,
-//! SOS constraints, callbacks and lazy constraints are not.
+//! models this accepts are ordinary MIPs rather than pure BIPs. Callbacks are
+//! supported for what they are mostly used for, lazy constraints and user cuts:
+//! `optimize(callback)` calls back at `GRB.Callback.MIPNODE` and `MIPSOL`, where
+//! `cbGetNodeRel`, `cbGetSolution`, `cbLazy` and `cbCut` work as in gurobipy.
+//! Quadratic terms and SOS constraints are not supported.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{PyAttributeError, PyIndexError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 
 use ripsolve::model::{Problem, RowSense, Sense, VarType};
-use ripsolve::search::{self, Options, Status as SearchStatus};
+use ripsolve::cuts::Cut;
+use ripsolve::search::{self, Options, Point, Status as SearchStatus};
 use ripsolve::sparse::SparseMatrix;
 
 /// A row as the user built it, before translation into a [`Problem`].
@@ -54,6 +60,16 @@ struct ModelData {
     upper: Vec<f64>,
     solution: Option<Solved>,
     params: Params,
+    /// What the callback being run may read and has added, while one runs.
+    callback: Option<CallbackState>,
+}
+
+/// One call of the user's callback: where the search is, the point it is at, and the
+/// rows the callback has added so far.
+struct CallbackState {
+    place: i32,
+    x: Vec<f64>,
+    rows: Vec<Cut>,
 }
 
 #[derive(Clone)]
@@ -73,6 +89,12 @@ struct Params {
     threads: usize,
     mip_gap: f64,
     output_flag: i32,
+    /// Gurobi refuses `cbLazy` unless this is set, and so does this binding, so a
+    /// script that runs here runs there.
+    lazy_constraints: i32,
+    /// Accepted for scripts that set it for `cbCut`. Presolve here never renumbers
+    /// the columns a callback sees, so there is nothing for it to change.
+    pre_crush: i32,
 }
 
 impl Default for Params {
@@ -82,7 +104,48 @@ impl Default for Params {
             threads: 0,
             mip_gap: 0.0,
             output_flag: 1,
+            lazy_constraints: 0,
+            pre_crush: 0,
         }
+    }
+}
+
+impl Params {
+    /// Set a parameter by Gurobi's name, in any case. Unknown names are rejected
+    /// rather than ignored, so a misspelling does not silently do nothing.
+    fn set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match name.to_ascii_lowercase().as_str() {
+            "timelimit" => self.time_limit = Some(value.extract()?),
+            "threads" => self.threads = value.extract()?,
+            "mipgap" => self.mip_gap = value.extract()?,
+            "outputflag" | "logtoconsole" => self.output_flag = value.extract()?,
+            "lazyconstraints" => self.lazy_constraints = value.extract()?,
+            "precrush" => self.pre_crush = value.extract()?,
+            other => {
+                return Err(PyKeyError::new_err(format!("unknown parameter {other:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn get<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match name.to_ascii_lowercase().as_str() {
+            "timelimit" => self
+                .time_limit
+                .unwrap_or(f64::INFINITY)
+                .into_pyobject(py)?
+                .into_any(),
+            "threads" => self.threads.into_pyobject(py)?.into_any(),
+            "mipgap" => self.mip_gap.into_pyobject(py)?.into_any(),
+            "outputflag" | "logtoconsole" => self.output_flag.into_pyobject(py)?.into_any(),
+            "lazyconstraints" => self.lazy_constraints.into_pyobject(py)?.into_any(),
+            "precrush" => self.pre_crush.into_pyobject(py)?.into_any(),
+            other => {
+                return Err(PyAttributeError::new_err(format!(
+                    "unknown parameter {other:?}"
+                )));
+            }
+        })
     }
 }
 
@@ -101,6 +164,7 @@ impl ModelData {
             upper: Vec::new(),
             solution: None,
             params: Params::default(),
+            callback: None,
         }
     }
 }
@@ -112,6 +176,32 @@ const STATUS_OPTIMAL: i32 = 2;
 const STATUS_INFEASIBLE: i32 = 3;
 const STATUS_NODE_LIMIT: i32 = 7;
 const STATUS_TIME_LIMIT: i32 = 9;
+
+/// Gurobi's callback codes: where the search is, and what `cbGet` may ask.
+const WHERE_MIPSOL: i32 = 4;
+const WHERE_MIPNODE: i32 = 5;
+const MIPSOL_OBJ: i32 = 4002;
+const MIPNODE_STATUS: i32 = 5001;
+
+/// `GRB.Callback`, the codes a callback is called with and may ask about.
+#[pyclass(name = "Callback", module = "ripsolve", from_py_object)]
+#[derive(Clone)]
+struct CallbackCodes;
+
+#[pymethods]
+impl CallbackCodes {
+    /// A new incumbent candidate; `cbGetSolution` and `cbLazy` apply.
+    #[classattr]
+    const MIPSOL: i32 = WHERE_MIPSOL;
+    /// A node's relaxation, the root's included; `cbGetNodeRel`, `cbLazy` and `cbCut`
+    /// apply.
+    #[classattr]
+    const MIPNODE: i32 = WHERE_MIPNODE;
+    #[classattr]
+    const MIPSOL_OBJ: i32 = MIPSOL_OBJ;
+    #[classattr]
+    const MIPNODE_STATUS: i32 = MIPNODE_STATUS;
+}
 
 /// The `GRB` namespace of constants.
 #[pyclass(name = "GRB", module = "ripsolve", from_py_object)]
@@ -146,6 +236,12 @@ impl Grb {
     const GREATER_EQUAL: char = '>';
     #[classattr]
     const EQUAL: char = '=';
+
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn Callback(py: Python<'_>) -> Py<PyType> {
+        py.get_type::<CallbackCodes>().unbind()
+    }
 }
 
 /// The spelling a class gives a Gurobi attribute, matched whatever its
@@ -503,7 +599,9 @@ impl Constr {
 }
 
 /// An optimization model.
-#[pyclass(name = "Model", module = "ripsolve")]
+// `dict`, so that a script can hang its variables on the model for its callback,
+// `model._vars = x`, the way gurobipy's documentation does it.
+#[pyclass(name = "Model", module = "ripsolve", dict)]
 struct Model {
     data: Shared,
 }
@@ -573,6 +671,66 @@ impl Model {
             .validate()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(problem)
+    }
+
+    /// The running callback's state, or the error for calling `what` outside one.
+    fn in_callback<'a>(data: &'a ModelData, what: &str) -> PyResult<&'a CallbackState> {
+        data.callback
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{what} is only for use in a callback")))
+    }
+
+    fn push_callback_row(data: &mut ModelData, row: &TempConstr) {
+        let (lb, ub) = row.sense.bounds(row.rhs);
+        if let Some(state) = data.callback.as_mut() {
+            state.rows.push(Cut {
+                coefficients: row.terms.clone(),
+                lb,
+                ub,
+            });
+        }
+    }
+
+    /// The point a callback was called at, read for `vars` and shaped like it.
+    fn callback_values<'py>(
+        &self,
+        vars: &Bound<'py, PyAny>,
+        place: i32,
+        what: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = vars.py();
+        let x = {
+            let data = self.data.lock().expect("model lock");
+            let state = Model::in_callback(&data, what)?;
+            if state.place != place {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{what} is not available at callback code {}",
+                    state.place
+                )));
+            }
+            state.x.clone()
+        };
+        let value = |var: &Bound<'py, PyAny>| -> PyResult<f64> {
+            let var = var.extract::<PyRef<Var>>()?;
+            x.get(var.index)
+                .copied()
+                .ok_or_else(|| PyIndexError::new_err("a variable added after optimize began"))
+        };
+        if vars.extract::<PyRef<Var>>().is_ok() {
+            return Ok(value(vars)?.into_pyobject(py)?.into_any());
+        }
+        if let Ok(dict) = vars.cast::<PyDict>() {
+            let out = PyDict::new(py);
+            for (key, var) in dict.iter() {
+                out.set_item(key, value(&var)?)?;
+            }
+            return Ok(out.into_any());
+        }
+        let values: Vec<f64> = vars
+            .try_iter()?
+            .map(|var| value(&var?))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, values)?.into_any())
     }
 
     fn solved(&self) -> PyResult<Solved> {
@@ -714,27 +872,7 @@ impl Model {
         rhs: Option<&Bound<'_, PyAny>>,
         name: &str,
     ) -> PyResult<Constr> {
-        let constraint = match (sense, rhs) {
-            (None, None) => lhs.extract::<PyRef<TempConstr>>()?.clone(),
-            (Some(sense), Some(rhs)) => {
-                let sense = match sense {
-                    "<" | "<=" => RowSense::Le,
-                    ">" | ">=" => RowSense::Ge,
-                    "=" | "==" => RowSense::Eq,
-                    other => {
-                        return Err(PyValueError::new_err(format!(
-                            "unknown constraint sense {other:?}"
-                        )));
-                    }
-                };
-                LinExpr::extract(lhs)?.compare(rhs, sense)?
-            }
-            _ => {
-                return Err(PyTypeError::new_err(
-                    "addLConstr needs both sense and rhs, or neither",
-                ));
-            }
-        };
+        let constraint = linear_constraint(lhs, sense, rhs, "addLConstr")?;
         Ok(self.push_row(&constraint, name))
     }
 
@@ -781,23 +919,33 @@ impl Model {
     /// Set a solver parameter. Unknown names are rejected rather than ignored, so a
     /// misspelling does not silently do nothing.
     fn setParam(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut data = self.data.lock().expect("model lock");
-        match name.to_ascii_lowercase().as_str() {
-            "timelimit" => data.params.time_limit = Some(value.extract()?),
-            "threads" => data.params.threads = value.extract()?,
-            "mipgap" => data.params.mip_gap = value.extract()?,
-            "outputflag" | "logtoconsole" => data.params.output_flag = value.extract()?,
-            other => {
-                return Err(PyKeyError::new_err(format!("unknown parameter {other:?}")));
-            }
-        }
-        Ok(())
+        self.data.lock().expect("model lock").params.set(name, value)
     }
 
-    /// Solve the model.
-    fn optimize(&self, py: Python<'_>) -> PyResult<()> {
+    /// The parameters as attributes, `model.Params.LazyConstraints = 1`.
+    #[getter(Params)]
+    fn params(&self) -> ParamSet {
+        ParamSet {
+            data: Arc::clone(&self.data),
+        }
+    }
+
+    /// Solve the model, calling `callback(model, where)` as the search goes if given.
+    ///
+    /// The callback runs at `GRB.Callback.MIPNODE`, for the root's and every node's
+    /// relaxation, and at `GRB.Callback.MIPSOL`, for every point before it may become
+    /// the incumbent. Rows it adds with `cbLazy` or `cbCut` are kept where the point
+    /// breaks them. An exception it raises ends its part in the search and is raised
+    /// again from here once the search stops.
+    #[pyo3(signature = (callback = None))]
+    fn optimize(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        callback: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let this = slf.borrow();
         let (problem, params) = {
-            let data = self.data.lock().expect("model lock");
+            let data = this.data.lock().expect("model lock");
             (Model::to_problem(&data)?, data.params.clone())
         };
 
@@ -815,7 +963,45 @@ impl Model {
         // Release the GIL: the solve is pure Rust and can take minutes, and holding
         // the GIL would freeze every other Python thread for its duration.
         let started = std::time::Instant::now();
-        let solution = py.detach(|| search::solve(&problem, options));
+        let model: Py<Model> = slf.clone().unbind();
+        let shared = Arc::clone(&this.data);
+        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        // One callback at a time. The interpreter lock alone does not ensure it: a
+        // callback that releases the lock, to sleep or to wait on I/O, would let a
+        // second worker's call overwrite the state the first is still reading.
+        let turn = Mutex::new(());
+        let solution = py.detach(|| match &callback {
+            None => search::solve(&problem, options),
+            Some(callback) => {
+                let separator = |x: &[f64], point: Point| -> Vec<Cut> {
+                    let _turn = turn.lock().expect("callback turn");
+                    if failure.lock().expect("callback failure").is_some() {
+                        return Vec::new();
+                    }
+                    let place = match point {
+                        Point::Candidate => WHERE_MIPSOL,
+                        Point::Root | Point::Node => WHERE_MIPNODE,
+                    };
+                    Python::attach(|py| {
+                        shared.lock().expect("model lock").callback = Some(CallbackState {
+                            place,
+                            x: x.to_vec(),
+                            rows: Vec::new(),
+                        });
+                        let called = callback.call1(py, (model.clone_ref(py), place));
+                        let state = shared.lock().expect("model lock").callback.take();
+                        match called {
+                            Ok(_) => state.map(|s| s.rows).unwrap_or_default(),
+                            Err(error) => {
+                                *failure.lock().expect("callback failure") = Some(error);
+                                Vec::new()
+                            }
+                        }
+                    })
+                };
+                search::solve_with(&problem, options, None, &separator)
+            }
+        });
         let runtime = started.elapsed().as_secs_f64();
 
         let status = match solution.status {
@@ -825,7 +1011,7 @@ impl Model {
             SearchStatus::TimeLimit => STATUS_TIME_LIMIT,
         };
 
-        let mut data = self.data.lock().expect("model lock");
+        let mut data = this.data.lock().expect("model lock");
         data.solution = Some(Solved {
             status,
             objective: solution.objective,
@@ -835,6 +1021,87 @@ impl Model {
             runtime,
             gap: solution.gap(),
         });
+        drop(data);
+        match failure.into_inner().expect("callback failure") {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// A value about the search, inside a callback: `GRB.Callback.MIPSOL_OBJ`, the
+    /// candidate's objective, or `GRB.Callback.MIPNODE_STATUS`, which is always
+    /// `GRB.OPTIMAL` since a node whose relaxation is not solved is not called back.
+    fn cbGet<'py>(&self, py: Python<'py>, what: i32) -> PyResult<Bound<'py, PyAny>> {
+        let data = self.data.lock().expect("model lock");
+        let state = Model::in_callback(&data, "cbGet")?;
+        match (state.place, what) {
+            (WHERE_MIPSOL, MIPSOL_OBJ) => {
+                let value = data.objective_constant
+                    + data
+                        .objective
+                        .iter()
+                        .zip(&state.x)
+                        .map(|(c, v)| c * v)
+                        .sum::<f64>();
+                Ok(value.into_pyobject(py)?.into_any())
+            }
+            (WHERE_MIPNODE, MIPNODE_STATUS) => Ok(STATUS_OPTIMAL.into_pyobject(py)?.into_any()),
+            _ => Err(PyValueError::new_err(format!(
+                "cbGet({what}) is not available here"
+            ))),
+        }
+    }
+
+    /// The candidate's values, at `GRB.Callback.MIPSOL`: one for a `Var`, a list for
+    /// a list of them, a dict for a dict of them.
+    fn cbGetSolution<'py>(&self, vars: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        self.callback_values(vars, WHERE_MIPSOL, "cbGetSolution")
+    }
+
+    /// The node's relaxation values, at `GRB.Callback.MIPNODE`, shaped as
+    /// [`Model::cbGetSolution`]'s are.
+    fn cbGetNodeRel<'py>(&self, vars: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        self.callback_values(vars, WHERE_MIPNODE, "cbGetNodeRel")
+    }
+
+    /// Add a lazy constraint: a row the model needs, given as `addLConstr` takes one.
+    /// Needs `LazyConstraints` set, as in Gurobi.
+    #[pyo3(signature = (lhs, sense = None, rhs = None))]
+    fn cbLazy(
+        &self,
+        lhs: &Bound<'_, PyAny>,
+        sense: Option<&str>,
+        rhs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let row = linear_constraint(lhs, sense, rhs, "cbLazy")?;
+        let mut data = self.data.lock().expect("model lock");
+        if data.params.lazy_constraints == 0 {
+            return Err(PyRuntimeError::new_err(
+                "cbLazy needs the LazyConstraints parameter set to 1",
+            ));
+        }
+        Model::in_callback(&data, "cbLazy")?;
+        Model::push_callback_row(&mut data, &row);
+        Ok(())
+    }
+
+    /// Add a cut: a row every solution satisfies, offered to tighten a node's
+    /// relaxation. Only at `GRB.Callback.MIPNODE`, as in Gurobi.
+    #[pyo3(signature = (lhs, sense = None, rhs = None))]
+    fn cbCut(
+        &self,
+        lhs: &Bound<'_, PyAny>,
+        sense: Option<&str>,
+        rhs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let row = linear_constraint(lhs, sense, rhs, "cbCut")?;
+        let mut data = self.data.lock().expect("model lock");
+        if Model::in_callback(&data, "cbCut")?.place != WHERE_MIPNODE {
+            return Err(PyRuntimeError::new_err(
+                "cbCut is only available at GRB.Callback.MIPNODE",
+            ));
+        }
+        Model::push_callback_row(&mut data, &row);
         Ok(())
     }
 
@@ -963,6 +1230,52 @@ impl Model {
     }
 }
 
+/// A constraint given as `lhs, sense, rhs`, or as a single comparison in `lhs` with
+/// `sense` and `rhs` left out, as gurobipy's `addLConstr` and `cbLazy` take one.
+fn linear_constraint(
+    lhs: &Bound<'_, PyAny>,
+    sense: Option<&str>,
+    rhs: Option<&Bound<'_, PyAny>>,
+    what: &str,
+) -> PyResult<TempConstr> {
+    match (sense, rhs) {
+        (None, None) => Ok(lhs.extract::<PyRef<TempConstr>>()?.clone()),
+        (Some(sense), Some(rhs)) => {
+            let sense = match sense {
+                "<" | "<=" => RowSense::Le,
+                ">" | ">=" => RowSense::Ge,
+                "=" | "==" => RowSense::Eq,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown constraint sense {other:?}"
+                    )));
+                }
+            };
+            LinExpr::extract(lhs)?.compare(rhs, sense)
+        }
+        _ => Err(PyTypeError::new_err(format!(
+            "{what} needs both sense and rhs, or neither"
+        ))),
+    }
+}
+
+/// `model.Params`: the parameters as attributes, by Gurobi's names in any case.
+#[pyclass(name = "ParamSet", module = "ripsolve")]
+struct ParamSet {
+    data: Shared,
+}
+
+#[pymethods]
+impl ParamSet {
+    fn __getattr__<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        self.data.lock().expect("model lock").params.get(py, name)
+    }
+
+    fn __setattr__(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.data.lock().expect("model lock").params.set(name, value)
+    }
+}
+
 /// Sum an iterable of variables or expressions.
 #[pyfunction]
 fn quicksum(terms: &Bound<'_, PyAny>) -> PyResult<LinExpr> {
@@ -1033,6 +1346,8 @@ fn ripsolve_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<LinExpr>()?;
     module.add_class::<TempConstr>()?;
     module.add_class::<Grb>()?;
+    module.add_class::<CallbackCodes>()?;
+    module.add_class::<ParamSet>()?;
     module.add_function(wrap_pyfunction!(quicksum, module)?)?;
     module.add_function(wrap_pyfunction!(read, module)?)?;
     module.add("GRB", module.py().get_type::<Grb>())?;
