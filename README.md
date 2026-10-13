@@ -87,7 +87,9 @@ Useful flags for `solve`:
 | `--gap <g>` | Stop once the relative gap reaches `g` |
 | `--threads <n>` | Worker threads. Defaults to the machine's parallelism |
 | `--local-cut-frequency <n>` | Separate cuts at one node in every `n`. Default 10, `0` disables |
-| `--cut-rounds <n>` | Rounds of root cut separation. Default 0 |
+| `--cut-rounds <n>` | Rounds of root cut separation. Default 50, `0` disables |
+| `--no-cdcl` | Skip the conflict-driven search that runs beside the tree on pure binary models |
+| `--no-aggregate` | Skip substituting out doubleton equalities |
 | `--no-presolve` | Skip presolve |
 | `--symmetry` | Find the model's automorphism group and branch on its orbits. Off: it converts nothing on MIPLIB's binary set |
 | `--values <none\|nonzero\|all>` | Print column values, one per line |
@@ -210,6 +212,19 @@ when translating a model from somewhere else.
 `gap_tolerance`, `local_cut_frequency` and `cut_rounds`. The library defaults to one
 thread so its behaviour is predictable; the CLI defaults to the machine's
 parallelism.
+
+`search::solve_with` takes a `Separator` as well: a function the search asks for rows
+at the root, at every node, and of every point before it may become the incumbent. Rows
+it returns that the point breaks are added everywhere, so it serves as a cut callback and
+as lazy constraints at once, for models whose rows are too many to write down:
+
+```rust
+use ripsolve::search::{self, Point};
+
+// Every triangle row a point breaks, from a model that holds none of them.
+let separator = |x: &[f64], _: Point| violated_triangles(x);
+let solution = search::solve_with(&problem, search::Options::default(), None, &separator);
+```
 
 Full API documentation is on [docs.rs](https://docs.rs/ripsolve).
 

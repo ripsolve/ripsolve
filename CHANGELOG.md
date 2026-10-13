@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+Over this release the pure binary MIPLIB set used to track progress, 140 instances at
+sixty seconds and sixteen threads, went from 22 closed to 36. For comparison on the
+same run: HiGHS 46, SCIP 45, CBC 30.
+
+### Changed behaviour you will notice
+
+- **Root cut separation is on**, at 50 rounds of 64 cuts (`cut_rounds`,
+  `cuts_per_round`). It doubles the time on generated knapsack and covering models
+  that solve either way, and decides whether a MIPLIB instance is solved at all:
+  `nexp-50-20-1-1` from a 47.3% gap to optimal in 1.3s.
+- **A conflict-driven search runs beside the tree** on the pure binary part of a model
+  (`cdcl`, `--no-cdcl`), on its own thread. Its points prune the tree and its proof
+  ends the solve: the `easter_monster` sudoku from 2.4s to 14ms.
+- **Doubleton aggregation is on** (`aggregate`, `--no-aggregate`), with a postsolve.
+- **Node propagation, reduced cost fixing, restarts and the LP-free feasibility jump**
+  are on by default; see the new options below.
+- An LP file's variable with no `Bounds` entry is read as `[0, inf)`, as the format
+  says, not as free; a bound at `1e30` or beyond reads as infinite.
+- `search::Options` has new public fields, so code that spells every field out needs
+  `..Options::default()`.
 
 ### Added
 
@@ -17,6 +38,34 @@
   lazy-constraint script returns Gurobi's answer under either module.
 - `presolve::presolve_with`, which can leave out the reductions that fix a column by
   its cost.
+- `Problem::to_lp`, the LP writer, in the core crate rather than private to the
+  Python module, and `Problem::from_text`.
+- Cut families: mixed-integer rounding with variable bound substitution, mod-2 cuts
+  that combine rows, clique cuts from a conflict graph over literals, and rows
+  aggregated through the bounds the model implies.
+- Heuristics: fixing with propagation, a feasibility jump that needs no relaxation,
+  the corners of the box, searches over the neighbourhood the root's reduced costs
+  would fix and over the model rewritten through its implied bounds.
+- Reduced cost fixing at the root and as the incumbent earns more, restarts on the
+  model those fixings leave, and a stalled root relaxation restarted from a perturbed
+  one.
+- Optional, off by default and documented with what they were measured to be worth:
+  symmetry handling by orbital branching (`symmetry`), root probing, rapid learning,
+  and conflict analysis.
+- CLI flags for each of them: `--no-node-propagation`, `--conflict-analysis`,
+  `--root-probing`, `--rapid-learning`, `--no-aggregate`, `--no-cdcl`,
+  `--jump-moves`, `--symmetry` and `--min-orbit`; `relax --dual` enters the
+  relaxation through the dual method.
+- Modules `aggregate`, `cdcl`, `compact`, `propagate` and `symmetry`.
+
+### Python
+
+- Packaged for PyPI as `ripsolve`, so `pip install ripsolve` works once a release is
+  tagged: one abi3 wheel per platform for every CPython from 3.9, built, tested and
+  published by CI on a version tag.
+- `addLConstr`, `GRB.LESS_EQUAL`, `GREATER_EQUAL` and `EQUAL`; attribute names ignore
+  case as gurobipy's do; and the model reads variable and constraint attributes as
+  lists, `model.X`.
 
 ### Performance
 
@@ -31,6 +80,12 @@
   (`Options::warm_steepest_edge`, on by default). Over the cached MIPLIB set at thirty
   seconds it closes `n9-3` and `ex9` and is 12% slower by geometric mean on the 32
   instances both settings close.
+- The factorization no longer searches a column for rows it already holds, which was
+  quadratic on a basis that fills in: `cod105`'s relaxation from 57.8s to 9.0s.
+- The cut loop grows its model and warm-starts instead of rebuilding and solving cold,
+  and its final purge is bounded.
+- A stalling relaxation switches itself to devex pricing, and Bland's rule is left
+  after a short spell.
 
 ### Correctness
 
@@ -43,6 +98,17 @@
   known: `bnatt400` took 28 seconds where it takes 1.5.
 - An integral node's incumbent is scored from its rounded point, as the root's is,
   rather than from the relaxation's objective.
+- Failing to factorize a basis no longer proves a model infeasible, and neither does
+  phase 1's arithmetic noise: `supportcase4` and `gasprod1-2` had been reported
+  infeasible.
+- The ratio test refuses a pivot negligible within its column, which on `neos-850681`
+  took the basis inverse to entries of 1e15.
+- A column no row constrains is no longer fixed at an infinite bound.
+- A search that proved no bound reports no gap, where it reported 0.0000%, and nodes it
+  skipped count against the bound it reports.
+- The incumbent survives a root relaxation that does not finish.
+- Mod-2 separation no longer lists a column twice when rows cancel it part way through
+  a combination, which produced a cut that removed the optimum.
 
 ## 0.3.0
 
