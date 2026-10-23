@@ -1524,22 +1524,45 @@ fn is_binary(problem: &Problem, j: usize) -> bool {
 /// relaxation is kept, since that is the one a row aggregated through these bounds is
 /// most violated at.
 fn implied_upper_bounds(problem: &Problem, conflicts: &Conflicts, x: &[f64]) -> Vec<Option<usize>> {
+    // Keep `y` over `held` if it stands strictly lower, so the first lowest is kept.
+    let lower = |held: Option<usize>, y: usize| match held {
+        Some(h) if x[y] >= x[h] => held,
+        _ => Some(y),
+    };
+    // A clique's lowest `y = 0` literal is the same for every column in it, but for the
+    // column itself, so it is found once, with the lowest of the rest for that column.
+    // Walking each column's cliques whole instead read every set partitioning row once per
+    // column in it: 1.5e9 literals on `nw04`, four seconds past a ten second limit.
+    let lowest: Vec<(Option<usize>, Option<usize>)> = conflicts
+        .cliques
+        .iter()
+        .map(|clique| {
+            let odd = || clique.iter().filter(|n| !n.is_multiple_of(2)).map(|&n| n as usize / 2);
+            let first = odd().fold(None, lower);
+            let second = odd().filter(|&y| Some(y) != first).fold(None, lower);
+            (first, second)
+        })
+        .collect();
     let mut bounds: Vec<Option<usize>> = vec![None; problem.n_cols()];
     for (j, slot) in bounds.iter_mut().enumerate() {
         if !is_binary(problem, j) {
             continue;
         }
-        let mut best: Option<usize> = None;
-        conflicts.for_each_adjacent(literal(j, true), |node| {
-            // An odd node is the literal `y = 0`, so conflicting with it means `y = 1`.
-            if !node.is_multiple_of(2) {
-                let y = node as usize / 2;
-                if y != j && best.is_none_or(|held| x[y] < x[held]) {
-                    best = Some(y);
-                }
+        let node = literal(j, true);
+        // An odd node is the literal `y = 0`, so conflicting with it means `y = 1`.
+        let mut best = conflicts.neighbours[node as usize]
+            .iter()
+            .filter(|n| !n.is_multiple_of(2))
+            .map(|&n| n as usize / 2)
+            .filter(|&y| y != j)
+            .fold(None, lower);
+        for &id in &conflicts.membership[node as usize] {
+            let (first, second) = lowest[id as usize];
+            let here = if first == Some(j) { second } else { first };
+            if let Some(y) = here {
+                best = lower(best, y);
             }
-            true
-        });
+        }
         *slot = best;
     }
     bounds
@@ -3060,6 +3083,78 @@ mod tests {
     /// A clique is only valid if *every* pair in it conflicts. Growing one greedily
     /// makes it easy to admit a column that conflicts with some members and not others,
     /// which is exactly how such a cut goes wrong.
+    #[test]
+    fn implied_upper_bounds_match_a_walk_of_every_neighbour() {
+        // What `implied_upper_bounds` computed before it read each clique once: every
+        // literal each column's `x = 1` excludes, the lowest `y = 0` among them kept.
+        fn walked(problem: &Problem, conflicts: &Conflicts, x: &[f64]) -> Vec<Option<usize>> {
+            (0..problem.n_cols())
+                .map(|j| {
+                    if !is_binary(problem, j) {
+                        return None;
+                    }
+                    let mut best: Option<usize> = None;
+                    conflicts.for_each_adjacent(literal(j, true), |node| {
+                        if !node.is_multiple_of(2) {
+                            let y = node as usize / 2;
+                            if y != j && best.is_none_or(|held| x[y] < x[held]) {
+                                best = Some(y);
+                            }
+                        }
+                        true
+                    });
+                    best
+                })
+                .collect()
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut odd_in_cliques = 0usize;
+        for _ in 0..300 {
+            let n = 4 + (next() % 6) as usize;
+            let mut model = crate::model::Builder::new(crate::model::Sense::Minimize);
+            let cols: Vec<usize> = (0..n).map(|j| model.binary(&format!("x{j}"))).collect();
+            for _ in 0..(1 + next() % 4) {
+                // Sum of some columns minus at most one gate, at most zero or one: with
+                // a gate this is a clique holding the gate's `y = 0`, without one a set
+                // packing clique, and over two columns an edge.
+                let mut terms: Vec<(usize, f64)> = Vec::new();
+                for &j in &cols {
+                    if next() % 3 == 0 {
+                        terms.push((j, 1.0));
+                    }
+                }
+                if terms.len() < 2 {
+                    continue;
+                }
+                let gated = next() % 2 == 0;
+                if gated {
+                    terms[0].1 = -1.0;
+                }
+                model.row(&terms, RowSense::Le, if gated { 0.0 } else { 1.0 });
+            }
+            let problem = model.build();
+            let conflicts = Conflicts::of(&problem);
+            odd_in_cliques += conflicts
+                .cliques
+                .iter()
+                .filter(|c| c.iter().any(|n| !n.is_multiple_of(2)))
+                .count();
+            // Coarse values, so ties are common and the order they break in is tested.
+            let x: Vec<f64> = (0..n).map(|_| (next() % 4) as f64 / 4.0).collect();
+            assert_eq!(
+                implied_upper_bounds(&problem, &conflicts, &x),
+                walked(&problem, &conflicts, &x)
+            );
+        }
+        assert!(odd_in_cliques > 0, "no clique held a `y = 0` literal, so none was tested");
+    }
+
     #[test]
     fn a_clique_admits_only_columns_conflicting_with_all_of_it() {
         // 0-1 and 0-2 conflict, 1-2 do not, so no clique larger than a pair exists.

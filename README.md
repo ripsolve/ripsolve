@@ -281,26 +281,34 @@ reproduce these for anyone holding a licence. Nothing is withheld.
 ### MIPLIB, against the open-source field
 
 The tables above are generated models. This one is MIPLIB: the 140 instances of its
-`easy` set whose every column is binary, at a 60-second limit and sixteen threads.
-Membership is a property of the model rather than of what any solver manages on it, so
-the set cannot flatter the solver being measured. `bench/binary_bench.py` reproduces it.
+`easy` set whose every column is binary, at a 60-second limit. Membership is a property
+of the model rather than of what any solver manages on it, so the set cannot flatter
+the solver being measured. `bench/binary_bench.py` reproduces it, and
+`docs/baselines/binary-2026-10-23.json` holds every measurement below
+(`binary-2026-10-23-1t.json` the one-thread run).
 
-Of the 140, **57 are closed by at least one open-source solver**, and those are the rows
-below; the other 83 defeat all four. Counting over the whole 140:
+Counting over the whole 140, at sixteen threads and at one:
 
-| | closes |
-|---|---:|
-| Gurobi | 94 |
-| HiGHS | 46 |
-| SCIP | 45 |
-| **ripsolve** | **34** |
-| CBC | 30 |
+| | sixteen threads | one thread |
+|---|---:|---:|
+| Gurobi | 94 | 81 |
+| **ripsolve** | **51** | **47** |
+| HiGHS | 46 | 39 |
+| SCIP | 45 | 41 |
+| CBC | 30 | 31 |
 
-So this solver is ahead of CBC and twelve behind HiGHS, and the honest way to read that
-is coverage rather than speed: on the instances it does close it is usually quick, and
-the gap is instances it does not close at all. Six of its 34 are ones HiGHS does not
-close -- `decomp2`, `disctom`, `eil33-2`, `neos-4754521-awarau`, `neos-787933`, `nw04` --
-and two are ones SCIP does not, so the sets are not nested.
+Of the 140, 66 are closed at sixteen threads by at least one open-source solver, and
+those are the rows below; the other 74 defeat all four. The sets are not nested.
+ripsolve closes 15 that HiGHS does not and 13 that SCIP does not, and misses 15 that
+one of them closes: `ab71-20-100`, `air04`, `air05`, `bley_xl1`, `cod105`,
+`graph20-20-1rand`, `mine-166-5`, `neos-1324574`, `neos-780889`, `neos-787933`,
+`neos-820879`, `neos-953928`, `neos-957143`, `neos-960392`, `tanglegram6`. Of the 41
+it closes that another open-source solver also closes, it is the fastest on 26.
+
+Every answer was checked against MIPLIB's published solution file. Each proven
+infeasibility is correct, and each optimum matches MIPLIB's to within the default 1e-4
+relative gap that all five solvers stop at; three are not exact, `app2-1`, `app2-2` and
+`cap6000`, at most 7e-5 apart.
 
 Bold marks the fastest of the four open-source solvers on that row. `--` is a solver that
 did not close the instance inside the limit; `inf` marks an instance proven infeasible,
@@ -308,70 +316,83 @@ which is a complete answer and counts as closed.
 
 | instance | rows | cols | ripsolve | HiGHS | SCIP | CBC | Gurobi |
 |---|---:|---:|---:|---:|---:|---:|---:|
+| `app2-2` | 335 | 1226 | **0.0s** | 0.6s | 1.5s | -- | 0.0s |
+| `f2gap40400` | 40 | 400 | 0.0s | **0.0s** | 0.1s | 0.4s | 0.0s |
+| `stein15inf` | 37 | 15 | 0.0s inf | 0.1s inf | **0.0s inf** | 0.1s inf | 0.0s inf |
+| `stein9inf` | 14 | 9 | 0.0s inf | 0.0s inf | 0.0s inf | **0.0s inf** | 0.0s inf |
 | `supportcase14` | 234 | 304 | **0.0s** | 0.1s | 0.2s | 0.2s | 0.0s |
 | `supportcase16` | 130 | 319 | **0.0s** | 0.1s | 0.2s | 0.2s | 0.0s |
-| `app2-2` | 335 | 1226 | **0.1s** | 0.6s | 1.5s | -- | 0.0s |
-| `f2gap40400` | 40 | 400 | 0.1s | **0.0s** | 0.1s | 0.4s | 0.0s |
-| `stein9inf` | 14 | 9 | 0.2s inf | 0.0s inf | 0.0s inf | **0.0s inf** | 0.0s inf |
-| `f2gap401600` | 40 | 1600 | 0.3s | 0.2s | **0.1s** | 0.4s | 0.1s |
-| `neos-1516309` | 489 | 4500 | 0.5s | **0.3s** | 3.2s | 2.7s | 0.1s |
-| `stein15inf` | 37 | 15 | 0.5s inf | 0.1s inf | **0.0s inf** | 0.1s inf | 0.0s inf |
-| `f2gap201600` | 20 | 1600 | 0.6s | 1.4s | **0.2s** | 0.3s | 0.1s |
-| `mod010` | 146 | 2655 | 0.6s | 0.6s | 0.6s | **0.4s** | 0.2s |
-| `neos-3437289-erdre` | 7358 | 12162 | 0.6s | 1.1s | **0.0s** | -- | 0.0s |
-| `p0201` | 133 | 201 | **0.6s** | 1.2s | 0.9s | 2.3s | 0.4s |
-| `app2-1` | 1038 | 3283 | 1.2s | 3.1s | 1.1s | **1.1s** | 0.1s |
-| `air03` | 124 | 10757 | 1.6s | 2.6s | 1.6s | **1.1s** | 0.3s |
-| `neos-3148108-pahi` | 154774 | 12241 | 1.6s | 1.6s | **0.2s** | 7.7s | 0.0s |
-| `stein45inf` | 332 | 45 | 3.2s inf | 1.3s inf | **1.0s inf** | 1.5s inf | 0.2s inf |
+| `acc-tight2` | 2520 | 1620 | 0.1s | **0.1s** | 16.6s | 3.2s | 0.6s |
+| `chromaticindex32-8` | 2111 | 2304 | **0.1s** | 26.9s | 1.0s | -- | 0.1s |
+| `f2gap201600` | 20 | 1600 | **0.1s** | 1.4s | 0.2s | 0.3s | 0.1s |
+| `f2gap401600` | 40 | 1600 | 0.1s | 0.2s | **0.1s** | 0.4s | 0.1s |
+| `supportcase4` | 9492 | 3162 | **0.1s** | 23.1s | 2.1s | -- | -- |
+| `f2gap801600` | 80 | 1600 | 0.2s | **0.1s** | 0.2s | 0.7s | 0.1s |
+| `neos-1516309` | 489 | 4500 | **0.2s** | 0.3s | 3.2s | 2.7s | 0.1s |
+| `neos18` | 11402 | 3312 | **0.2s** | 43.5s | 14.4s | -- | 1.3s |
+| `neos-3437289-erdre` | 7358 | 12162 | 0.3s | 1.1s | **0.0s** | -- | 0.0s |
+| `p0201` | 133 | 201 | **0.3s** | 1.2s | 0.9s | 2.3s | 0.4s |
+| `chromaticindex128-5` | 8447 | 9216 | **0.4s** | -- | -- | -- | 0.1s |
+| `mod010` | 146 | 2655 | 0.4s | 0.6s | 0.6s | **0.4s** | 0.2s |
+| `neos-3226448-wkra` | 2208 | 10012 | 0.4s | **0.2s** | -- | -- | 25.5s |
+| `decomp1` | 8357 | 10735 | **0.5s** | 18.1s | 1.6s | 20.0s | 0.3s |
+| `acc-tight5` | 3052 | 1339 | **0.6s** | 49.7s | 19.5s | -- | 6.3s |
+| `air03` | 124 | 10757 | **0.6s** | 2.6s | 1.6s | 1.1s | 0.3s |
+| `app2-1` | 1038 | 3283 | **0.6s** | 3.1s | 1.1s | 1.1s | 0.1s |
+| `stein45inf` | 332 | 45 | **0.7s inf** | 1.3s inf | 1.0s inf | 1.5s inf | 0.2s inf |
+| `decomp2` | 10765 | 14387 | **0.8s** | -- | 1.8s | 18.9s | 0.3s |
+| `supportcase3` | 12702 | 4191 | **0.8s** | -- | -- | -- | -- |
+| `acc-tight4` | 3285 | 1620 | **1.0s** | 24.2s | -- | -- | 5.2s |
+| `bnatt400` | 5614 | 3600 | **1.1s** | -- | -- | -- | 58.4s |
+| `chromaticindex256-8` | 16895 | 18432 | **1.2s** | -- | -- | -- | 0.1s |
+| `mitre` | 2054 | 10724 | 1.2s | 1.4s | 10.2s | **1.2s** | 0.1s |
+| `hanoi5` | 16399 | 3862 | **1.9s** | -- | -- | -- | -- |
+| `neos-3148108-pahi` | 154774 | 12241 | 2.2s | 1.6s | **0.2s** | 7.7s | 0.0s |
+| `neos-578379` | 21703 | 17010 | **2.6s** | -- | -- | -- | -- |
+| `neos-633273` | 21781 | 11154 | 3.0s | 5.7s | **0.5s** | 2.6s | 0.2s |
 | `mod008inf` | 7 | 319 | 3.9s inf | 0.1s inf | 0.1s inf | **0.1s inf** | 0.0s inf |
-| `neos-4754521-awarau` | 255386 | 41680 | **6.9s** | -- | 52.6s | -- | 0.1s |
-| `f2gap801600` | 80 | 1600 | 7.0s | **0.1s** | 0.2s | 0.7s | 0.1s |
-| `neos-3226448-wkra` | 2208 | 10012 | 8.8s | **0.2s** | -- | -- | 25.5s |
-| `disctom` | 399 | 10000 | 15.9s | -- | 6.2s | **1.5s** | 0.2s |
-| `n2seq36f` | 285 | 8100 | 18.4s | **3.6s** | 10.1s | -- | 0.2s |
-| `ex9` | 40962 | 10404 | 25.0s | **3.5s** | 23.1s | -- | 2.7s |
-| `mitre` | 2054 | 10724 | 27.4s | 1.4s | 10.2s | **1.2s** | 0.1s |
-| `cap6000` | 2176 | 6000 | 29.1s | 2.8s | 5.5s | **1.5s** | 0.3s |
-| `eil33-2` | 32 | 4516 | **31.4s** | -- | -- | -- | 2.1s |
-| `decomp1` | 8357 | 10735 | 32.2s | 18.1s | **1.6s** | 20.0s | 0.3s |
-| `neos-1599274` | 1237 | 4500 | 33.5s | **0.6s** | 1.5s | 1.1s | 0.2s |
-| `acc-tight2` | 2520 | 1620 | 37.2s | **0.1s** | 16.6s | 3.2s | 0.6s |
-| `neos-913984` | 1076 | 76000 | 37.3s | **4.3s** | 4.8s | 5.1s | 0.2s |
-| `neos-787933` | 1897 | 236376 | 39.3s | -- | **1.7s** | -- | 0.4s |
-| `decomp2` | 10765 | 14387 | 42.3s | -- | **1.8s** | 18.9s | 0.3s |
-| `nw04` | 36 | 87482 | 49.2s | -- | 40.1s | **15.4s** | 2.2s |
-| `irp` | 39 | 20315 | 53.7s | 23.7s | 18.8s | **10.5s** | 1.0s |
+| `neos-4754521-awarau` | 255386 | 41680 | **4.6s** | -- | 52.6s | -- | 0.1s |
+| `bnatt500` | 7029 | 4500 | **4.8s inf** | -- | -- | -- | -- |
+| `chromaticindex512-7` | 33791 | 36864 | **5.5s** | -- | -- | -- | 0.1s |
+| `disctom` | 399 | 10000 | 10.0s | -- | 6.2s | **1.5s** | 0.2s |
+| `neos-1599274` | 1237 | 4500 | 11.1s | **0.6s** | 1.5s | 1.1s | 0.2s |
+| `n2seq36f` | 285 | 8100 | 11.8s | **3.6s** | 10.1s | -- | 0.2s |
+| `chromaticindex1024-7` | 67583 | 73728 | **13.8s** | -- | -- | -- | 0.2s |
+| `neos-3045796-mogo` | 2245 | 11016 | 13.9s | **1.7s** | 2.4s | 2.2s | 0.1s |
+| `cap6000` | 2176 | 6000 | 19.4s | 2.8s | 5.5s | **1.5s** | 0.3s |
+| `neos-5129192-manaia` | 531569 | 164229 | **20.5s** | -- | 50.9s | -- | 14.5s |
+| `ex9` | 40962 | 10404 | 22.7s | **3.5s** | 23.1s | -- | 2.7s |
+| `ex10` | 69608 | 17680 | **26.0s** | 33.3s | -- | -- | 18.2s |
+| `eil33-2` | 32 | 4516 | **27.0s** | -- | -- | -- | 2.1s |
+| `neos-913984` | 1076 | 76000 | 38.1s | **4.3s** | 4.8s | 5.1s | 0.2s |
+| `irp` | 39 | 20315 | 44.4s | 23.7s | 18.8s | **10.5s** | 1.0s |
+| `nw04` | 36 | 87482 | 45.8s | -- | 40.1s | **15.4s** | 2.2s |
 | `ab71-20-100` | 6380 | 6689 | -- | **41.6s** | 58.0s | -- | 1.9s |
-| `acc-tight4` | 3285 | 1620 | -- | **24.2s** | -- | -- | 5.2s |
-| `acc-tight5` | 3052 | 1339 | -- | 49.7s | **19.5s** | -- | 6.3s |
 | `air04` | 823 | 8904 | -- | **55.0s** | -- | -- | 8.5s |
 | `air05` | 426 | 7195 | -- | 34.6s | 36.6s | **13.1s** | 3.3s |
 | `bley_xl1` | 175620 | 5831 | -- | **17.7s** | -- | -- | 2.9s |
-| `chromaticindex32-8` | 2111 | 2304 | -- | 26.9s | **1.0s** | -- | 0.1s |
 | `cod105` | 1024 | 1024 | -- | -- | **57.2s** | -- | 42.7s |
-| `ex10` | 69608 | 17680 | -- | **33.3s** | -- | -- | 18.2s |
 | `graph20-20-1rand` | 5587 | 2183 | -- | -- | **6.2s** | -- | -- |
 | `mine-166-5` | 8429 | 830 | -- | **52.6s** | -- | -- | 1.2s |
 | `neos-1324574` | 5904 | 5256 | -- | -- | **43.5s** | -- | 12.0s |
-| `neos-3045796-mogo` | 2245 | 11016 | -- | **1.7s** | 2.4s | 2.2s | 0.1s |
-| `neos-5129192-manaia` | 531569 | 164229 | -- | -- | **50.9s** | -- | 14.5s |
-| `neos-633273` | 21781 | 11154 | -- | 5.7s | **0.5s** | 2.6s | 0.2s |
 | `neos-780889` | 73910 | 182700 | -- | **7.2s** | -- | 33.1s | 1.4s |
+| `neos-787933` | 1897 | 236376 | -- | -- | **1.7s** | -- | 0.4s |
 | `neos-820879` | 361 | 9522 | -- | **26.8s** | -- | -- | 4.4s |
 | `neos-953928` | 12498 | 23305 | -- | **15.0s** | -- | -- | 1.1s |
 | `neos-957143` | 2767 | 57756 | -- | **42.4s** | -- | -- | 2.2s |
 | `neos-960392` | 4744 | 59376 | -- | **21.9s** | -- | -- | 4.7s |
-| `neos18` | 11402 | 3312 | -- | 43.5s | **14.4s** | -- | 1.3s |
-| `supportcase4` | 9492 | 3162 | -- | 23.1s | **2.1s** | -- | -- |
 | `tanglegram6` | 17712 | 9182 | -- | -- | **19.2s** | -- | 0.1s |
 
-Two cautions about reading this table. It is one run: the parallel search is not
-deterministic, and an instance finishing near the limit may not finish on the next run --
-`neos-3045796-mogo` closes at 38 to 41 seconds and is a coin flip, which is why it is
-absent here and present in earlier baselines. And Gurobi, at the same limit and thread
-count, closes 55 of these 57 and 94 of the 140 -- which is a more useful thing to know
-about the state of the art than any ranking among the rest.
+Some cautions about reading this table. It is one run: the parallel search is not
+deterministic, and an instance finishing near the limit may not finish on the next run.
+`neos-787933` closed at 57.8 seconds in the previous run and does not close here, while
+`nw04` closes anywhere from 30 to 55 seconds depending on when the conflict-driven search
+beside the tree hands over its first point. The other solvers' times were measured
+earlier on the same machine and reused from the harness's cache; only ripsolve was rerun
+for this table. The one-thread column is from the 0.4.0 release build, before the
+time-limit fixes. And Gurobi, at the same limit and thread count, closes 60 of these 66
+and 94 of the 140 -- which is a more useful thing to know about the state of the art
+than any ranking among the rest.
 
 ## Building and testing
 

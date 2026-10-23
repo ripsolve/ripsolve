@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Time limits held on models with very dense rows.** Three loops were quadratic in
+  row length and none of them checked the clock: coefficient tightening in presolve
+  recomputed a row's activity for every entry, and the conflict-driven search and the
+  fixing heuristics reread every row whose slack had not changed. `pb-fit2d` at a
+  60-second limit returned after 285s and now returns after 63s; `nw04` at a 10-second
+  limit on one thread ran to 14s and now stops on time. The conflict-driven search also
+  checks the deadline on every conflict, not every 64th.
+- Separating implied-bound cuts reads each clique once rather than once per column in
+  it. The cuts are the same.
+
+### Benchmarks
+
+- The pure binary MIPLIB set, 140 instances at sixty seconds, rerun with every answer
+  checked against MIPLIB's solution file: 51 closed at sixteen threads (HiGHS 46, SCIP
+  45, CBC 30, Gurobi 94) and 47 at one thread with the 0.4.0 build (HiGHS 39, SCIP 41,
+  CBC 31, Gurobi 81). Optima agree with MIPLIB's to within the default 1e-4 gap. The
+  results are in `docs/baselines/binary-2026-10-23.json` and the README.
+- `bench/benchmark_set.py` runs MIPLIB 2017's 240 benchmark instances and checks each
+  answer against MIPLIB.
+
 ## 0.4.0
 
 Over this release the pure binary MIPLIB set used to track progress, 140 instances at

@@ -504,6 +504,10 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
     }
 
     let mut changed = false;
+    // Only a tightened coefficient moves the activity, so it is recomputed after one
+    // rather than for every entry: on a dense row the latter is quadratic, and took
+    // pb-fit2d's 25 rows of 10500 columns five minutes per presolve.
+    let (mut min_activity, mut max_activity) = activity(row, &problem.col_lb, &problem.col_ub);
     for k in 0..row.len() {
         let (j, a) = row[k];
         // Only free binaries. The reduction reasons about a column being switched
@@ -513,7 +517,6 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
         {
             continue;
         }
-        let (min_activity, max_activity) = activity(row, &problem.col_lb, &problem.col_ub);
 
         if ge {
             let slack = problem.row_lb[i] - min_activity;
@@ -524,14 +527,12 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
                 // `x_j = 1` already satisfies the row on its own; the excess above
                 // `slack` can never be needed, so spending it is pure LP looseness.
                 row[k].1 = slack;
-                changed = true;
-                stats.tightened_coefficients += 1;
             } else if a < 0.0 && -a > slack + TOL {
                 // Mirror image: `x_j = 0` is the non-binding case.
                 row[k].1 = -slack;
                 problem.row_lb[i] = min_activity - a;
-                changed = true;
-                stats.tightened_coefficients += 1;
+            } else {
+                continue;
             }
         } else {
             let slack = max_activity - problem.row_ub[i];
@@ -541,14 +542,15 @@ fn tighten_coefficients(problem: &mut Problem, row: &mut Row, i: usize, stats: &
             if a > 0.0 && a > slack + TOL {
                 row[k].1 = slack;
                 problem.row_ub[i] = max_activity - a;
-                changed = true;
-                stats.tightened_coefficients += 1;
             } else if a < 0.0 && -a > slack + TOL {
                 row[k].1 = -slack;
-                changed = true;
-                stats.tightened_coefficients += 1;
+            } else {
+                continue;
             }
         }
+        changed = true;
+        stats.tightened_coefficients += 1;
+        (min_activity, max_activity) = activity(row, &problem.col_lb, &problem.col_ub);
     }
     changed
 }

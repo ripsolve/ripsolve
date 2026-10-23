@@ -268,6 +268,12 @@ struct Search<'a> {
     seen: Vec<bool>,
     /// Scratch for reasons, so explaining allocates nothing per step.
     scratch: Vec<(u32, f64)>,
+    /// For each row, the slack its upper and its lower side had when last scanned for
+    /// implications, and the epoch of that scan. See [`Search::propagate_row`].
+    scanned: Vec<[(u64, f64); 2]>,
+    /// Advanced whenever an assignment is undone or a row bound moves, which is what
+    /// can make a slack grow and so invalidate every entry of `scanned`.
+    epoch: u64,
 }
 
 /// A contradiction, as the set of assignments that cannot all hold.
@@ -366,6 +372,7 @@ impl<'a> Search<'a> {
             max_activity.push(high);
             kept.push(row);
         }
+        let rows_len = kept.len();
 
         Search {
             conflicts,
@@ -390,6 +397,8 @@ impl<'a> Search<'a> {
             phase: vec![false; n],
             seen: vec![false; n],
             scratch: Vec::new(),
+            scanned: vec![[(u64::MAX, 0.0); 2]; rows_len],
+            epoch: 0,
         }
     }
 
@@ -443,6 +452,7 @@ impl<'a> Search<'a> {
         }
         self.level_start.truncate(to as usize);
         self.head = self.trail.len();
+        self.epoch += 1;
     }
 
     /// Force `lit`, or report that it contradicts what already holds.
@@ -563,6 +573,16 @@ impl<'a> Search<'a> {
         Ok(())
     }
 
+    /// Every implication of row `i`, or its conflict.
+    ///
+    /// A side is scanned only when its slack has fallen since its last scan. Until an
+    /// assignment is undone, an assignment only adds to the least activity and takes from
+    /// the greatest (the increments have one sign, and so does their rounding), so the
+    /// slacks only fall, and a scan at a slack no smaller than the last one's finds every
+    /// column it would imply already assigned. Rescanning anyway was quadratic: on `nw04`'s
+    /// set partitioning rows of 17700 columns, every column one choice forces to zero
+    /// rescanned all its rows, a conflict cost 0.15s, and one propagation ran fifty
+    /// seconds past the time limit.
     fn propagate_row(&mut self, i: u32) -> Result<(), Conflict> {
         let row = &self.rows[i as usize];
         let low = self.min_activity[i as usize];
@@ -572,7 +592,10 @@ impl<'a> Search<'a> {
                 return Err(self.row_conflict(i, true));
             }
             let slack = row.ub - low;
-            if row.largest > slack + TOL * scale {
+            let (epoch, last) = self.scanned[i as usize][0];
+            let stale = epoch != self.epoch || slack < last;
+            if stale && row.largest > slack + TOL * scale {
+                self.scanned[i as usize][0] = (self.epoch, slack);
                 for e in 0..self.rows[i as usize].entries.len() {
                     let (k, a) = self.rows[i as usize].entries[e];
                     if self.value[k as usize] == -1 && a.abs() > slack + TOL * scale {
@@ -589,7 +612,10 @@ impl<'a> Search<'a> {
                 return Err(self.row_conflict(i, false));
             }
             let slack = high - row.lb;
-            if row.largest > slack + TOL * scale {
+            let (epoch, last) = self.scanned[i as usize][1];
+            let stale = epoch != self.epoch || slack < last;
+            if stale && row.largest > slack + TOL * scale {
+                self.scanned[i as usize][1] = (self.epoch, slack);
                 for e in 0..self.rows[i as usize].entries.len() {
                     let (k, a) = self.rows[i as usize].entries[e];
                     if self.value[k as usize] == -1 && a.abs() > slack + TOL * scale {
@@ -848,6 +874,7 @@ impl Search<'_> {
             return true;
         };
         self.backjump(0);
+        self.epoch += 1;
         let row = &mut self.rows[i as usize];
         row.ub = row.ub.min(ub);
         row.upper_usable = row.ub.is_finite() && row.rest_min_finite;
@@ -859,7 +886,19 @@ impl Search<'_> {
 
     /// Search until a point, a proof, or the budget. Resumable: the trail, the clauses and
     /// the activities carry over to the next call.
-    fn run(&mut self, problem: &Problem, limits: &Limits<'_>, out: &mut Outcome) -> Verdict {
+    ///
+    /// `patience` is [`optimize`]'s own soft stop, kept apart from the deadline because
+    /// the two are checked differently: the deadline on every conflict, since the caller's
+    /// time limit is a promise, and patience every 64th, as both once were, so that how
+    /// long the search is given to improve is what it was tuned at.
+    fn run(
+        &mut self,
+        problem: &Problem,
+        limits: &Limits<'_>,
+        patience: Option<Instant>,
+        out: &mut Outcome,
+    ) -> Verdict {
+        let impatient = || patience.is_some_and(|p| Instant::now() >= p);
         let n = problem.n_cols();
         let pure = (0..n).all(|j| self.binary[j]);
         let mut restart_index = 0usize;
@@ -900,7 +939,10 @@ impl Search<'_> {
                     if out.conflicts >= limits.max_conflicts {
                         return Verdict::Unknown;
                     }
-                    if out.conflicts.is_multiple_of(64) && limits.expired() {
+                    // One conflict is a full analysis, against which reading the clock is
+                    // nothing; on pb-fit2d's dense rows each costs 80ms, and checking the
+                    // deadline every 64th ran five seconds past the time limit.
+                    if limits.expired() || (out.conflicts.is_multiple_of(64) && impatient()) {
                         return Verdict::Unknown;
                     }
                 }
@@ -930,7 +972,7 @@ impl Search<'_> {
                         };
                     };
                     out.decisions += 1;
-                    if out.decisions.is_multiple_of(1024) && limits.expired() {
+                    if out.decisions.is_multiple_of(1024) && (limits.expired() || impatient()) {
                         return Verdict::Unknown;
                     }
                     self.level_start.push(self.trail.len());
@@ -967,7 +1009,7 @@ pub fn search(
     let mut s = Search::new(problem, cutoff, conflicts);
     let mut out = empty_outcome();
     out.verdict = if s.start(problem) {
-        s.run(problem, &limits, &mut out)
+        s.run(problem, &limits, None, &mut out)
     } else {
         Verdict::Infeasible
     };
@@ -1042,13 +1084,9 @@ pub fn optimize(
             max_conflicts: limits
                 .max_conflicts
                 .min(out.conflicts.saturating_add(limits.stall_conflicts)),
-            deadline: match (limits.deadline, patience) {
-                (Some(hard), Some(own)) => Some(hard.min(own)),
-                (hard, own) => hard.or(own),
-            },
             ..limits
         };
-        match s.run(problem, &this_run, &mut out) {
+        match s.run(problem, &this_run, patience, &mut out) {
             Verdict::Solution(x) => {
                 let value: f64 = problem.obj.iter().zip(&x).map(|(c, v)| c * v).sum();
                 on_point(value, &x);

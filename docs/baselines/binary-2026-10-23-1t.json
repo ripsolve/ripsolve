@@ -1,0 +1,3975 @@
+{
+ "rows": [
+  [
+   "stein9inf",
+   14,
+   9,
+   54,
+   {
+    "ripsolve": {
+     "status": "infeasible",
+     "seconds": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 0.0
+    },
+    "SCIP": {
+     "status": "infeasible",
+     "seconds": 0.0
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "stein15inf",
+   37,
+   15,
+   135,
+   {
+    "ripsolve": {
+     "status": "infeasible",
+     "seconds": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "infeasible",
+     "seconds": 0.0
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "p2m2p1m1p0n100",
+   2,
+   100,
+   200,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 74.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "f2gap40400",
+   40,
+   400,
+   800,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.0,
+     "objective": 20772.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "supportcase16",
+   130,
+   319,
+   1076,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 288.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "stein45inf",
+   332,
+   45,
+   1079,
+   {
+    "ripsolve": {
+     "status": "infeasible",
+     "seconds": 1.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 1.5
+    },
+    "SCIP": {
+     "status": "infeasible",
+     "seconds": 1.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 3.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 0.3
+    }
+   }
+  ],
+  [
+   "supportcase14",
+   234,
+   304,
+   1129,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.0,
+     "objective": 288.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "mod008inf",
+   7,
+   319,
+   1562,
+   {
+    "ripsolve": {
+     "status": "infeasible",
+     "seconds": 3.9
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "infeasible",
+     "seconds": 0.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "p0201",
+   133,
+   201,
+   1923,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.0,
+     "objective": 7615.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.7
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "ponderthis0517-inf",
+   78,
+   975,
+   2925,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 2.2
+    }
+   }
+  ],
+  [
+   "app2-2",
+   335,
+   1226,
+   3130,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.0,
+     "objective": 212042.5
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.5
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 1.4
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 65.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "f2gap201600",
+   20,
+   1600,
+   3200,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 76453.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.3
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "f2gap401600",
+   40,
+   1600,
+   3200,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 82307.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "f2gap801600",
+   80,
+   1600,
+   3200,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.3,
+     "objective": 86679.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "cvs08r139-94",
+   2398,
+   1864,
+   6456,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "cvs16r89-60",
+   3068,
+   2384,
+   8368,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "chromaticindex32-8",
+   2111,
+   2304,
+   8436,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 4.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 25.2
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.8
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "cvs16r70-62",
+   3278,
+   2112,
+   8512,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "app2-1",
+   1038,
+   3283,
+   8652,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.2,
+     "objective": 19295.5
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 2.9
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 1.0
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "cvs16r106-72",
+   3608,
+   2848,
+   9888,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "mod010",
+   146,
+   2655,
+   11203,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.6,
+     "objective": 6548.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.6
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.6
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.3
+    }
+   }
+  ],
+  [
+   "neos-831188",
+   2185,
+   4612,
+   11256,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "cvs16r128-89",
+   4633,
+   3472,
+   12528,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 64.8
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-2328163-agri",
+   1963,
+   2236,
+   12740,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-1330346",
+   4248,
+   2664,
+   13032,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "toll-like",
+   4408,
+   2883,
+   13224,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "reblock115",
+   4735,
+   1150,
+   13724,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "acc-tight2",
+   2520,
+   1620,
+   15327,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 14.8
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 2.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.6
+    }
+   }
+  ],
+  [
+   "mine-90-10",
+   6270,
+   900,
+   15407,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 16.6
+    }
+   }
+  ],
+  [
+   "acc-tight5",
+   3052,
+   1339,
+   16134,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.7,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 53.8
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 20.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 56.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 32.8
+    }
+   }
+  ],
+  [
+   "acc-tight4",
+   3285,
+   1620,
+   17073,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.5,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 28.6
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 57.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 35.4
+    }
+   }
+  ],
+  [
+   "qap10",
+   1820,
+   4150,
+   18200,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 65.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 40.9
+    }
+   }
+  ],
+  [
+   "graph20-20-1rand",
+   5587,
+   2183,
+   19277,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 9.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "mine-166-5",
+   8429,
+   830,
+   19412,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 4.2
+    }
+   }
+  ],
+  [
+   "neos-1324574",
+   5904,
+   5256,
+   20880,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 26.5
+    }
+   }
+  ],
+  [
+   "bnatt400",
+   5614,
+   3600,
+   21698,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 2.3,
+     "objective": 1.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 57.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos18",
+   11402,
+   3312,
+   24614,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.3,
+     "objective": 16.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 25.7
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 4.5
+    }
+   }
+  ],
+  [
+   "bnatt500",
+   7029,
+   4500,
+   27203,
+   {
+    "ripsolve": {
+     "status": "infeasible",
+     "seconds": 8.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "peg-solitaire-a3",
+   4587,
+   4552,
+   28387,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 57.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "supportcase18",
+   240,
+   13410,
+   28920,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "disctom",
+   399,
+   10000,
+   30000,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 15.1,
+     "objective": -5000.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 8.8
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.3
+    }
+   }
+  ],
+  [
+   "neos-1516309",
+   489,
+   4500,
+   30400,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.4,
+     "objective": 35954.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.5
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 4.7
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 5.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "neos-1337307",
+   5687,
+   2840,
+   30799,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 16.8
+    }
+   }
+  ],
+  [
+   "seymour",
+   4944,
+   1372,
+   33549,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "chromaticindex128-5",
+   8447,
+   9216,
+   33780,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.7,
+     "objective": 4.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 62.9
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "sorrell8",
+   18944,
+   2046,
+   37888,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 45.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "supportcase4",
+   9492,
+   3162,
+   38036,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.1,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 21.8
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 2.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "reblock166",
+   17024,
+   1660,
+   39442,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 73.7
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 42.9
+    }
+   }
+  ],
+  [
+   "mitre",
+   2054,
+   10724,
+   39704,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.3,
+     "objective": 115155.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.4
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 10.5
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "hanoi5",
+   16399,
+   3862,
+   39718,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.9,
+     "objective": 1931.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 49.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-3226448-wkra",
+   2208,
+   10012,
+   40048,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.4,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 98.6
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 65.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 24.5
+    }
+   }
+  ],
+  [
+   "opm2-z6-s1",
+   15533,
+   1350,
+   41844,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 67.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 7.0
+    }
+   }
+  ],
+  [
+   "ab71-20-100",
+   6380,
+   6689,
+   41961,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 42.3
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 54.3
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 2.5
+    }
+   }
+  ],
+  [
+   "eil33-2",
+   32,
+   4516,
+   44243,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 8.6
+    }
+   }
+  ],
+  [
+   "neos-3045796-mogo",
+   2245,
+   11016,
+   45183,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 14.2,
+     "objective": -175.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.8
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 2.5
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 2.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "neos-1599274",
+   1237,
+   4500,
+   46800,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 11.2,
+     "objective": 32075.6
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 0.6
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 1.4
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 0.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "decomp1",
+   8357,
+   10735,
+   47889,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.2,
+     "objective": -120.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 12.7
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 1.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 12.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "cap6000",
+   2176,
+   6000,
+   48243,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 24.0,
+     "objective": -2451325.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.8
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 3.3
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "air05",
+   426,
+   7195,
+   52121,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 31.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 34.2
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 20.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 5.7
+    }
+   }
+  ],
+  [
+   "tanglegram6",
+   17712,
+   9182,
+   53136,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 21.9
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "supportcase3",
+   12702,
+   4191,
+   53470,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.1,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "iis-glass-cov",
+   5375,
+   214,
+   56133,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "cod105",
+   1024,
+   1024,
+   57344,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 84.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 48.9
+    }
+   }
+  ],
+  [
+   "n2seq36f",
+   285,
+   8100,
+   60948,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 15.6,
+     "objective": 52200.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 4.3
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 13.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "neos-633273",
+   21781,
+   11154,
+   63910,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 3.6,
+     "objective": 6996841097.997802
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 7.2
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.6
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 2.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "glass-sc",
+   6119,
+   214,
+   63918,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "decomp2",
+   10765,
+   14387,
+   64073,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 2.7,
+     "objective": -160.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 2.3
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 19.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.4
+    }
+   }
+  ],
+  [
+   "chromaticindex256-8",
+   16895,
+   18432,
+   67572,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.9,
+     "objective": 4.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 63.5
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.2
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 67.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "ab72-40-100",
+   11671,
+   12370,
+   72137,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 2.2
+    }
+   }
+  ],
+  [
+   "neos-820879",
+   361,
+   9522,
+   72356,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 36.5
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 13.1
+    }
+   }
+  ],
+  [
+   "ab51-40-100",
+   11893,
+   12675,
+   72745,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 57.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 3.1
+    }
+   }
+  ],
+  [
+   "air04",
+   823,
+   8904,
+   72965,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 10.5
+    }
+   }
+  ],
+  [
+   "ab69-40-100",
+   11911,
+   12622,
+   74233,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 1.9
+    }
+   }
+  ],
+  [
+   "ab67-40-100",
+   12092,
+   12812,
+   75871,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 58.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 2.3
+    }
+   }
+  ],
+  [
+   "opm2-z7-s8",
+   31798,
+   2023,
+   79756,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 22.7
+    }
+   }
+  ],
+  [
+   "neos-829552",
+   5153,
+   40971,
+   86952,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 59.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "air03",
+   124,
+   10757,
+   91028,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 1.1,
+     "objective": 340160.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 3.6
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 2.4
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 1.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.3
+    }
+   }
+  ],
+  [
+   "supportcase29",
+   12441,
+   12050,
+   96050,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 59.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 15.5
+    }
+   }
+  ],
+  [
+   "irp",
+   39,
+   20315,
+   98254,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 28.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 25.3
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 17.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 1.2
+    }
+   }
+  ],
+  [
+   "neos-578379",
+   21703,
+   17010,
+   101560,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 5.9,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 66.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 54.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "chromaticindex512-7",
+   33791,
+   36864,
+   135156,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 6.9,
+     "objective": 4.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 64.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 101.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "reblock420",
+   62800,
+   4200,
+   138670,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "HiGHS": {
+     "status": "killed",
+     "seconds": 180.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.5
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "iis-hc-cov",
+   9727,
+   297,
+   142971,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-3437289-erdre",
+   7358,
+   12162,
+   149856,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 0.8,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 1.5
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 6.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "neos-913984",
+   1076,
+   76000,
+   152000,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 42.6,
+     "objective": 1000.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 6.4
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 7.6
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 5.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.3
+    }
+   }
+  ],
+  [
+   "opm2-z8-s0",
+   63608,
+   3200,
+   152793,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 72.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 68.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 49.8
+    }
+   }
+  ],
+  [
+   "bab5",
+   4964,
+   21600,
+   155520,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 59.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 40.2
+    }
+   }
+  ],
+  [
+   "neos-827015",
+   7688,
+   79347,
+   166239,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 70.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-953928",
+   12498,
+   23305,
+   169861,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 16.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 52.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 1.1
+    }
+   }
+  ],
+  [
+   "n2seq36q",
+   2565,
+   22480,
+   183292,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 4.2
+    }
+   }
+  ],
+  [
+   "neos-960392",
+   4744,
+   59376,
+   189503,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 18.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 48.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 3.2
+    }
+   }
+  ],
+  [
+   "tbfp-network",
+   2436,
+   72747,
+   215837,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 70.7
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 48.0
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-885524",
+   65,
+   91670,
+   258309,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 1.2
+    }
+   }
+  ],
+  [
+   "academictimetablesmall",
+   23294,
+   28926,
+   268350,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 57.6
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "chromaticindex1024-7",
+   67583,
+   73728,
+   270324,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 22.2,
+     "objective": 4.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.2
+    }
+   }
+  ],
+  [
+   "sp97ar",
+   1761,
+   14101,
+   290968,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 59.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-787933",
+   1897,
+   236376,
+   298320,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 2.2
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.5
+    }
+   }
+  ],
+  [
+   "eilC76-2",
+   75,
+   28599,
+   314837,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 69.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 25.6
+    }
+   }
+  ],
+  [
+   "sp98ic",
+   825,
+   10894,
+   316317,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 55.8
+    }
+   }
+  ],
+  [
+   "sp97ic",
+   1033,
+   12497,
+   316629,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "tanglegram4",
+   110404,
+   56048,
+   331212,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 3.3
+    }
+   }
+  ],
+  [
+   "sorrell3",
+   169162,
+   1024,
+   338324,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 61.6
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 84.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "n3div36",
+   4484,
+   22120,
+   340740,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-3988577-wolgan",
+   44662,
+   25870,
+   350350,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 41.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-3148108-pahi",
+   154774,
+   12241,
+   353504,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 2.4,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 2.2
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 0.2
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 10.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.0
+    }
+   }
+  ],
+  [
+   "opm2-z10-s4",
+   160633,
+   6250,
+   371240,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 64.6
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "vpphard",
+   47280,
+   51471,
+   372305,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 61.6
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 69.3
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 58.9
+    }
+   }
+  ],
+  [
+   "rail01",
+   46843,
+   117527,
+   392086,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "fast0507",
+   507,
+   63009,
+   409349,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "sp98ar",
+   1435,
+   15085,
+   426148,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 61.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-956971",
+   2527,
+   57756,
+   483560,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 6.3
+    }
+   }
+  ],
+  [
+   "neos-941313",
+   13189,
+   167910,
+   484080,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 62.8
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.4
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 30.0
+    }
+   }
+  ],
+  [
+   "neos-780889",
+   73910,
+   182700,
+   497210,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.5
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 12.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 45.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 1.9
+    }
+   }
+  ],
+  [
+   "neos-957143",
+   2767,
+   57756,
+   497676,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 55.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 66.1
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 2.9
+    }
+   }
+  ],
+  [
+   "neos-957323",
+   3757,
+   57756,
+   499656,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 61.6
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.2
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 59.7
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 3.2
+    }
+   }
+  ],
+  [
+   "ex9",
+   40962,
+   10404,
+   517112,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 50.6,
+     "objective": 81.0
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 4.9
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 43.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 6.5
+    }
+   }
+  ],
+  [
+   "neos-948346",
+   1570,
+   57855,
+   540443,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 67.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 22.3
+    }
+   }
+  ],
+  [
+   "supportcase10",
+   165684,
+   14770,
+   555082,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.9
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "netdiversion",
+   119589,
+   129180,
+   615282,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 89.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 96.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "nw04",
+   36,
+   87482,
+   636666,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 81.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 19.8
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 2.3
+    }
+   }
+  ],
+  [
+   "vpphard2",
+   198450,
+   199999,
+   648340,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 63.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 68.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 54.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 37.8
+    }
+   }
+  ],
+  [
+   "neos-876808",
+   85808,
+   87268,
+   682376,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.3
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 73.1
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "opm2-z12-s8",
+   319508,
+   10800,
+   725377,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 62.3
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "rail02",
+   95791,
+   270869,
+   756228,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.9
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-3555904-turama",
+   146493,
+   37461,
+   793605,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.9
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.0
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 87.7
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "neos-631710",
+   169576,
+   167056,
+   834166,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.2
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 61.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 64.5
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 116.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.1
+    }
+   }
+  ],
+  [
+   "neos-954925",
+   2989,
+   84718,
+   844983,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.5
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.5
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 3.6
+    }
+   }
+  ],
+  [
+   "bley_xl1",
+   175620,
+   5831,
+   869391,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.4
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 26.9
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 88.5
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 4.4
+    }
+   }
+  ],
+  [
+   "neos-859770",
+   2065,
+   2504,
+   880736,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 60.8
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 28.4
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 7.4
+    }
+   }
+  ],
+  [
+   "eilA101-2",
+   100,
+   65832,
+   959373,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 63.3
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.2
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 63.3
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "ex10",
+   69608,
+   17680,
+   1162000,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 61.9
+    },
+    "HiGHS": {
+     "status": "optimal",
+     "seconds": 37.9
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.9
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.4
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 19.9
+    }
+   }
+  ],
+  [
+   "neos-4754521-awarau",
+   255386,
+   41680,
+   1237481,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 6.2,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "optimal",
+     "seconds": 37.1
+    },
+    "CBC": {
+     "status": "optimal",
+     "seconds": 28.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 0.1
+    }
+   }
+  ],
+  [
+   "bab6",
+   29904,
+   114240,
+   1283181,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 62.3
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 60.6
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "wnq-n100-mw99-14",
+   656900,
+   10000,
+   1333400,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 65.4
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.4
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.0
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 71.2
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ],
+  [
+   "pb-fit2d",
+   10525,
+   118500,
+   1575578,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 299.5
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 62.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 66.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 35685.5
+    }
+   }
+  ],
+  [
+   "neos-5129192-manaia",
+   531569,
+   164229,
+   1599180,
+   {
+    "ripsolve": {
+     "status": "optimal",
+     "seconds": 27.8,
+     "objective": 0.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 74.3
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.6
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 65.9
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 21.1
+    }
+   }
+  ],
+  [
+   "co-100",
+   2187,
+   48417,
+   1995817,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 63.7
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 73.4
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.1
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 64.4
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.3
+    }
+   }
+  ],
+  [
+   "n3seq24",
+   6044,
+   119856,
+   3232340,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 93.6
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.4
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 81.6
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 22.7
+    }
+   }
+  ],
+  [
+   "neos-5052403-cygnet",
+   38268,
+   32868,
+   4898304,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 65.0
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 60.1
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.3
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 62.0
+    },
+    "commercial": {
+     "status": "optimal",
+     "seconds": 52.4
+    }
+   }
+  ],
+  [
+   "neos-2075418-temuka",
+   349602,
+   122304,
+   7610261,
+   {
+    "ripsolve": {
+     "status": "limit",
+     "seconds": 68.1
+    },
+    "HiGHS": {
+     "status": "limit",
+     "seconds": 91.8
+    },
+    "SCIP": {
+     "status": "timelimit",
+     "seconds": 60.8
+    },
+    "CBC": {
+     "status": "limit",
+     "seconds": 99.8
+    },
+    "commercial": {
+     "status": "limit",
+     "seconds": 60.0
+    }
+   }
+  ]
+ ],
+ "tally": {
+  "ripsolve": 47,
+  "HiGHS": 39,
+  "SCIP": 41,
+  "CBC": 31,
+  "commercial": 81
+ },
+ "limit": 60.0,
+ "threads": 1
+}

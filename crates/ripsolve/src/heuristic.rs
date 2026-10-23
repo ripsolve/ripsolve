@@ -1004,6 +1004,12 @@ pub(crate) struct Propagator<'a> {
     /// a column in a clique of four the same as one in a clique of four thousand.
     work: usize,
     tolerance: f64,
+    /// For each row, its least and its greatest activity when it was last read, each with
+    /// the epoch of that reading. See [`Propagator::propagate_row`].
+    scanned_min: Vec<(u64, f64)>,
+    scanned_max: Vec<(u64, f64)>,
+    /// Advanced whenever an activity can have moved back: a rewind, or a row rebuilt.
+    epoch: u64,
 }
 
 /// How a propagation sweep ended.
@@ -1087,6 +1093,9 @@ impl<'a> Propagator<'a> {
             forced: Vec::new(),
             work: 0,
             tolerance,
+            scanned_min: vec![(u64::MAX, 0.0); m],
+            scanned_max: vec![(u64::MAX, 0.0); m],
+            epoch: 0,
         }
     }
 
@@ -1120,6 +1129,9 @@ impl<'a> Propagator<'a> {
 
     /// Put everything back as it stood at `mark`.
     pub(crate) fn rewind(&mut self, mark: usize) {
+        if self.trail.len() > mark {
+            self.epoch += 1;
+        }
         while self.trail.len() > mark {
             match self.trail.pop().expect("length checked") {
                 Undo::Column { j, lb, ub } => {
@@ -1223,6 +1235,7 @@ impl<'a> Propagator<'a> {
         }
         self.min_activity[i] = min;
         self.max_activity[i] = max;
+        self.epoch += 1;
     }
 
     /// Suppose `j` takes `value`, and work out what follows.
@@ -1331,8 +1344,27 @@ impl<'a> Propagator<'a> {
         if min > row_ub + tolerance || max < row_lb - tolerance {
             return false;
         }
+        // What the upper side forces depends on the least activity alone, and grows with
+        // it; the lower side on the greatest, as it falls. A side whose activity has not
+        // moved that way since the row was last read, with nothing undone in between,
+        // forces only what that reading already fixed. Reading it again regardless was
+        // quadratic on `nw04`, whose set partitioning rows hold 17700 columns: every
+        // column one choice forced to zero reread all of its rows, and the fixing pass
+        // ran four seconds past a ten second limit. A skipped row is still charged as
+        // read: the work count is what probing and the fixing passes are budgeted in,
+        // and left uncharged, `air03`'s probing ran on at a third of the cost per step
+        // and took the solve from under a second to two.
         let (cols, values) = self.csr.column(i);
         self.work += cols.len();
+        let (epoch, least) = self.scanned_min[i];
+        let (since, greatest) = self.scanned_max[i];
+        let upper_moved = epoch != self.epoch || min > least;
+        let lower_moved = since != self.epoch || max < greatest;
+        if !(above && upper_moved) && !(below && lower_moved) {
+            return true;
+        }
+        self.scanned_min[i] = (self.epoch, min);
+        self.scanned_max[i] = (self.epoch, max);
         let mut forced = std::mem::take(&mut self.forced);
         forced.clear();
         for (&k, &a) in cols.iter().zip(values) {

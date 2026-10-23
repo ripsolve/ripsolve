@@ -161,7 +161,10 @@ def run_ripsolve(path):
         return {"status": "killed", "seconds": LIMIT * 4}
     elapsed = round(time.time() - started, 1)
     if "status:    optimal" in out:
-        return {"status": "optimal", "seconds": elapsed}
+        # The objective is kept so a claimed optimum can be checked against MIPLIB's.
+        found = re.search(r"^objective: (\S+)", out, re.M)
+        return {"status": "optimal", "seconds": elapsed,
+                "objective": float(found.group(1)) if found else None}
     if "status:    Infeasible" in out:
         return {"status": "infeasible", "seconds": elapsed}
     return {"status": "limit", "seconds": elapsed}
