@@ -761,6 +761,11 @@ enum Term {
     /// The slack `s_j = factor * y - x_j` of column `j` against its variable upper
     /// bound. It is continuous and nonnegative, which is all the rounding needs.
     Residual(usize),
+    /// Column `j` measured up from its lower bound, `x_j - lb_j`, for a column whose
+    /// lower bound is not zero.
+    Above(usize),
+    /// Column `j` measured down from its upper bound, `ub_j - x_j`.
+    Below(usize),
 }
 
 /// Variable upper bounds for every continuous column that has one.
@@ -828,53 +833,44 @@ fn variable_upper_bounds(problem: &Problem) -> Vec<Option<VariableBound>> {
 /// onto the binary `y`, which the rounding can then act on, and it is what makes the
 /// derivation reach fixed-charge structure at all.
 ///
-/// Every column in the row must sit at a lower bound of zero. Shifting a column that
-/// does not is a further step this does not take, so such rows are skipped rather than
-/// cut incorrectly.
+/// A column whose lower bound is not zero is measured from a bound first; see
+/// `shift_to_zero`.
 pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
     let csr = problem.matrix.to_csr();
     let vubs = variable_upper_bounds(problem);
     let mut found: Vec<Cut> = Vec::new();
+    // Entries read while aggregating, against a budget proportional to the model; see
+    // `aggregate_and_round`.
+    let mut work = 0usize;
+    let budget = AGGREGATION_WORK_FACTOR * problem.matrix.nnz() + AGGREGATION_WORK_FLOOR;
 
     for i in 0..problem.n_rows() {
         let (cols, vals) = csr.column(i);
         if cols.is_empty() {
             continue;
         }
-        // A range row gives two one-sided rows to try; an equality gives nothing this
-        // reduction can use, since it has no slack to round against.
+        // A range row gives two one-sided rows to try, and so does an equality, each
+        // side of which is an inequality the rounding applies to like any other. They
+        // were once skipped as having no slack to round against, which shut out the
+        // flow balance of every network model: on `p200x1188c` all 200 of its node
+        // rows are equalities, and the root took no cut at all.
         let lb = problem.row_lb[i];
         let ub = problem.row_ub[i];
         for &(sign, bound) in &[(1.0f64, ub), (-1.0f64, -lb)] {
-            if !bound.is_finite() || lb == ub {
+            if !bound.is_finite() {
                 continue;
             }
             // Written as `sum a_j x_j <= b`, negating a `>=` row to get there.
             let terms: Vec<(usize, f64)> =
                 cols.iter().zip(vals).map(|(&j, &v)| (j, sign * v)).collect();
-            if terms.iter().any(|&(j, _)| problem.col_lb[j] != 0.0) {
-                continue;
-            }
-            // Each rewriting of the row is exact, and which one the rounding bites on
-            // is not predictable from the row alone, so all four are tried: as written,
-            // with continuous columns put on their variable bounds, with binaries near
-            // one complemented, and with both.
-            let plain: Vec<(Term, f64)> =
-                terms.iter().map(|&(j, a)| (Term::Column(j), a)).collect();
-            let mut rewritings = vec![(plain.clone(), bound)];
-            if let Some(pair) = substitute_bounds(problem, &terms, bound, x, &vubs) {
-                rewritings.push(pair);
-            }
-            for index in 0..rewritings.len() {
-                let (row, rhs) = &rewritings[index];
-                if let Some(pair) = complement_binaries(problem, row, *rhs, x) {
-                    rewritings.push(pair);
-                }
-            }
-            for (row, rhs) in &rewritings {
-                if let Some(cut) = mir_from_row(problem, row, *rhs, x, &vubs, MAX_MIR_DIVISORS) {
-                    found.push(cut);
-                }
+            let before = found.len();
+            found.extend(round_rewritings(problem, &terms, bound, x, &vubs));
+            if found.len() == before
+                && work < budget
+                && let Some(cut) =
+                    aggregate_and_round(problem, &csr, i, terms, bound, x, &vubs, &mut work)
+            {
+                found.push(cut);
             }
         }
     }
@@ -884,9 +880,195 @@ pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
             .partial_cmp(&a.violation(x))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // Two rewritings of one row, or one row reached from two starts, often round to the
+    // same cut, and each copy would take a place below.
+    found.dedup_by(|later, held| later.ub == held.ub && later.coefficients == held.coefficients);
     found.truncate(limit);
     found
 }
+
+/// The MIR cuts from each rewriting of `sum a_j x_j <= bound`, one per rewriting at most.
+///
+/// Each rewriting of the row is exact, and which one the rounding bites on is not
+/// predictable from the row alone, so all four are tried: as written, with continuous
+/// columns put on their variable bounds, with binaries near one complemented, and with
+/// both.
+fn round_rewritings(
+    problem: &Problem,
+    terms: &[(usize, f64)],
+    bound: f64,
+    x: &[f64],
+    vubs: &[Option<VariableBound>],
+) -> Vec<Cut> {
+    let Some((plain, bound)) = shift_to_zero(problem, terms, bound, x) else {
+        return Vec::new();
+    };
+    let mut rewritings = vec![(plain.clone(), bound)];
+    if let Some(pair) = substitute_bounds(problem, &plain, bound, x, vubs) {
+        rewritings.push(pair);
+    }
+    for index in 0..rewritings.len() {
+        let (row, rhs) = &rewritings[index];
+        if let Some(pair) = complement_binaries(problem, row, *rhs, x) {
+            rewritings.push(pair);
+        }
+    }
+    rewritings
+        .iter()
+        .filter_map(|(row, rhs)| mir_from_row(problem, row, *rhs, x, vubs, MAX_MIR_DIVISORS))
+        .collect()
+}
+
+/// The row with every column measured from a bound, so that each is nonnegative, which
+/// is what the rounding assumes; or `None` if some column is free at both ends.
+///
+/// A column whose lower bound is zero stands as it is. Any other is measured from
+/// whichever finite bound the point sits nearer, `x_j = lb_j + x'` or `x_j = ub_j - x''`,
+/// the constant moving to the right-hand side. Rows with such a column were once skipped
+/// altogether, and that is every scheduling model's time-window rows: on `drayage-100-23`
+/// each arrival time lies in a window like `[22225, 29425]`, the big-M rows linking them
+/// to the routing binaries were never rounded, and the root bound of its RINS
+/// neighbourhood stayed at 103334 where HiGHS's cuts raise it to 113648, the optimum.
+fn shift_to_zero(
+    problem: &Problem,
+    terms: &[(usize, f64)],
+    bound: f64,
+    x: &[f64],
+) -> Option<(Vec<(Term, f64)>, f64)> {
+    let mut rhs = bound;
+    let mut shifted = Vec::with_capacity(terms.len());
+    for &(j, a) in terms {
+        let (lb, ub) = (problem.col_lb[j], problem.col_ub[j]);
+        if lb == 0.0 {
+            shifted.push((Term::Column(j), a));
+        } else if lb.is_finite() && (!ub.is_finite() || x[j] - lb <= ub - x[j]) {
+            // a x = a lb + a (x - lb)
+            shifted.push((Term::Above(j), a));
+            rhs -= a * lb;
+        } else if ub.is_finite() {
+            // a x = a ub - a (ub - x)
+            shifted.push((Term::Below(j), -a));
+            rhs -= a * ub;
+        } else {
+            return None;
+        }
+    }
+    Some((shifted, rhs))
+}
+
+/// Rows combined at most, counting the one started from; see [`aggregate_and_round`].
+const MAX_AGGREGATED_ROWS: usize = 5;
+/// The longest aggregated row worth rounding. Each step can add a whole row's entries,
+/// and a cut that long is rarely worth its place even when it is violated.
+const MAX_AGGREGATED_LENGTH: usize = 500;
+/// Entries aggregation may read per call, as a multiple of the model's nonzeros plus a
+/// floor, so that a model whose rows all chain together cannot make separation the
+/// whole of the root.
+const AGGREGATION_WORK_FACTOR: usize = 4;
+const AGGREGATION_WORK_FLOOR: usize = 100_000;
+
+/// A cut from `terms <= bound`, row `start` of the model, combined with further rows to
+/// cancel its continuous columns, when the row alone gives none.
+///
+/// A single row of a network model says little: on `p200x1188c` 193 of the 200 node
+/// balances carry no demand, and rounding one of them proves nothing. What the
+/// rounding needs is the balance of a whole group of nodes, which is the sum of their
+/// rows with the arcs between them cancelled. This is the aggregation heuristic of
+/// Marchand and Wolsey that every MIR separator in use runs: take the continuous
+/// column the point holds furthest inside its bounds, since that is the one keeping the
+/// row slack against rounding, add the multiple of another row containing it that
+/// cancels it, and try again.
+///
+/// The row added must hold at the point with equality on the side used, which every
+/// equality does: adding a slack row adds its slack to the right-hand side and weakens
+/// whatever follows. A `<=` row may only be added with a positive multiple and a `>=`
+/// row with a negative one, so that the sum is still implied by the model.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_and_round(
+    problem: &Problem,
+    csr: &crate::sparse::SparseMatrix,
+    start: usize,
+    terms: Vec<(usize, f64)>,
+    bound: f64,
+    x: &[f64],
+    vubs: &[Option<VariableBound>],
+    work: &mut usize,
+) -> Option<Cut> {
+    let mut row: std::collections::BTreeMap<usize, f64> = terms.into_iter().collect();
+    let mut rhs = bound;
+    let mut used = vec![start];
+
+    for _ in 1..MAX_AGGREGATED_ROWS {
+        // The continuous column furthest from both of its bounds.
+        let mut pick: Option<(usize, f64)> = None;
+        for (&j, &a) in &row {
+            if problem.is_integer(j) || a.abs() <= TOL {
+                continue;
+            }
+            let distance = (x[j] - problem.col_lb[j]).min(problem.col_ub[j] - x[j]);
+            if distance > AGGREGATION_MIN_DISTANCE && pick.is_none_or(|(_, held)| distance > held)
+            {
+                pick = Some((j, distance));
+            }
+        }
+        let (j, _) = pick?;
+        let cj = row[&j];
+
+        // The shortest row that can cancel it, tight at the point on the side it would
+        // be added from.
+        let (rows_of_j, coefficients) = problem.matrix.column(j);
+        let mut chosen: Option<(usize, f64, f64, usize)> = None;
+        for (&r, &arj) in rows_of_j.iter().zip(coefficients) {
+            if used.contains(&r) || arj.abs() <= TOL {
+                continue;
+            }
+            let lambda = -cj / arj;
+            let side = if lambda > 0.0 { problem.row_ub[r] } else { problem.row_lb[r] };
+            if !side.is_finite() {
+                continue;
+            }
+            let (cols, vals) = csr.column(r);
+            let activity: f64 = cols.iter().zip(vals).map(|(&k, &v)| v * x[k]).sum();
+            if (activity - side).abs() > AGGREGATION_TIGHT * (1.0 + side.abs()) {
+                continue;
+            }
+            if chosen.is_none_or(|(_, _, _, len)| cols.len() < len) {
+                chosen = Some((r, lambda, side, cols.len()));
+            }
+        }
+        let (r, lambda, side, _) = chosen?;
+
+        let (cols, vals) = csr.column(r);
+        *work += cols.len() + row.len();
+        for (&k, &v) in cols.iter().zip(vals) {
+            *row.entry(k).or_insert(0.0) += lambda * v;
+        }
+        rhs += lambda * side;
+        // Exactly cancelled, whatever the arithmetic left behind.
+        row.remove(&j);
+        row.retain(|_, a| a.abs() > TOL);
+        used.push(r);
+        if row.len() > MAX_AGGREGATED_LENGTH {
+            return None;
+        }
+
+        let terms: Vec<(usize, f64)> = row.iter().map(|(&k, &a)| (k, a)).collect();
+        let best = round_rewritings(problem, &terms, rhs, x, vubs)
+            .into_iter()
+            .max_by(|a, b| a.violation(x).total_cmp(&b.violation(x)));
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
+/// A continuous column must sit at least this far inside its bounds to be worth
+/// cancelling; one at a bound contributes nothing the rounding is held back by.
+const AGGREGATION_MIN_DISTANCE: f64 = 1e-6;
+/// How close to its side a row's activity must be to count as tight, relative to the
+/// side's magnitude.
+const AGGREGATION_TIGHT: f64 = 1e-7;
 
 /// Replace continuous columns by their variable upper bounds where that tightens the
 /// row at the current point.
@@ -898,7 +1080,7 @@ pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
 /// leaves the row unchanged and the caller has already rounded it.
 fn substitute_bounds(
     problem: &Problem,
-    terms: &[(usize, f64)],
+    terms: &[(Term, f64)],
     bound: f64,
     x: &[f64],
     vubs: &[Option<VariableBound>],
@@ -906,7 +1088,13 @@ fn substitute_bounds(
     let mut coefficients: Vec<(Term, f64)> = Vec::with_capacity(terms.len() * 2);
     let mut substituted = false;
 
-    for &(j, a) in terms {
+    for &(term, a) in terms {
+        // Only a column standing on its own lower bound of zero has a variable upper
+        // bound to be put on; a shifted one is left as it is.
+        let Term::Column(j) = term else {
+            coefficients.push((term, a));
+            continue;
+        };
         let vub = vubs[j].filter(|_| !problem.is_integer(j) && a.abs() > TOL);
         let Some(vub) = vub else {
             coefficients.push((Term::Column(j), a));
@@ -933,6 +1121,8 @@ fn substitute_bounds(
         Term::Column(j) => (0usize, j),
         Term::Complement(j) => (1, j),
         Term::Residual(j) => (2, j),
+        Term::Above(j) => (3, j),
+        Term::Below(j) => (4, j),
     });
     coefficients.dedup_by(|later, held| {
         if later.0 == held.0 {
@@ -1000,6 +1190,11 @@ fn mir_from_row(
         Term::Column(j) => problem.is_integer(j),
         Term::Complement(_) => true,
         Term::Residual(_) => false,
+        // Integral only if the bound it is measured from is, as it is on any integer
+        // column presolve has left alone. Treating one as continuous is always valid,
+        // merely weaker, so a fractional bound costs nothing but strength.
+        Term::Above(j) => problem.is_integer(j) && problem.col_lb[j].fract() == 0.0,
+        Term::Below(j) => problem.is_integer(j) && problem.col_ub[j].fract() == 0.0,
     };
 
     let mut candidates: Vec<f64> = terms
@@ -1039,7 +1234,7 @@ fn mir_from_row(
             continue;
         }
 
-        let Some(cut) = restate(&rounded, floor_rhs, vubs) else {
+        let Some(cut) = restate(problem, &rounded, floor_rhs, vubs) else {
             continue;
         };
         let violation = cut.violation(x);
@@ -1054,7 +1249,12 @@ fn mir_from_row(
 ///
 /// A residual carries `s_j = factor * y - x_j`, so its coefficient splits between the
 /// binary and the continuous column it came from.
-fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) -> Option<Cut> {
+fn restate(
+    problem: &Problem,
+    rounded: &[(Term, f64)],
+    rhs: f64,
+    vubs: &[Option<VariableBound>],
+) -> Option<Cut> {
     let mut coefficients: Vec<(usize, f64)> = Vec::with_capacity(rounded.len() * 2);
     let mut rhs = rhs;
     for &(term, c) in rounded {
@@ -1069,6 +1269,16 @@ fn restate(rounded: &[(Term, f64)], rhs: f64, vubs: &[Option<VariableBound>]) ->
                 let vub = vubs[j]?;
                 coefficients.push((vub.binary, c * vub.factor));
                 coefficients.push((j, -c));
+            }
+            Term::Above(j) => {
+                // c (x - lb) on the left is c x with c lb added to the right.
+                coefficients.push((j, c));
+                rhs += c * problem.col_lb[j];
+            }
+            Term::Below(j) => {
+                // c (ub - x) on the left is -c x with c ub taken off the right.
+                coefficients.push((j, -c));
+                rhs -= c * problem.col_ub[j];
             }
         }
     }
@@ -2966,21 +3176,89 @@ mod tests {
     }
 
     #[test]
-    fn mir_skips_a_column_that_does_not_sit_at_zero() {
-        // The derivation assumes every column has a lower bound of zero. A row with a
-        // shifted column must be left alone rather than cut on a false premise.
+    fn mir_cuts_a_row_whose_columns_sit_away_from_zero() {
+        // A shifted column is measured from its bound before rounding. The row as
+        // written is cuttable, and with the continuous column's window moved off zero
+        // it must still give a cut, and a valid one.
         let p = mixed_knapsack(4.5, 3.0);
-        let relaxed = Lp::relaxation(&p).solve();
-        assert!(!separate_mir(&p, &relaxed.x, 32).is_empty(), "row is cuttable as written");
+        assert!(assert_mir_is_valid(&p, "as written") > 0, "row is cuttable as written");
+        for (lb, ub) in [(1.0, 5.0), (-2.0, 2.0), (0.5, 4.5)] {
+            let mut shifted = p.clone();
+            shifted.col_lb[0] = lb;
+            shifted.col_ub[0] = ub;
+            shifted.row_lb[0] += lb;
+            assert_mir_is_valid(&shifted, &format!("window [{lb}, {ub}]"));
+        }
+    }
 
-        let mut shifted = p.clone();
-        shifted.col_lb[0] = 1.0;
-        let relaxed = Lp::relaxation(&shifted).solve();
-        assert_eq!(relaxed.status, LpStatus::Optimal);
-        assert!(
-            separate_mir(&shifted, &relaxed.x, 32).is_empty(),
-            "cut derived from a row containing a shifted column"
+    #[test]
+    fn mir_cuts_a_time_window_row() {
+        // The scheduling shape: an arrival time `t` in a window far from zero, held
+        // after a departure `s` by a travel time unless the binary `y` switches the
+        // link off, through a big-M row `t - s + M (1 - y) >= 30`, written as
+        // `t - s - M y >= 30 - M`.
+        // A second row pushes the binary half on, so the relaxation leans on the big-M.
+        let mut p = problem(
+            &[1.0, 0.0, 5.0],
+            &[
+                (&[1.0, -1.0, -100.0], RowSense::Ge, 30.0 - 100.0),
+                (&[0.0, 0.0, 1.0], RowSense::Ge, 0.5),
+            ],
         );
+        for j in [0, 1] {
+            p.col_type[j] = crate::model::VarType::Continuous;
+        }
+        (p.col_lb[0], p.col_ub[0]) = (1000.0, 1060.0);
+        (p.col_lb[1], p.col_ub[1]) = (1010.0, 1040.0);
+        assert!(assert_mir_is_valid(&p, "time window") > 0, "no cut from the time window row");
+    }
+
+    #[test]
+    fn mir_is_valid_on_random_rows_with_shifted_columns() {
+        let mut seed = 0x6A09_E667_F3BC_C909u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut total = 0;
+        for _ in 0..300 {
+            let binaries = 2 + (next() % 4) as usize;
+            let continuous = 1 + (next() % 3) as usize;
+            let n = binaries + continuous;
+            let rows = 1 + (next() % 3) as usize;
+            let mut entries: Vec<(Vec<f64>, RowSense, f64)> = Vec::new();
+            for _ in 0..rows {
+                let coefficients: Vec<f64> =
+                    (0..n).map(|_| (next() % 11) as f64 - 5.0).collect();
+                let sense = match next() % 3 {
+                    0 => RowSense::Le,
+                    1 => RowSense::Ge,
+                    _ => RowSense::Eq,
+                };
+                entries.push((coefficients, sense, (next() % 21) as f64 - 10.0 + 0.5));
+            }
+            let objective: Vec<f64> = (0..n).map(|_| (next() % 7) as f64 - 3.0).collect();
+            let spec: Vec<(&[f64], RowSense, f64)> =
+                entries.iter().map(|(c, s, b)| (&c[..], *s, *b)).collect();
+            let mut p = problem(&objective, &spec);
+            for j in binaries..n {
+                p.col_type[j] = crate::model::VarType::Continuous;
+                let lb = (next() % 9) as f64 - 4.0;
+                let width = 1.0 + (next() % 6) as f64;
+                // Some columns bounded only above, the rest in a window off zero.
+                if next() % 4 == 0 {
+                    p.col_lb[j] = f64::NEG_INFINITY;
+                    p.col_ub[j] = lb + width;
+                } else {
+                    p.col_lb[j] = lb;
+                    p.col_ub[j] = lb + width;
+                }
+            }
+            total += assert_mir_is_valid(&p, "random shifted");
+        }
+        assert!(total > 0, "no MIR cut was produced, so nothing was checked");
     }
 
     /// Every conflict has to hold at every feasible point, checked by enumeration

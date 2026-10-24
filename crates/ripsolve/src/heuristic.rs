@@ -682,6 +682,27 @@ mod tests {
         assert_valid(&p, &found, "jump local minimum");
     }
 
+    /// General integers and continuous columns move too, by jumping to the value that
+    /// minimises their rows' weighted violation. This model has no binary at all, and
+    /// the search once declined it on sight; from all zeros, every row violated, it has
+    /// to raise both integers and the continuous column to get anywhere.
+    #[test]
+    fn feasibility_jump_moves_general_integers_and_continuous_columns() {
+        let lp = "Minimize\n obj: x + y + z\nSubject To\n \
+                  r1: 3 x + 2 y >= 7\n r2: y - z <= 1\n r3: x + z >= 4.5\n\
+                  Bounds\n 0 <= x <= 10\n 0 <= y <= 10\n 0 <= z <= 5\n\
+                  General\n x\n y\nEnd\n";
+        let p = Problem::from_lp(&LpProblem::parse(lp).unwrap()).unwrap();
+        let start = vec![0.0; p.n_cols()];
+        assert!(!is_feasible(&p, &start, 1e-6));
+        let found = feasibility_jump(&p, &start, &Limits::default(), 100_000, None)
+            .expect("x = 1, y = 2, z = 3.5 is one of many feasible points");
+        assert_valid(&p, &found, "jump general integers");
+        for j in p.integer_columns() {
+            assert_eq!(found.x[j], found.x[j].round(), "integer column {j} left fractional");
+        }
+    }
+
     /// The property that makes this heuristic safe to add: propagation may be wrong
     /// about where the feasible points are, and cannot be wrong about what it returns,
     /// because the completed assignment is checked before it is handed back.
@@ -1528,6 +1549,70 @@ const JUMP_STALL: usize = 30_000;
 /// How far the candidate queue may outgrow the columns before it is rebuilt.
 const STALE_FACTOR: usize = 8;
 
+/// The value of column `j` minimising the weighted violation of its rows, within its
+/// bounds, with every other column held.
+///
+/// Row `i` as a function of `j`'s value is violated below one breakpoint and above
+/// another, at a rate of `weight * |a|` either way, so the sum over the rows is convex
+/// and piecewise linear: its slope starts at minus the total rate of every row that has
+/// a lower breakpoint, and each breakpoint passed adds that row's rate. The minimum is
+/// where the slope stops being negative. On a flat stretch the current value is kept if
+/// it lies there, since a move that gains nothing is only churn.
+fn jump_target(
+    problem: &Problem,
+    j: usize,
+    assign: &[f64],
+    activity: &[f64],
+    weight: &[f64],
+    events: &mut Vec<(f64, f64)>,
+) -> f64 {
+    let (rows, vals) = problem.matrix.column(j);
+    events.clear();
+    let mut slope = 0.0f64;
+    for (&i, &a) in rows.iter().zip(vals) {
+        if a == 0.0 {
+            continue;
+        }
+        // The row's activity with `j` taken out, so `rest + a * v` is the activity at `v`.
+        let rest = activity[i] - a * assign[j];
+        let (lb, ub) = (problem.row_lb[i], problem.row_ub[i]);
+        let (low, high) = if a > 0.0 {
+            ((lb - rest) / a, (ub - rest) / a)
+        } else {
+            ((ub - rest) / a, (lb - rest) / a)
+        };
+        let rate = weight[i] * a.abs();
+        if low.is_finite() {
+            slope -= rate;
+            events.push((low, rate));
+        }
+        if high.is_finite() {
+            events.push((high, rate));
+        }
+    }
+    let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+    let current = assign[j];
+    if slope >= 0.0 {
+        // Nothing gets worse leftwards: the lowest value in range, or where it is.
+        return if lo.is_finite() { lo } else { current };
+    }
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (index, &(at, rate)) in events.iter().enumerate() {
+        slope += rate;
+        if slope >= -1e-12 {
+            if slope <= 1e-12 {
+                // Flat from here to the next breakpoint.
+                let end = events.get(index + 1).map_or(f64::INFINITY, |e| e.0);
+                if current >= at && current <= end {
+                    return current.clamp(lo, hi);
+                }
+            }
+            return at.clamp(lo, hi);
+        }
+    }
+    current.clamp(lo, hi)
+}
+
 /// A row's distance from being satisfied.
 fn row_violation(activity: f64, lb: f64, ub: f64) -> f64 {
     let below = if activity < lb { lb - activity } else { 0.0 };
@@ -1615,9 +1700,15 @@ pub fn corners(problem: &Problem, limits: &Limits) -> Option<Incumbent> {
 /// any feasible point at all rather than finding a good one, and because whatever this
 /// returns is handed to polish and to the improvement search afterwards.
 ///
-/// Binary columns only. General integers would need a jump to the best value in their
-/// range rather than a flip, and the models this is aimed at do not have any. Continuous
-/// columns stay where they were put and contribute a constant to every row they are in.
+/// A binary column moves by flipping. Every other column moves by the *jump* the method
+/// is named for: to the value in its range that minimises the weighted violation of its
+/// rows, which as a function of that one value is convex and piecewise linear, so its
+/// minimum is found by one sweep over the breakpoints; an integer column takes the
+/// better of the integers either side. This was binary-only once, declining any model
+/// with a general integer and leaving continuous columns where they started, and on
+/// mixed models that is most of the way to declining them all: on `neos-3381206-awhea`,
+/// `neos-1582420`, `piperout-08` and `neos8` it returned in no time with nothing, where
+/// HiGHS's version of the same search finds their first points.
 pub fn feasibility_jump(
     problem: &Problem,
     start: &[f64],
@@ -1630,11 +1721,6 @@ pub fn feasibility_jump(
     const CLOCK_STRIDE: usize = 512;
     let n = problem.n_cols();
     let m = problem.n_rows();
-    // A general integer column has no flip, and standing in for one badly is worse than
-    // declining the model.
-    if (0..n).any(|j| problem.is_integer(j) && !is_binary_column(problem, j)) {
-        return None;
-    }
     // The matrix is held by column, so a column's rows and coefficients are already
     // adjacent; only the row-wise view has to be built.
     let csr = problem.matrix.to_csr();
@@ -1645,6 +1731,8 @@ pub fn feasibility_jump(
             if is_binary_column(problem, j) {
                 let rounded: f64 = if start[j] > 0.5 { 1.0 } else { 0.0 };
                 rounded.clamp(problem.col_lb[j], problem.col_ub[j])
+            } else if problem.is_integer(j) {
+                start[j].round().clamp(problem.col_lb[j], problem.col_ub[j])
             } else {
                 start[j].clamp(problem.col_lb[j], problem.col_ub[j])
             }
@@ -1662,36 +1750,62 @@ pub fn feasibility_jump(
         .collect();
 
     let tolerance = limits.feasibility_tolerance;
-    let movable: Vec<usize> = (0..n)
-        .filter(|&j| is_binary_column(problem, j) && problem.col_lb[j] < problem.col_ub[j])
+    let binary: Vec<bool> = (0..n).map(|j| is_binary_column(problem, j)).collect();
+    let can_move: Vec<bool> = (0..n)
+        .map(|j| problem.col_lb[j] < problem.col_ub[j] && !problem.matrix.column(j).0.is_empty())
         .collect();
+    let movable: Vec<usize> = (0..n).filter(|&j| can_move[j]).collect();
     if movable.is_empty() {
         return None;
     }
 
-    // What flipping `j` would do to the weighted violation, positive being an
-    // improvement.
+    // The value `j` would move to, and what that would do to the weighted violation,
+    // positive being an improvement. `events` is scratch for the jump.
     let gain_of = |j: usize,
                    assign: &[f64],
                    activity: &[f64],
                    violation: &[f64],
-                   weight: &[f64]|
-     -> f64 {
-        let step = 1.0 - 2.0 * assign[j];
+                   weight: &[f64],
+                   events: &mut Vec<(f64, f64)>|
+     -> (f64, f64) {
         let (rows, vals) = problem.matrix.column(j);
-        let mut gain = 0.0;
-        for (&i, &a) in rows.iter().zip(vals) {
-            let moved = activity[i] + a * step;
-            let after = row_violation(moved, problem.row_lb[i], problem.row_ub[i]);
-            gain += weight[i] * (violation[i] - after);
+        let change = |value: f64| -> f64 {
+            let step = value - assign[j];
+            rows.iter()
+                .zip(vals)
+                .map(|(&i, &a)| {
+                    let after = row_violation(activity[i] + a * step, problem.row_lb[i], problem.row_ub[i]);
+                    weight[i] * (violation[i] - after)
+                })
+                .sum()
+        };
+        if binary[j] {
+            let flipped = 1.0 - assign[j];
+            return (flipped, change(flipped));
         }
-        gain
+        let target = jump_target(problem, j, assign, activity, weight, events);
+        let target = if problem.is_integer(j) {
+            let (down, up) = (target.floor(), target.ceil());
+            let (down, up) = (
+                down.clamp(problem.col_lb[j], problem.col_ub[j]),
+                up.clamp(problem.col_lb[j], problem.col_ub[j]),
+            );
+            if change(up) > change(down) { up } else { down }
+        } else {
+            target
+        };
+        if (target - assign[j]).abs() <= 1e-12 {
+            return (target, 0.0);
+        }
+        (target, change(target))
     };
 
+    let mut events: Vec<(f64, f64)> = Vec::new();
     let mut gain: Vec<f64> = vec![0.0; n];
+    let mut target: Vec<f64> = vec![0.0; n];
     let mut heap: std::collections::BinaryHeap<Candidate> = std::collections::BinaryHeap::new();
     for &j in &movable {
-        gain[j] = gain_of(j, &assign, &activity, &violation, &weight);
+        (target[j], gain[j]) = gain_of(j, &assign, &activity, &violation, &weight, &mut events);
         heap.push(Candidate {
             gain: gain[j],
             column: j,
@@ -1780,10 +1894,11 @@ pub fn feasibility_jump(
             touched.sort_unstable();
             touched.dedup();
             for &k in &touched {
-                if problem.col_lb[k] >= problem.col_ub[k] || !is_binary_column(problem, k) {
+                if !can_move[k] {
                     continue;
                 }
-                gain[k] = gain_of(k, &assign, &activity, &violation, &weight);
+                (target[k], gain[k]) =
+                    gain_of(k, &assign, &activity, &violation, &weight, &mut events);
                 heap.push(Candidate {
                     gain: gain[k],
                     column: k,
@@ -1793,9 +1908,9 @@ pub fn feasibility_jump(
             continue;
         };
 
-        // Apply the flip and repair everything it touched.
-        let step = 1.0 - 2.0 * assign[j];
-        assign[j] += step;
+        // Apply the move and repair everything it touched.
+        let step = target[j] - assign[j];
+        assign[j] = target[j];
         let mut touched: Vec<usize> = Vec::new();
         let (rows, vals) = problem.matrix.column(j);
         for (&i, &a) in rows.iter().zip(vals) {
@@ -1809,10 +1924,10 @@ pub fn feasibility_jump(
         touched.sort_unstable();
         touched.dedup();
         for &k in &touched {
-            if problem.col_lb[k] >= problem.col_ub[k] || !is_binary_column(problem, k) {
+            if !can_move[k] {
                 continue;
             }
-            gain[k] = gain_of(k, &assign, &activity, &violation, &weight);
+            (target[k], gain[k]) = gain_of(k, &assign, &activity, &violation, &weight, &mut events);
             heap.push(Candidate {
                 gain: gain[k],
                 column: k,

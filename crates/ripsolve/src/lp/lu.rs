@@ -258,6 +258,69 @@ impl Lu {
         l_start.push(0);
         u_start.push(0);
 
+        // Entries the elimination reads or writes, for [`Lu::cost`].
+        let mut touched = 0usize;
+
+        // Column singletons first, all at once. A column with one entry pivots on it
+        // with no fill and no arithmetic -- its L part is empty, and its U row is just
+        // what the other columns hold in that row -- which is why Markowitz takes them
+        // first anyway, at a cost of zero. Taken one at a time through the elimination
+        // below, though, each one rebuilds every column its row touches, so a structural
+        // column of `k` nonzeros pays about `k^2` to lose its rows one logical at a time.
+        // On MIPLIB's `neos8`, 46324 rows and a basis of a few hundred dense structural
+        // columns among the logicals, that was 2e9 entries and 1.5 seconds a
+        // factorization. One sweep over the columns does the same in their nonzeros.
+        //
+        // Only the singletons the basis starts with, each on a row no earlier one has
+        // claimed; anything this leaves, the elimination handles as before.
+        let mut claimed_step = vec![usize::MAX; m];
+        for (j, col) in cols.iter().enumerate() {
+            if let [(i, v)] = col[..]
+                && claimed_step[i] == usize::MAX
+                && v.abs() > zero_tol
+            {
+                claimed_step[i] = prow.len();
+                row_done[i] = true;
+                col_done[j] = true;
+                prow.push(i);
+                pcol.push(j);
+                diag.push(v);
+                l_start.push(l_entries.len());
+            }
+        }
+        let singletons = prow.len();
+        if singletons > 0 {
+            // Each U row of a singleton step is its row's entries in the columns still
+            // live, gathered in one pass and then laid out in step order.
+            let mut rows_of: Vec<Vec<(usize, f64)>> = vec![Vec::new(); singletons];
+            for (j, col) in cols.iter_mut().enumerate() {
+                if col_done[j] {
+                    continue;
+                }
+                touched += col.len();
+                col.retain(|&(i, v)| {
+                    let step = claimed_step[i];
+                    if step == usize::MAX {
+                        return true;
+                    }
+                    rows_of[step].push((j, v));
+                    false
+                });
+            }
+            for row in rows_of {
+                u_entries.extend(row);
+                u_start.push(u_entries.len());
+            }
+            for j in 0..m {
+                if col_done[j] {
+                    cols[j].clear();
+                }
+            }
+            for &i in &prow {
+                row_nz[i] = 0;
+            }
+        }
+
         // `held` records which rows the column being updated already holds, stamped
         // per column so that it never has to be cleared. See the fill-in step below
         // for why.
@@ -279,10 +342,8 @@ impl Lu {
         // Elimination can only shorten a column by removing the pivot row, so this
         // moves down by one at a time and is corrected on the way past.
         let mut min_len = 0usize;
-        // Entries the elimination reads or writes, for [`Lu::cost`].
-        let mut touched = 0usize;
 
-        for step in 0..m {
+        for step in singletons..m {
             // One factorization is a single call to the caller, so the deadline has to
             // be read here or not at all until it finishes.
             if step.is_multiple_of(FACTOR_CLOCK_INTERVAL)

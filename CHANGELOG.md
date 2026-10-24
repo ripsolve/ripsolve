@@ -35,6 +35,36 @@
   `NodeLimit`, a limit nobody had set. It now keeps solving until the deadline, and
   reports `TimeLimit` if that comes first.
 
+### Performance
+
+General MIP, which the pure binary set does not exercise. Measured on instances from
+MIPLIB 2017's benchmark set that HiGHS and SCIP both close in seconds, at thirty
+seconds on one thread.
+
+- **Feasibility jump moves general integer and continuous columns.** It was binary
+  only, declining any model with a general integer and leaving continuous columns where
+  they started; now each such column jumps to the value in its range that minimises the
+  weighted violation of its rows. It finds a first point in under three seconds on
+  `neos-3381206-awhea`, `neos-1582420`, `neos-860300`, `app1-1` and `neos8`, none of
+  which had one. Binary columns flip as before.
+- **RINS at the root**, as soon as there is an incumbent, and not only every 500 nodes:
+  the models with a poor first point are often the ones whose nodes are slow enough
+  never to reach 500. Its neighbourhood is searched with the fixed columns removed from
+  the model rather than pinned in it. `beasleyC3` goes from 1783 to 807 against an
+  optimum of 754, and `neos-860300` from no point to 4161 against 3201.
+- **MIR cuts from equality rows, from rows combined to cancel continuous columns, and
+  from rows whose columns sit away from zero.** Equalities were skipped, which left a
+  network model's node balances uncut; combining rows is the aggregation of Marchand and
+  Wolsey; and a column with a nonzero lower bound, every time variable of a scheduling
+  model, is now measured from its nearer bound instead of keeping its row out.
+  `sp150x300d` closes at the root, 35 to 69, the optimum; `exp-1-500-5-5` closes where
+  it ended at a 48.6% gap; `neos-3381206-awhea` closes at 453.
+- **Factorizing a basis of mostly logicals is linear rather than quadratic.** The
+  column singletons a basis starts with are pivoted in one sweep before the Markowitz
+  elimination, which took them one at a time and rebuilt every column each one's row
+  touched. On `neos8`, 46324 rows, a factorization took 1.5 seconds; the root relaxation
+  goes from 52 seconds to 3.7, and the model now closes.
+
 ### Benchmarks
 
 - The pure binary MIPLIB set, 140 instances at sixty seconds, rerun with every answer

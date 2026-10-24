@@ -3139,6 +3139,39 @@ fn solve_once(
         heuristic_solutions += 1;
     }
 
+    // RINS at the root, and not only every `improvement_frequency` nodes in the tree.
+    // The models whose first point is poor are often the ones whose nodes are slow, and
+    // a schedule counted in nodes never reaches them: `drayage-100-23` holds its bound at
+    // the optimum from the root and a point five times worse for the whole minute, in
+    // four nodes, where HiGHS's sub-MIP at the root takes the same kind of point to the
+    // optimum in under a second. Repeated while it keeps improving, since each better
+    // point gives a different neighbourhood, and under the same guard as above.
+    for _ in 0..ROOT_RINS_ROUNDS {
+        if options.improvement_frequency == 0
+            || !improves(root_bound, incumbent, options.gap_tolerance)
+        {
+            break;
+        }
+        let Some(current) = incumbent_x.as_ref() else {
+            break;
+        };
+        let Some((objective, x)) = improve(
+            problem,
+            current,
+            incumbent,
+            &root.x,
+            &options,
+            remaining_of(options.time_limit, started).map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
+            separation,
+        )
+        .filter(|(_, x)| admitted(separation, x)) else {
+            break;
+        };
+        incumbent = objective;
+        incumbent_x = Some(x);
+        heuristic_solutions += 1;
+    }
+
     let mut status = Status::Optimal;
 
     let threads = options.threads.max(1);
@@ -3950,6 +3983,9 @@ const NEIGHBOURHOOD_CEILING: usize = 30;
 /// in none of three, the search having been left too little to certify what it holds.
 const NEIGHBOURHOOD_SHARE: f64 = 0.3;
 
+/// Root RINS passes at most, each from the point the last one found.
+const ROOT_RINS_ROUNDS: usize = 3;
+
 /// The share of the run a model with nothing to optimise gives its feasibility search.
 ///
 /// Most of it, because there is nothing else to spend it on. What is left over goes to
@@ -4179,8 +4215,30 @@ fn improve(
         return None;
     }
 
+    // With the fixed columns taken out of the model, not only pinned by their bounds.
+    // Presolve does not remove a fixed column, so the sub-search carried every one of
+    // them through every LP and every heuristic: `drayage-100-23`'s neighbourhood fixes
+    // 10651 of its 11025 integers and was searched at full size, finding nothing in 389
+    // nodes, where HiGHS reduces the same model to 292 columns and solves it in a fifth
+    // of a second. A separator reads the caller's column numbering, so with one the
+    // model is searched as it stands.
+    let compacted = if separation.is_none() {
+        match compact::compact(&neighbourhood, options.integrality_tolerance) {
+            Ok(pair) => pair,
+            // The neighbourhood contradicts itself, which says only that the incumbent
+            // and the relaxation agree on columns no point can hold at once.
+            Err(compact::Infeasible) => return None,
+        }
+    } else {
+        None
+    };
+    let (searched, compaction) = match &compacted {
+        Some((model, map)) => (model, Some(map)),
+        None => (&neighbourhood, None),
+    };
+
     let found = solve_separating(
-        &neighbourhood,
+        searched,
         Options {
             improvement_frequency: 0,
             max_nodes: options.improvement_nodes,
@@ -4203,8 +4261,20 @@ fn improve(
         separation,
     );
 
-    let x = found.x;
+    if found.x.len() != searched.n_cols() {
+        return None;
+    }
+    let x = match compaction {
+        Some(map) => map.expand(&found.x),
+        None => found.x,
+    };
     if x.len() != problem.n_cols() {
+        return None;
+    }
+    // Read back through the map, so checked rather than trusted; see `compact`.
+    if compaction.is_some()
+        && !heuristic::is_feasible(problem, &x, options.heuristic_limits.feasibility_tolerance)
+    {
         return None;
     }
     let objective = objective_at(problem, &x);
