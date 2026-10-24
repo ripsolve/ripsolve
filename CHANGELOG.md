@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed behaviour you will notice
+
+- **`--time-limit` counts from when the command starts**, so reading the model is part
+  of it. On a large file that is much of the wait: `neos-3402454-bohle`'s 346MB take
+  about twenty seconds to read, and a 60-second limit returned after 106s. It now
+  returns after 62s. The library's `Options::time_limit` is unchanged and still covers
+  the solve alone.
+
 ### Fixed
 
 - **Time limits held on models with very dense rows.** Three loops were quadratic in
@@ -13,6 +21,19 @@
   checks the deadline on every conflict, not every 64th.
 - Separating implied-bound cuts reads each clique once rather than once per column in
   it. The cuts are the same.
+- **The simplex reads the clock often enough on large LPs.** It read it every 256
+  pivots whatever the model's size, and a pivot on `neos-3402454-bohle` takes about a
+  tenth of a second, so half a minute could pass between readings. The interval now
+  shrinks with the LP's size, down to every pivot.
+- **A phase 1 that never ended on wide-ranging columns.** The primal ratio test leaves
+  out rows whose entry is too small to pivot on, and left them out of limiting the step
+  as well, so a step could push a feasible variable in such a row out of bounds. On
+  `leo1`, whose columns run from 1 to 9e7, phase 1 flipped one binary back and forth
+  for a million iterations; its relaxation now solves in 1103, and `leo2`'s in 1956.
+  Where the step was already feasible nothing changes.
+- A root relaxation that ran out of iterations before the deadline reported
+  `NodeLimit`, a limit nobody had set. It now keeps solving until the deadline, and
+  reports `TimeLimit` if that comes first.
 
 ### Benchmarks
 

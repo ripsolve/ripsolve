@@ -45,7 +45,8 @@ enum Command {
         /// Stop after this many nodes.
         #[arg(long)]
         max_nodes: Option<usize>,
-        /// Stop after this many seconds.
+        /// Stop after this many seconds, counted from when the command starts, so the
+        /// time spent reading the model is part of it.
         #[arg(long)]
         time_limit: Option<f64>,
         /// Relative optimality gap to stop at. 0 demands a proof of optimality.
@@ -193,13 +194,18 @@ fn main() -> Result<()> {
             symmetry,
             min_orbit,
         } => {
+            // The limit is what the caller waits for, and on a large file reading is a
+            // good part of the wait: `neos-3402454-bohle`'s 346MB take twenty seconds,
+            // which a limit counted from the start of the solve left out entirely.
+            let launched = std::time::Instant::now();
             let problem =
                 Problem::from_file(&path).with_context(|| format!("reading {}", path.display()))?;
             problem.validate()?;
 
             let options = Options {
                 max_nodes: max_nodes.unwrap_or(usize::MAX),
-                time_limit: time_limit.map(Duration::from_secs_f64),
+                time_limit: time_limit
+                    .map(|limit| Duration::from_secs_f64(limit).saturating_sub(launched.elapsed())),
                 gap_tolerance: gap,
                 presolve: !no_presolve,
                 node_propagation: !no_node_propagation,

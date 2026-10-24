@@ -34,8 +34,6 @@ use std::time::Instant;
 
 use crate::sparse::SparseMatrix;
 
-/// Pivots between clock checks. Small enough to bound the overrun, large enough
-/// that reading the clock does not show up in a profile.
 /// Singular-basis repairs between clock reads. Each repair costs a factorization, so
 /// this is far smaller than the interval between simplex iterations.
 const REPAIR_CLOCK_INTERVAL: usize = 8;
@@ -45,7 +43,13 @@ const REPAIR_CLOCK_INTERVAL: usize = 8;
 /// The pivot-count interval remains as a ceiling; this is what usually fires.
 const ETA_GROWTH_LIMIT: f64 = 1.0;
 
+/// Pivots between clock checks on a small LP. Small enough to bound the overrun, large
+/// enough that reading the clock does not show up in a profile.
 const CLOCK_INTERVAL: usize = 256;
+
+/// Rows and columns, summed, over which the pivots between clock checks are spread; see
+/// [`Lp::clock_interval`].
+const CLOCK_SPAN: usize = 1 << 20;
 
 /// Primal iterations after which pricing switches to devex; see [`Solver::consider_devex`].
 ///
@@ -506,6 +510,15 @@ impl Lp {
     /// The flag [`Lp::set_interrupt`] installed, for an LP built to replace this one.
     pub fn interrupt(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.interrupt.clone()
+    }
+
+    /// Pivots between clock checks: [`CLOCK_INTERVAL`] on a small LP, fewer on a large
+    /// one, down to every pivot. A pivot costs at least a pass over the rows and the
+    /// columns, so a fixed count is a fixed *time* only for one size of model. On
+    /// `neos-3402454-bohle` a pivot takes a tenth of a second, 256 of them were half a
+    /// minute between readings, and a 60 second limit returned at 106.
+    fn clock_interval(&self) -> usize {
+        (CLOCK_SPAN / (self.m + self.n_structural).max(1)).clamp(1, CLOCK_INTERVAL)
     }
 
     /// Has the budget run out, or has someone asked this to stop?
@@ -1300,12 +1313,22 @@ impl<'a> Solver<'a> {
         // Among ties, prefer the largest pivot: it is the numerically safest choice
         // and is the standard cheap defence against degenerate stalling.
         let mut best_pivot = 0.0;
+        // The nearest breakpoint among the rows too weak to pivot on, as (ratio, row,
+        // bound, pivot). Too weak to pivot on is not too weak to matter: the variable
+        // there still moves by its entry times the step, and a step taken past it puts
+        // a feasible variable outside its bounds. On `leo1`, whose columns run from 1 to
+        // 9e7, entries up to 9 fall under the filter; phase 1 flipped a binary across
+        // such a row, raising the infeasibility from 38 to 87, priced the flip back, and
+        // did that for a million iterations. So the step is taken to them when it would
+        // otherwise go past one by more than the tolerance, and only then.
+        let mut weak: Option<(f64, usize, At, f64)> = None;
 
         for i in 0..lp.m {
             let beta = self.alpha[i] * sigma;
-            if beta.abs() <= pivot_tol {
+            if beta.abs() <= lp.tol.pivot {
                 continue;
             }
+            let strong = beta.abs() > pivot_tol;
             let j = self.basic[i];
             let v = self.z[j];
             let (lo, hi) = (lp.lower[j], lp.upper[j]);
@@ -1352,6 +1375,14 @@ impl<'a> Solver<'a> {
             // otherwise produce a small negative ratio and a backwards step.
             let ratio = ((v - target) / beta).max(0.0);
             let pivot = self.alpha[i].abs();
+            if !strong {
+                if weak.is_none_or(|(held, _, _, p)| {
+                    ratio < held - 1e-12 || (ratio <= held + 1e-12 && pivot > p)
+                }) {
+                    weak = Some((ratio, i, to, pivot));
+                }
+                continue;
+            }
             let ties = ratio <= best + 1e-12;
             let wins_tie = if bland {
                 chosen.is_none_or(|(prev, _)| j < self.basic[prev])
@@ -1365,6 +1396,12 @@ impl<'a> Solver<'a> {
                 chosen = Some((i, to));
                 best_pivot = pivot;
             }
+        }
+        if let Some((ratio, row, to, pivot)) = weak
+            && (best - ratio) * pivot > tol
+        {
+            best = ratio;
+            chosen = Some((row, to));
         }
 
         match chosen {
@@ -1775,10 +1812,11 @@ impl<'a> Solver<'a> {
         let mut degenerate = 0usize;
         let mut bland_run = BLAND_RUN;
 
+        // Polled rather than checked every pivot: reading the clock is not free, and on
+        // a small LP a pivot costs little more.
+        let clock = self.lp.clock_interval();
         while *iterations < max_iterations {
-            // Polled rather than checked every pivot: reading the clock is not free,
-            // and this granularity bounds the overrun to a few hundred pivots.
-            if iterations.is_multiple_of(CLOCK_INTERVAL) && self.lp.out_of_time() {
+            if iterations.is_multiple_of(clock) && self.lp.out_of_time() {
                 return Some(LpStatus::IterationLimit);
             }
             let bland = stalled > STALL_LIMIT;
@@ -2336,8 +2374,9 @@ impl<'a> Solver<'a> {
             }
         }
 
+        let clock = self.lp.clock_interval();
         while iterations < max_iterations {
-            if iterations.is_multiple_of(CLOCK_INTERVAL) && self.lp.out_of_time() {
+            if iterations.is_multiple_of(clock) && self.lp.out_of_time() {
                 return self.done(LpStatus::IterationLimit, iterations);
             }
             let phase_one = self.worst_violation() > slack;

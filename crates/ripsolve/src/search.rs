@@ -2795,11 +2795,20 @@ fn solve_once(
     // deadline, so the last resort is the first attempt continued to it. Without this a
     // model whose rescues are cheap and hopeless returns at 41 seconds of a 60 second
     // budget, having given up with a third of the run unspent.
-    if root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
+    //
+    // Continued to it, not for one more helping of the per-node iteration cap: that cap
+    // is for a node, and the root has nothing to fall back on. `leo1` spent its 100000
+    // iterations at 53 seconds of 60 and reported NodeLimit, a limit nobody had set.
+    // Only while it stops at the cap and is still moving, since any other status will
+    // be the same on every further try.
+    while root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
         let again = lp.solve_with_limit(options.max_iterations_per_node);
         iterations += again.iterations;
+        let stuck = again.status != LpStatus::IterationLimit || again.iterations == 0;
         if again.status == LpStatus::Optimal {
             root = again;
+        } else if stuck || deadline.is_none() {
+            break;
         }
     }
     nodes += 1;
