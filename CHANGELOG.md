@@ -19,6 +19,11 @@
   60-second limit returned after 285s and now returns after 63s; `nw04` at a 10-second
   limit on one thread ran to 14s and now stops on time. The conflict-driven search also
   checks the deadline on every conflict, not every 64th.
+- **A search stopped by the clock no longer says NodeLimit.** A node whose LP runs into
+  the deadline is skipped, and when the skipped nodes were the last ones the tree
+  emptied and reported a node limit nobody had set. Five of MIPLIB's benchmark
+  instances did this at 60 seconds, among them `tbfp-network` and `eilA101-2`; they
+  now report TimeLimit.
 - Separating implied-bound cuts reads each clique once rather than once per column in
   it. The cuts are the same.
 - **The simplex reads the clock often enough on large LPs.** It read it every 256

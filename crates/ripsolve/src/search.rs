@@ -1689,7 +1689,16 @@ fn run_parallel(
                 options.gap_tolerance,
             ) =>
         {
-            Status::NodeLimit
+            // Nodes are skipped when their LP runs into the deadline too; see the
+            // serial driver.
+            if options
+                .time_limit
+                .is_some_and(|limit| started.elapsed() >= limit)
+            {
+                Status::TimeLimit
+            } else {
+                Status::NodeLimit
+            }
         }
         _ => Status::Optimal,
     };
@@ -3359,10 +3368,19 @@ fn solve_once(
         // and must not say it has -- unless the incumbent has since overtaken every
         // bound it skipped, which is the same test the search applies before opening a
         // node at all.
+        // A node is skipped when its LP runs into the deadline, too, and a tree
+        // emptied that way stopped on the clock, not on a node limit nobody set.
         (Status::Optimal, _)
             if unresolved > 0 && improves(unresolved_bound, incumbent, options.gap_tolerance) =>
         {
-            Status::NodeLimit
+            if options
+                .time_limit
+                .is_some_and(|limit| started.elapsed() >= limit)
+            {
+                Status::TimeLimit
+            } else {
+                Status::NodeLimit
+            }
         }
         (Status::Optimal, None) => Status::Infeasible,
         (other, _) => other,
