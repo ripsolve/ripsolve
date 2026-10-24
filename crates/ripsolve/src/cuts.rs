@@ -1102,8 +1102,17 @@ fn substitute_bounds(
         };
         // Closer to the variable upper bound than to zero is the standard test: it is
         // the end the relaxation is leaning on, so it is the one worth rewriting.
+        //
+        // A tie goes by the coefficient's sign, and a tie is the common case: an arc
+        // carrying nothing, its binary at zero, is at both ends at once. A negative
+        // coefficient is substituted, putting weight on the binary for the rounding to
+        // act on; a positive one stays, and drops out of the cut. Leaving every tie as
+        // it stood gave `p200x1188c` cuts like `y + 0.5 x' + ... >= 1` where the cut wanted
+        // is `y + y' + ... >= 1`, and MIR rounds took its root from 5679 to 5842; deciding
+        // ties this way takes it to 14329, against an optimum of 15078.
         let ceiling = vub.factor * x[vub.binary];
-        if ceiling - x[j] >= x[j] {
+        let lean = (ceiling - x[j]) - x[j];
+        if lean > TOL || (lean >= -TOL && a > 0.0) {
             coefficients.push((Term::Column(j), a));
             continue;
         }
@@ -3211,6 +3220,35 @@ mod tests {
         (p.col_lb[0], p.col_ub[0]) = (1000.0, 1060.0);
         (p.col_lb[1], p.col_ub[1]) = (1010.0, 1040.0);
         assert!(assert_mir_is_valid(&p, "time window") > 0, "no cut from the time window row");
+    }
+
+    #[test]
+    fn mir_puts_idle_arcs_on_their_binaries() {
+        // A node shipping 2 out along three arcs of capacity 10, each opened by a
+        // binary: `x0 + x1 + x2 = 2`, `x_k <= 10 y_k`. The relaxation sends it all down
+        // arc 0 with that arc a fifth open and the others idle. The cut wanted is
+        // `y0 + y1 + y2 >= 1`; leaving the idle arcs as flow gave `y0 + x1/2 + x2/2 >= 1`
+        // instead, which the next relaxation satisfies by moving the flow.
+        let mut p = problem(
+            &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &[
+                (&[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], RowSense::Eq, 2.0),
+                (&[1.0, 0.0, 0.0, -10.0, 0.0, 0.0], RowSense::Le, 0.0),
+                (&[0.0, 1.0, 0.0, 0.0, -10.0, 0.0], RowSense::Le, 0.0),
+                (&[0.0, 0.0, 1.0, 0.0, 0.0, -10.0], RowSense::Le, 0.0),
+            ],
+        );
+        for j in 0..3 {
+            p.col_type[j] = crate::model::VarType::Continuous;
+            p.col_ub[j] = 10.0;
+        }
+        let x = [2.0, 0.0, 0.0, 0.2, 0.0, 0.0];
+        let cuts = separate_mir(&p, &x, 10);
+        let wanted = cuts.iter().any(|cut| {
+            let on = |j: usize| cut.coefficients.iter().any(|&(k, a)| k == j && a.abs() > 1e-9);
+            (3..6).all(on) && !(1..3).any(on)
+        });
+        assert!(wanted, "no cut on the three binaries alone: {cuts:?}");
     }
 
     #[test]

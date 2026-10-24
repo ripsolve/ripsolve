@@ -1549,6 +1549,14 @@ const JUMP_STALL: usize = 30_000;
 /// How far the candidate queue may outgrow the columns before it is rebuilt.
 const STALE_FACTOR: usize = 8;
 
+/// `value` brought within `[lo, hi]`, `hi` winning should the two cross.
+///
+/// A column's bounds can arrive crossed by rounding, `[25, 24.999999999999986]` on
+/// `h80x6320d`, and `f64::clamp` panics on that rather than pick one.
+fn within(value: f64, lo: f64, hi: f64) -> f64 {
+    value.max(lo).min(hi)
+}
+
 /// The value of column `j` minimising the weighted violation of its rows, within its
 /// bounds, with every other column held.
 ///
@@ -1604,13 +1612,13 @@ fn jump_target(
                 // Flat from here to the next breakpoint.
                 let end = events.get(index + 1).map_or(f64::INFINITY, |e| e.0);
                 if current >= at && current <= end {
-                    return current.clamp(lo, hi);
+                    return within(current, lo, hi);
                 }
             }
-            return at.clamp(lo, hi);
+            return within(at, lo, hi);
         }
     }
-    current.clamp(lo, hi)
+    within(current, lo, hi)
 }
 
 /// A row's distance from being satisfied.
@@ -1665,7 +1673,7 @@ pub fn corners(problem: &Problem, limits: &Limits) -> Option<Incumbent> {
                 if value.is_finite() {
                     value
                 } else {
-                    0.0f64.clamp(lo, hi)
+                    within(0.0f64, lo, hi)
                 }
             })
             .collect();
@@ -1730,11 +1738,11 @@ pub fn feasibility_jump(
         .map(|j| {
             if is_binary_column(problem, j) {
                 let rounded: f64 = if start[j] > 0.5 { 1.0 } else { 0.0 };
-                rounded.clamp(problem.col_lb[j], problem.col_ub[j])
+                within(rounded, problem.col_lb[j], problem.col_ub[j])
             } else if problem.is_integer(j) {
-                start[j].round().clamp(problem.col_lb[j], problem.col_ub[j])
+                within(start[j].round(), problem.col_lb[j], problem.col_ub[j])
             } else {
-                start[j].clamp(problem.col_lb[j], problem.col_ub[j])
+                within(start[j], problem.col_lb[j], problem.col_ub[j])
             }
         })
         .collect();
@@ -1787,8 +1795,8 @@ pub fn feasibility_jump(
         let target = if problem.is_integer(j) {
             let (down, up) = (target.floor(), target.ceil());
             let (down, up) = (
-                down.clamp(problem.col_lb[j], problem.col_ub[j]),
-                up.clamp(problem.col_lb[j], problem.col_ub[j]),
+                within(down, problem.col_lb[j], problem.col_ub[j]),
+                within(up, problem.col_lb[j], problem.col_ub[j]),
             );
             if change(up) > change(down) { up } else { down }
         } else {

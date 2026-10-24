@@ -24,6 +24,15 @@
   emptied and reported a node limit nobody had set. Five of MIPLIB's benchmark
   instances did this at 60 seconds, among them `tbfp-network` and `eilA101-2`; they
   now report TimeLimit.
+- **A pass that stopped to restart no longer claims to be optimal.** The serial search
+  left its status as it stood when it broke off to restart with nodes still open. The
+  restart loop discarded it, but a pass that settled its model is now the answer rather
+  than a reason to restart, and that exposed it: `h80x6320d` reported an optimum of 6386
+  against MIPLIB's 6382. The search also asks whether to restart only of a node it would
+  solve, so a root whose cuts had closed the gap ends the search instead.
+- **Feasibility jump no longer panics on crossed bounds.** A column whose bounds arrive
+  crossed by rounding, `[25, 24.999999999999986]` on `h80x6320d`, made `f64::clamp`
+  panic.
 - Separating implied-bound cuts reads each clique once rather than once per column in
   it. The cuts are the same.
 - **The simplex reads the clock often enough on large LPs.** It read it every 256
@@ -64,6 +73,13 @@ seconds on one thread.
   model, is now measured from its nearer bound instead of keeping its row out.
   `sp150x300d` closes at the root, 35 to 69, the optimum; `exp-1-500-5-5` closes where
   it ended at a 48.6% gap; `neos-3381206-awhea` closes at 453.
+- **MIR puts idle fixed-charge arcs on their binaries.** A continuous column with a
+  variable upper bound was substituted only when strictly nearer that bound than zero,
+  and an arc carrying nothing with its binary off is at both at once, so every idle arc
+  stayed as flow and the cuts read `y + x'/2 + ... >= 1`, which the next relaxation
+  escapes by moving the flow. Ties now go by the coefficient's sign. `p200x1188c`'s root
+  goes from 7954 to 15078, the optimum, and the model closes in 6 seconds at 60 on 12
+  threads; `cbs-cta` closes in 29; `h80x6320d` ends at a 1% gap where it ended at 17%.
 - **Factorizing a basis of mostly logicals is linear rather than quadratic.** The
   column singletons a basis starts with are pivoted in one sweep before the Markowitz
   elimination, which took them one at a time and rebuilt every column each one's row

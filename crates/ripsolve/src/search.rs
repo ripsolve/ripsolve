@@ -1606,17 +1606,17 @@ fn run_parallel(
                             shared.offer(value, x);
                         }
                     }
-                    // Whatever the incumbent has proved since this pass began is worth
-                    // more spent on a smaller model than on this one; see `solve`.
-                    if worker.wants_restart(shared.incumbent(), &options) {
-                        shared.stopped.store(STOP_RESTART, Ordering::Relaxed);
-                        shared.give_back(vec![node]);
-                        continue;
-                    }
-
                     let best = shared.incumbent();
                     if !improves(node.bound, best, options.gap_tolerance) {
                         shared.give_back(Vec::new());
+                        continue;
+                    }
+                    // Whatever the incumbent has proved since this pass began is worth
+                    // more spent on a smaller model than on this one; see `solve`. Asked
+                    // only of a node that would be solved; see the serial driver.
+                    if worker.wants_restart(best, &options) {
+                        shared.stopped.store(STOP_RESTART, Ordering::Relaxed);
+                        shared.give_back(vec![node]);
                         continue;
                     }
 
@@ -2458,7 +2458,15 @@ fn restart_loop(
             .is_some_and(|limit| started.elapsed() >= limit);
         let settled = mailbox.is_some_and(Mailbox::is_proved);
         let wanted_restart = attempt.restart.is_some();
-        let Some(narrowed) = attempt.restart.filter(|_| !out_of_time && !settled) else {
+        // A pass that settled its model is the answer: the narrowed model holds only
+        // what the incumbent proved, so its optimum is this one's. Restarting anyway
+        // threw that away on `p200x1188c`, whose root cuts reach the optimum: the pass
+        // reported optimal at 8.9 seconds, restarted twice, and the third pass ran to
+        // the time limit and reported no bound at all.
+        let finished = matches!(solution.status, Status::Optimal | Status::Infeasible);
+        let Some(narrowed) =
+            attempt.restart.filter(|_| !out_of_time && !settled && !finished)
+        else {
             // A pass that stopped to restart says NodeLimit, which is true only if the
             // restart then happens. When the clock has run out instead, what ended the
             // solve was the time limit, and a caller told NodeLimit goes looking for a
@@ -3286,15 +3294,21 @@ fn solve_once(
             open.push(node);
             break;
         }
-        if worker.wants_restart(incumbent, &options) {
-            restart_wanted = true;
-            open.push(node);
-            break;
-        }
         // The parent's bound may have been overtaken by an incumbent found since
         // this node was pushed, in which case it needs no solve at all.
         if !improves(node.bound, incumbent, options.gap_tolerance) {
             continue;
+        }
+        // Asked only of a node that would be solved: one already pruned is no reason
+        // to start over, and asked first, a root whose cuts had closed the gap
+        // restarted rather than ending the search.
+        if worker.wants_restart(incumbent, &options) {
+            // Not an answer, as in the parallel driver: nodes are still open, and the
+            // status left as it stood would claim the tree was exhausted.
+            status = Status::NodeLimit;
+            restart_wanted = true;
+            open.push(node);
+            break;
         }
 
         nodes += 1;
