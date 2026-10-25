@@ -9,9 +9,29 @@
   about twenty seconds to read, and a 60-second limit returned after 106s. It now
   returns after 62s. The library's `Options::time_limit` is unchanged and still covers
   the solve alone.
+- **Heuristics run on work budgets, not shares of the time limit.** The feasibility
+  jump is given work in proportion to the model's nonzeros, and the RINS and reduced
+  cost neighbourhood searches a number of simplex iterations scaled from the root
+  relaxation, with ten cut rounds at their roots. The time shares they had remain as
+  backstops. What they find no longer depends on the limit or on how busy the machine
+  is wherever the run has time to spare: `mc11` at 60 seconds on one thread, run
+  twice under load, now finds the same points in the same order. Where the root's own
+  cut loop runs into its share of the limit, which on short runs is common, results
+  still vary, so at 30 seconds two runs agree about as often as before. Over 54
+  instances at 30 seconds `drayage-100-23` goes from 506846 to 178247, `n5-3` from
+  9331 to 8938 and `neos-911970` from 56.87 to 55.33; none is worse beyond what
+  repeated runs of one build show.
+  `Options` gains `deadline`, a moment to stop at that nothing takes a share of,
+  `max_iterations` and `improvement_iterations`.
 
 ### Fixed
 
+- **A bound proven before a restart is kept.** A later pass that stopped before proving
+  a bound of its own reported none: `h80x6320d` at 30 seconds on one thread said "no
+  bound proven" after its first pass had proven 6344, and now reports a gap of 1.55%.
+- **The feasibility jump reads the clock by work done, not by moves.** A move on a
+  dense model rescores thousands of columns, and 512 moves between readings took
+  `ns1952667` to 64 seconds against a 60-second limit. It now stops at 60.1.
 - **Time limits held on models with very dense rows.** Three loops were quadratic in
   row length and none of them checked the clock: coefficient tightening in presolve
   recomputed a row's activity for every entry, and the conflict-driven search and the

@@ -1724,9 +1724,30 @@ pub fn feasibility_jump(
     max_moves: usize,
     deadline: Option<std::time::Instant>,
 ) -> Option<Incumbent> {
-    // Checked on a stride: the clock is far more expensive than a flip, and a stride
-    // this size is well under a second's worth of work on the largest model here.
-    const CLOCK_STRIDE: usize = 512;
+    let mut budget = usize::MAX;
+    feasibility_jump_within(problem, start, limits, max_moves, &mut budget, deadline)
+}
+
+/// [`feasibility_jump`] on a budget of work, counted in columns scored and taken from
+/// `budget`, which is left holding what the attempt did not spend.
+///
+/// Work rather than time, so that what it finds does not depend on how busy the machine
+/// is: two runs given the same budget make the same moves. The deadline is still read,
+/// but as a backstop for the run's own end, not as the budget.
+pub fn feasibility_jump_within(
+    problem: &Problem,
+    start: &[f64],
+    limits: &Limits,
+    max_moves: usize,
+    budget: &mut usize,
+    deadline: Option<std::time::Instant>,
+) -> Option<Incumbent> {
+    // Checked on a stride of work rather than of moves: the clock is far more expensive
+    // than a move, but a move costs a rescoring of every column in the rows it touches,
+    // and on a dense model that is nearly all of them. Counted in moves, 512 of them
+    // between readings took `ns1952667`, 41 rows over 13264 columns at 62% density, to
+    // 29 seconds against a limit of 20 before the relaxation was ever solved.
+    const CLOCK_STRIDE: usize = 1 << 18;
     let n = problem.n_cols();
     let m = problem.n_rows();
     // The matrix is held by column, so a column's rows and coefficients are already
@@ -1829,7 +1850,15 @@ pub fn feasibility_jump(
     let mut best = total;
     let mut since_improved = 0usize;
     let mut moves = 0usize;
-    while moves < max_moves {
+    // Work done, the first scoring of every column included, and how much more before
+    // the clock is read again. Scoring a column reads each of its entries, so that is
+    // what is counted, one more for the column itself, and so is gathering the columns
+    // of the rows a move touches. Counted in columns scored alone, the rate on
+    // `ns1952667`, whose rows are long, was a twentieth of that elsewhere.
+    let cost: Vec<usize> = (0..n).map(|j| 1 + problem.matrix.column(j).0.len()).collect();
+    let mut work: usize = movable.iter().map(|&j| cost[j]).sum();
+    let mut next_reading = 0usize;
+    while moves < max_moves && work < *budget {
         if total <= tolerance {
             break;
         }
@@ -1837,10 +1866,11 @@ pub fn feasibility_jump(
         // columns of the rows it touches, which on a dense model is thousands of them.
         // Without this `mitre` spends 34 seconds here against a limit of 20 and never
         // reaches the relaxation at all.
-        if moves.is_multiple_of(CLOCK_STRIDE)
-            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
-        {
-            break;
+        if work >= next_reading {
+            next_reading = work + CLOCK_STRIDE;
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                break;
+            }
         }
         if total < best - 1e-9 {
             best = total;
@@ -1899,8 +1929,10 @@ pub fn feasibility_jump(
             if touched.is_empty() {
                 break;
             }
+            work += touched.len();
             touched.sort_unstable();
             touched.dedup();
+            work += touched.iter().map(|&k| cost[k]).sum::<usize>();
             for &k in &touched {
                 if !can_move[k] {
                     continue;
@@ -1929,8 +1961,10 @@ pub fn feasibility_jump(
             let (cols, _) = csr.column(i);
             touched.extend_from_slice(cols);
         }
+        work += touched.len();
         touched.sort_unstable();
         touched.dedup();
+        work += touched.iter().map(|&k| cost[k]).sum::<usize>();
         for &k in &touched {
             if !can_move[k] {
                 continue;
@@ -1944,10 +1978,11 @@ pub fn feasibility_jump(
         moves += 1;
     }
 
+    *budget = budget.saturating_sub(work);
     let found = is_feasible(problem, &assign, tolerance);
     if std::env::var("RIPSOLVE_JUMP_TRACE").is_ok() {
         eprintln!(
-            "JUMP moves={moves} cols={} nnz={} violation={total:.6} found={found}",
+            "JUMP moves={moves} work={work} cols={} nnz={} violation={total:.6} found={found}",
             problem.n_cols(),
             problem.matrix.nnz(),
         );

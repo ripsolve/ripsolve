@@ -27,7 +27,7 @@ use crate::cuts::{self, Conflicts};
 use crate::compact;
 use crate::heuristic::{self, Limits, Schedule};
 use crate::lp::{BasisState, Lp, LpSolution, LpStatus};
-use crate::model::Problem;
+use crate::model::{Problem, Sense};
 use crate::sparse::SparseMatrix;
 use crate::presolve::{self, Outcome};
 use crate::symmetry::{self, OrbitScratch, Symmetry};
@@ -50,6 +50,17 @@ pub enum Status {
 pub struct Options {
     pub max_nodes: usize,
     pub time_limit: Option<Duration>,
+    /// A moment to stop at, in addition to the time limit.
+    ///
+    /// Unlike the time limit, nothing inside the search takes a share of this: the
+    /// cut loop, presolve and the feasibility search size themselves from the time
+    /// limit and from their own work limits, and this only ends them. It is what an
+    /// improvement search is given, so that what it finds is decided by its work
+    /// budget rather than by how much of the caller's minute was left.
+    pub deadline: Option<Instant>,
+    /// Simplex iterations the whole search may spend, the root's included, before it
+    /// stops as at a node limit.
+    pub max_iterations: usize,
     /// A relaxation value within this of an integer counts as integral.
     pub integrality_tolerance: f64,
     /// Stop once `(incumbent - bound) / |incumbent|` falls to this.
@@ -184,7 +195,7 @@ pub struct Options {
     /// Per column because a flip is a column: an absolute count is a different budget
     /// on every model, and on the large ones it is no budget at all. What bounds a run
     /// that is going nowhere is the stall cutoff inside the search, and what bounds the
-    /// whole of it is the deadline.
+    /// whole of it is `JUMP_BUDGET`.
     pub jump_moves: usize,
     /// Rounds of cut separation at the root. Zero disables cuts.
     ///
@@ -264,6 +275,9 @@ pub struct Options {
     pub improvement_frequency: usize,
     /// Nodes an improvement search may spend before giving the budget back.
     pub improvement_nodes: usize,
+    /// Simplex iterations an improvement search may spend. Zero, the default, derives
+    /// it from the root relaxation; see `SUB_ITERATIONS_PER_ROOT`.
+    pub improvement_iterations: usize,
     /// Base node interval between in-tree heuristic attempts. Zero disables them.
     ///
     /// This is a starting point, not a fixed cadence: the interval doubles after
@@ -308,6 +322,8 @@ impl Default for Options {
         Self {
             max_nodes: usize::MAX,
             time_limit: None,
+            deadline: None,
+            max_iterations: usize::MAX,
             integrality_tolerance: 1e-6,
             gap_tolerance: 1e-4,
             max_iterations_per_node: 100_000,
@@ -332,6 +348,7 @@ impl Default for Options {
             plunge_limit: 0,
             improvement_frequency: 500,
             improvement_nodes: 2_000,
+            improvement_iterations: 0,
             heuristic_frequency: 100,
             heuristic_limits: Limits::default(),
             strong_branching_budget: 0,
@@ -1586,10 +1603,7 @@ fn run_parallel(
                         shared.give_back(vec![node]);
                         continue;
                     }
-                    if options
-                        .time_limit
-                        .is_some_and(|limit| started.elapsed() >= limit)
-                    {
+                    if options.deadline.is_some_and(|d| Instant::now() >= d) {
                         shared.stopped.store(STOP_TIME, Ordering::Relaxed);
                         shared.give_back(vec![node]);
                         continue;
@@ -1654,7 +1668,7 @@ fn run_parallel(
                                 value,
                                 relaxation,
                                 &options,
-                                remaining_of(options.time_limit, started),
+                                remaining_until(options.deadline),
                                 separation,
                             )
                             && admitted(separation, &x)
@@ -1691,10 +1705,7 @@ fn run_parallel(
         {
             // Nodes are skipped when their LP runs into the deadline too; see the
             // serial driver.
-            if options
-                .time_limit
-                .is_some_and(|limit| started.elapsed() >= limit)
-            {
+            if options.deadline.is_some_and(|d| Instant::now() >= d) {
                 Status::TimeLimit
             } else {
                 Status::NodeLimit
@@ -2275,6 +2286,12 @@ fn solve_all_restarts(
     separation: Option<&Separation>,
 ) -> Solution {
     let started = Instant::now();
+    // From here on the time limit is read for the shares sized from it, and the
+    // deadline for when to stop.
+    let options = Options {
+        deadline: earliest(options.deadline, options.time_limit.map(|limit| started + limit)),
+        ..options
+    };
     let beside = options.cdcl && (0..problem.n_cols()).any(|j| problem.is_binary(j));
     let mailbox = Mailbox::default();
     let mut solution = std::thread::scope(|scope| {
@@ -2372,7 +2389,8 @@ fn search_beside(problem: &Problem, options: Options, started: Instant, mailbox:
     let mut model = problem.clone();
     let presolve_deadline = options
         .time_limit
-        .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
+        .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE))
+        .or(options.deadline);
     if options.presolve
         && presolve::presolve_until(&mut model, 20, presolve_deadline) == Outcome::Infeasible
     {
@@ -2392,7 +2410,7 @@ fn search_beside(problem: &Problem, options: Options, started: Instant, mailbox:
         next,
         cdcl::Limits {
             max_conflicts: CDCL_CONFLICTS,
-            deadline: options.time_limit.map(|limit| started + limit),
+            deadline: options.deadline,
             export_length: 0,
             export_count: 0,
             stall_conflicts: CDCL_STALL,
@@ -2442,9 +2460,37 @@ fn restart_loop(
         })
         .map(|x| (objective_at(problem, x), x.to_vec()));
     let (mut nodes, mut iterations, mut heuristics) = (0usize, 0usize, 0usize);
+    // The best bound any pass has proven, in the user's sense. Each pass's model is the
+    // last one with only fixings the incumbent justified, so a bound proven on any of
+    // them holds for the original; a later pass that stops before proving one of its
+    // own must not report that nothing was. On `h80x6320d` at 30 seconds the first pass
+    // proved 6344 and the run reported no bound at all.
+    let mut proven = f64::NAN;
+    let minimize = problem.sense == Sense::Minimize;
+    let carry = |proven: &mut f64, solution: &mut Solution| {
+        let mut bound = match (proven.is_nan(), solution.bound.is_nan()) {
+            (true, _) => solution.bound,
+            (false, true) => *proven,
+            _ if minimize => proven.max(solution.bound),
+            _ => proven.min(solution.bound),
+        };
+        // Not when nothing is proven: `min` and `max` pass over a NaN, and the
+        // incumbent would come back as a bound nobody proved.
+        if let Some(objective) = solution.objective
+            && !bound.is_nan()
+        {
+            bound = if minimize { bound.min(objective) } else { bound.max(objective) };
+        }
+        solution.bound = bound;
+        *proven = bound;
+    };
     for _ in 0..=MAX_RESTARTS {
         let current = model.as_ref().unwrap_or(problem);
-        let attempt = solve_once(current, options, started, seed.take(), mailbox, separation);
+        let pass = Options {
+            max_iterations: options.max_iterations.saturating_sub(iterations),
+            ..options
+        };
+        let attempt = solve_once(current, pass, started, seed.take(), mailbox, separation);
         // The counters belong to the whole solve, not to the last pass of it.
         nodes += attempt.solution.nodes;
         iterations += attempt.solution.simplex_iterations;
@@ -2453,9 +2499,8 @@ fn restart_loop(
         solution.nodes = nodes;
         solution.simplex_iterations = iterations;
         solution.heuristic_solutions = heuristics;
-        let out_of_time = options
-            .time_limit
-            .is_some_and(|limit| started.elapsed() >= limit);
+        carry(&mut proven, &mut solution);
+        let out_of_time = options.deadline.is_some_and(|d| Instant::now() >= d);
         let settled = mailbox.is_some_and(Mailbox::is_proved);
         let wanted_restart = attempt.restart.is_some();
         // A pass that settled its model is the answer: the narrowed model holds only
@@ -2488,7 +2533,10 @@ fn restart_loop(
     // Out of restarts. One more pass, and whatever it says is the answer.
     let attempt = solve_once(
         model.as_ref().unwrap_or(problem),
-        options,
+        Options {
+            max_iterations: options.max_iterations.saturating_sub(iterations),
+            ..options
+        },
         started,
         seed,
         mailbox,
@@ -2498,6 +2546,7 @@ fn restart_loop(
     solution.nodes += nodes;
     solution.simplex_iterations += iterations;
     solution.heuristic_solutions += heuristics;
+    carry(&mut proven, &mut solution);
     solution
 }
 
@@ -2521,7 +2570,8 @@ fn solve_once(
         // column. This catches a pathological model, not the ordinary case.
         let presolve_deadline = options
             .time_limit
-            .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE));
+            .map(|limit| started + limit.mul_f64(PRESOLVE_SHARE))
+        .or(options.deadline);
         match presolve::presolve_with(&mut reduced, 20, presolve_deadline, separation.is_none()) {
             Outcome::Infeasible => {
                 return Attempt {
@@ -2578,7 +2628,7 @@ fn solve_once(
     });
     // The budget belongs to the LP as well as the node loop. Checking only between
     // nodes is no limit at all once a single solve outlives the whole budget.
-    let deadline = options.time_limit.map(|limit| started + limit);
+    let deadline = options.deadline;
     lp.set_deadline(deadline);
     // A proof from the search beside the tree stops every LP of this solve, the node LPs
     // included, since the workers' LPs are clones of this one.
@@ -2609,7 +2659,7 @@ fn solve_once(
     // from 0.27 seconds to 11.5 and `mod010` from 0.78 to 12.9, on instances whose own
     // heuristics find a point in under a second. Asked only after those have failed, it
     // costs nothing on either.
-    let jump = |from: Option<&[f64]>, elapsed_share: f64| -> Option<heuristic::Incumbent> {
+    let jump = |from: Option<&[f64]>, allowance: JumpBudget| -> Option<heuristic::Incumbent> {
         if options.heuristic_frequency == 0 {
             return None;
         }
@@ -2622,15 +2672,19 @@ fn solve_once(
                 None => 0.0f64.clamp(problem.col_lb[j], problem.col_ub[j]),
             })
             .collect();
-        // From now rather than from the start of the run. This is asked for late, after
-        // the relaxation and the cutting and the whole chain above it have had their
-        // turn, and a budget measured from the beginning of a minute has already been
-        // spent by the time it is reached: every instance this heuristic wins came back
-        // empty when the deadline was anchored that way, having been given no time at
-        // all rather than too little.
+        // In work, so that two runs of the same model make the same moves and find the
+        // same point; see `JumpBudget`. Across every attempt rather than per attempt,
+        // since the restarts are what a model that will not yield spends it on.
+        let mut budget = allowance.of(problem);
+        // The backstop, from now rather than from the start of the run. This is asked
+        // for late, after the relaxation and the cutting and the whole chain above it
+        // have had their turn, and a budget measured from the beginning of a minute has
+        // already been spent by the time it is reached: every instance this heuristic
+        // wins came back empty when the deadline was anchored that way, having been
+        // given no time at all rather than too little.
         let jump_deadline = options
             .time_limit
-            .map(|limit| Instant::now() + limit.mul_f64(elapsed_share))
+            .map(|limit| Instant::now() + limit.mul_f64(allowance.backstop))
             .or(deadline);
         // Never past the run's own end.
         let jump_deadline = match (jump_deadline, deadline) {
@@ -2685,7 +2739,7 @@ fn solve_once(
             let moves = options
                 .jump_moves
                 .min(JUMP_UNIT << luby_exponent(attempt).min(usize::BITS as usize - 8));
-            let found = heuristic::feasibility_jump(
+            let found = heuristic::feasibility_jump_within(
                 problem,
                 &from,
                 &options.heuristic_limits,
@@ -2694,16 +2748,17 @@ fn solve_once(
                 // and two hundred and fifty on a model of a hundred, which is the same
                 // mistake this file complains about elsewhere. What actually bounds a
                 // run that is going nowhere is the stall cutoff inside the search, and
-                // what bounds the whole of it is the deadline; this is the third guard
+                // what bounds the whole of it is the work budget; this is the third guard
                 // and it should not be the binding one. `neos-3226448-wkra` closes at
                 // two hundred flips a column and does not at two and a half.
                 moves.saturating_mul(problem.n_cols().max(1)),
+                &mut budget,
                 jump_deadline,
             );
             if found.is_some() {
                 return found;
             }
-            if jump_deadline.is_some_and(|d| Instant::now() >= d) {
+            if budget == 0 || jump_deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
         }
@@ -2720,7 +2775,7 @@ fn solve_once(
     // tenths of a second without solving a single LP, and this solver spent sixty
     // seconds on a relaxation whose value it could have written down.
     if objective_is_constant(problem)
-        && let Some(found) = jump(None, CONSTANT_OBJECTIVE_SHARE)
+        && let Some(found) = jump(None, CONSTANT_OBJECTIVE_JUMP)
         && admitted(separation, &found.x)
     {
         let value = problem.objective_value(constant_objective(problem));
@@ -2747,9 +2802,19 @@ fn solve_once(
             None => first,
         }));
     }
-    let mut root = lp.solve_with_limit(options.max_iterations_per_node);
+    let mut root = lp.solve_with_limit(options.max_iterations_per_node.min(options.max_iterations));
     lp.set_deadline(deadline);
     iterations += root.iterations;
+    // What every improvement search below is allowed, sized from the one solve every
+    // model makes and before anything timed has run, so that it is the same on every
+    // run of the same model.
+    let options = Options {
+        improvement_iterations: match options.improvement_iterations {
+            0 => (SUB_ITERATIONS_PER_ROOT * root.iterations).max(SUB_ITERATIONS_FLOOR),
+            given => given,
+        },
+        ..options
+    };
 
     // A relaxation that did not finish is usually not slow, it is stuck. Two rescues,
     // each bounded by what the first attempt spent: the same model at the same size is
@@ -2773,7 +2838,10 @@ fn solve_once(
     // come off that tableau and branching reads its fractional values. On this set the
     // vertex it reaches is usually the worse one to start from. Asked only where the
     // primal method produced no vertex at all, there is nothing to be worse than.
-    if root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
+    if root.status != LpStatus::Optimal
+        && deadline.is_none_or(|d| Instant::now() < d)
+        && iterations < options.max_iterations
+    {
         let rescued = lp.solve_cold_dual(budget);
         iterations += rescued.iterations;
         if rescued.status == LpStatus::Optimal {
@@ -2800,6 +2868,7 @@ fn solve_once(
     // the search back in the degeneracy it was trying to leave.
     if root.status != LpStatus::Optimal
         && deadline.is_none_or(|d| Instant::now() < d)
+        && iterations < options.max_iterations
         && options.perturb_stalled_root
         && let Some(rescued) = perturbed_root(problem, &lp, deadline, budget)
     {
@@ -2818,7 +2887,12 @@ fn solve_once(
     // iterations at 53 seconds of 60 and reported NodeLimit, a limit nobody had set.
     // Only while it stops at the cap and is still moving, since any other status will
     // be the same on every further try.
-    while root.status != LpStatus::Optimal && deadline.is_none_or(|d| Instant::now() < d) {
+    // Within the search's own iteration budget too, which an improvement search has
+    // and a run as a whole does not, unless asked for one.
+    while root.status != LpStatus::Optimal
+        && deadline.is_none_or(|d| Instant::now() < d)
+        && iterations < options.max_iterations
+    {
         let again = lp.solve_with_limit(options.max_iterations_per_node);
         iterations += again.iterations;
         let stuck = again.status != LpStatus::IterationLimit || again.iterations == 0;
@@ -2864,7 +2938,7 @@ fn solve_once(
         let rescued = if status == Status::Infeasible {
             None
         } else {
-            jump(None, JUMP_SHARE).filter(|found| admitted(separation, &found.x))
+            jump(None, JUMP_BUDGET).filter(|found| admitted(separation, &found.x))
         };
         let held = incumbent_x.take().map(|x| (incumbent, x, false));
         let found = rescued.map(|found| (found.objective, found.x, true));
@@ -3000,7 +3074,7 @@ fn solve_once(
                 // start and is not, losing `acc-tight2`, `disctom` and `neos-913984`
                 // outright. The weights are what find the point, and where they start
                 // from decides which local minimum they have to climb out of first.
-                jump(None, JUMP_SHARE)
+                jump(None, JUMP_BUDGET)
             })
             // Last of all, and cheapest of all. A corner of the box is usually a poor
             // point and is not offered ahead of anything: put in front of diving, a
@@ -3126,7 +3200,7 @@ fn solve_once(
             &lurking,
             root_bound,
             &options,
-            remaining_of(options.time_limit, started),
+            remaining_until(options.deadline),
             separation,
         )
         && objective < incumbent
@@ -3145,7 +3219,7 @@ fn solve_once(
             problem,
             &root.x,
             &options,
-            remaining_of(options.time_limit, started),
+            remaining_until(options.deadline),
             separation,
         )
         && objective < incumbent
@@ -3178,7 +3252,7 @@ fn solve_once(
             incumbent,
             &root.x,
             &options,
-            remaining_of(options.time_limit, started).map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
+            remaining_until(options.deadline).map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
             separation,
         )
         .filter(|(_, x)| admitted(separation, x)) else {
@@ -3286,11 +3360,13 @@ fn solve_once(
             open.push(node);
             break;
         }
-        if options
-            .time_limit
-            .is_some_and(|limit| started.elapsed() >= limit)
-        {
+        if options.deadline.is_some_and(|d| Instant::now() >= d) {
             status = Status::TimeLimit;
+            open.push(node);
+            break;
+        }
+        if iterations + worker.iterations >= options.max_iterations {
+            status = Status::NodeLimit;
             open.push(node);
             break;
         }
@@ -3349,7 +3425,7 @@ fn solve_once(
                 incumbent,
                 relaxation,
                 &options,
-                remaining_of(options.time_limit, started),
+                remaining_until(options.deadline),
                 separation,
             )
             && admitted(separation, &x)
@@ -3387,10 +3463,7 @@ fn solve_once(
         (Status::Optimal, _)
             if unresolved > 0 && improves(unresolved_bound, incumbent, options.gap_tolerance) =>
         {
-            if options
-                .time_limit
-                .is_some_and(|limit| started.elapsed() >= limit)
-            {
+            if options.deadline.is_some_and(|d| Instant::now() >= d) {
                 Status::TimeLimit
             } else {
                 Status::NodeLimit
@@ -3941,17 +4014,46 @@ fn fix_by_reduced_cost(
     (changed > 0).then_some(narrowed)
 }
 
-/// How much of the run the LP-free feasibility search may have.
+/// How much work the LP-free feasibility search may do, across all its attempts.
 ///
-/// It runs before the relaxation, so whatever it takes is taken from everything else.
-/// A share of the limit is the wrong yardstick and this is deliberately a small one.
-/// The models this cracks it cracks in about a second: `acc-tight2`, `disctom` and
-/// `neos-913984` each cost under a second and a half of jumping to close outright. The
-/// models it cannot crack will take whatever they are given, and at a tenth of a two
-/// minute limit that came to twelve seconds spent on instances that solve in under one,
-/// taking `f2gap401600` from 0.27 seconds to 11.5. The stall cutoff inside the search
-/// is what actually bounds it; this is the backstop.
-const JUMP_SHARE: f64 = 0.05;
+/// It runs before the relaxation, so whatever it takes is taken from everything else,
+/// and this is deliberately small. The models this cracks it cracks quickly: across
+/// the 240 benchmark instances, of the 137 it finds a point on within three seconds,
+/// the most work any needed was `sct2`'s, about 18000 entries a nonzero of the model,
+/// and the next `n5-3`'s at 6900. The models it cannot crack will take whatever they
+/// are given, and at a tenth of a two minute limit that came to twelve seconds spent
+/// on instances that solve in under one, taking `f2gap401600` from 0.27 seconds to
+/// 11.5.
+///
+/// It used to be a share of the time limit, which made what it found depend on the
+/// limit and on how busy the machine was, rather than on the model alone.
+struct JumpBudget {
+    /// Work for each nonzero of the model, in the units `feasibility_jump_within`
+    /// counts.
+    per_nonzero: usize,
+    /// Work in all, whatever the size of the model. Per nonzero alone, `square47`'s 27
+    /// million of them would be given ten minutes; at the median rate across the
+    /// benchmark set, about 10^8 a second, this is five seconds.
+    ceiling: usize,
+    /// The share of the time limit that stops it regardless. The rate varies about
+    /// fifteenfold between models, so on the slowest the work allowed outlasts this;
+    /// where it binds, it mostly cuts short attempts that were finding nothing.
+    backstop: f64,
+}
+
+impl JumpBudget {
+    fn of(&self, problem: &Problem) -> usize {
+        self.per_nonzero
+            .saturating_mul(problem.matrix.nnz().max(1))
+            .min(self.ceiling)
+    }
+}
+
+const JUMP_BUDGET: JumpBudget = JumpBudget {
+    per_nonzero: 25_000,
+    ceiling: 500_000_000,
+    backstop: 0.1,
+};
 
 /// Conflicts without a better point or a proof before the search beside the tree gives
 /// up. It costs the tree one thread for as long as it runs, not the run itself, so this
@@ -3986,7 +4088,7 @@ fn luby_exponent(i: usize) -> usize {
 ///
 /// It stops when it has settled, and where it settles is decided by where it began, so
 /// beginning somewhere else is the cheapest thing to try next. The count is generous
-/// because the deadline is what actually stops this: `neos-3226448-wkra` needs
+/// because the work budget is what actually stops this: `neos-3226448-wkra` needs
 /// seventeen starts and nine seconds, and a model that is never going to yield spends
 /// exactly the same budget either way.
 const JUMP_RESTARTS: usize = 200;
@@ -4018,15 +4120,69 @@ const NEIGHBOURHOOD_SHARE: f64 = 0.3;
 /// Root RINS passes at most, each from the point the last one found.
 const ROOT_RINS_ROUNDS: usize = 3;
 
-/// The share of the run a model with nothing to optimise gives its feasibility search.
+/// What a model with nothing to optimise gives its feasibility search.
 ///
-/// Most of it, because there is nothing else to spend it on. What is left over goes to
-/// the ordinary path, which can still prove the model infeasible where this cannot.
-const CONSTANT_OBJECTIVE_SHARE: f64 = 0.75;
+/// Much more, because there is nothing else to spend it on: `neos-3226448-wkra` needs
+/// seventeen starts and about 14000 entries a nonzero, `acc-tight2` 93 starts and
+/// 70000. What is left over goes to the ordinary path, which can still prove the model
+/// infeasible where this cannot.
+const CONSTANT_OBJECTIVE_JUMP: JumpBudget = JumpBudget {
+    per_nonzero: 400_000,
+    ceiling: 10_000_000_000,
+    backstop: 0.75,
+};
 
-/// What is left of a time limit that started at `started`, or `None` for no limit.
-fn remaining_of(limit: Option<Duration>, started: Instant) -> Option<Duration> {
-    limit.map(|limit| limit.saturating_sub(started.elapsed()))
+/// The earlier of two optional moments, either being absent meaning no limit.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The options an improvement search runs under: the caller's, with a work budget in
+/// place of a time limit. `backstop` is what the caller would once have given it as a
+/// time limit, and is now only a moment it must not run past.
+///
+/// No time limit at all, rather than the backstop passed down as one, because every
+/// stage inside takes a share of a time limit, and a share of a backstop is a share of
+/// how much of the caller's run happened to be left. On `mc11` at 60 seconds under
+/// load, the sub-searches' cut loops stopped on that clock at round seven or eight of
+/// ten, and two runs of one build searched different neighbourhoods and came back with
+/// 72608 and 40208; sized by work, two runs agreed at every step.
+fn sub_search(options: &Options, backstop: Option<Duration>) -> Options {
+    Options {
+        improvement_frequency: 0,
+        max_nodes: options.improvement_nodes,
+        max_iterations: options.improvement_iterations.max(1),
+        improvement_iterations: 0,
+        threads: 1,
+        time_limit: None,
+        deadline: earliest(options.deadline, backstop.map(|left| Instant::now() + left)),
+        cut_rounds: options.cut_rounds.min(SUB_CUT_ROUNDS),
+        ..*options
+    }
+}
+
+/// Simplex iterations an improvement search gets, for each one the root relaxation
+/// took, and the least it gets however quickly the root solved.
+///
+/// They were given time instead, a share of what was left of the run, and so found
+/// different points on different runs and under different limits: over 57 instances
+/// at thirty seconds, 19 of 26 reduced cost neighbourhoods and 15 of 168 RINS searches
+/// stopped on the clock, having spent between 1400 and 180000 iterations. Most of those
+/// spent a few times the root's iterations, and the cheapest roots many times more.
+const SUB_ITERATIONS_PER_ROOT: usize = 5;
+const SUB_ITERATIONS_FLOOR: usize = 20_000;
+
+/// Cut rounds at an improvement search's root. It has no time limit to take a share of,
+/// and the full fifty rounds would spend its budget on a bound it only needs to prune
+/// with.
+const SUB_CUT_ROUNDS: usize = 10;
+
+/// What is left until `deadline`, or `None` for no limit.
+fn remaining_until(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(Instant::now()))
 }
 
 /// The internal-form objective of an assignment.
@@ -4107,16 +4263,10 @@ fn aggregated_search(
 
     let found = solve(
         searched,
-        Options {
-            // The rewritten model has no implied bounds of its own left to find, but a
-            // search of it must not be able to start this one again in any case.
-            improvement_frequency: 0,
-            max_nodes: options.improvement_nodes,
-            threads: 1,
-            jump_moves: options.jump_moves,
-            time_limit: remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
-            ..*options
-        },
+        // The rewritten model has no implied bounds of its own left to find, and
+        // `sub_search` takes the improvement searches away so a search of it cannot
+        // start this one again.
+        sub_search(options, remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE))),
     );
     if found.x.len() != searched.n_cols() {
         return None;
@@ -4188,21 +4338,15 @@ fn reduced_cost_neighbourhood(
     // tighter bounds and its points are the caller's points.
     let found = solve_separating(
         &narrowed,
-        Options {
-            improvement_frequency: 0,
-            max_nodes: options.improvement_nodes,
-            threads: 1,
-            // With its own feasibility search, unlike the improvement search next door.
-            // That one starts from an incumbent and is looking for a better point near
-            // it, so re-establishing feasibility is wasted; this one starts from no
-            // point at all, and finding one is the whole job. Inheriting the rule from
-            // the neighbour left `neos-3045796-mogo` at 150 where it reaches -155.
-            jump_moves: options.jump_moves,
-            // A share of what is left, not all of it. This runs before the tree opens,
-            // so whatever it spends the search never gets.
-            time_limit: remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
-            ..*options
-        },
+        // With its own feasibility search, unlike the improvement search next door.
+        // That one starts from an incumbent and is looking for a better point near it,
+        // so re-establishing feasibility is wasted; this one starts from no point at
+        // all, and finding one is the whole job. Inheriting the rule from the neighbour
+        // left `neos-3045796-mogo` at 150 where it reaches -155.
+        //
+        // Stopped no later than a share of what is left, not all of it. This runs
+        // before the tree opens, so whatever it spends the search never gets.
+        sub_search(options, remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE))),
         None,
         separation,
     );
@@ -4272,22 +4416,18 @@ fn improve(
     let found = solve_separating(
         searched,
         Options {
-            improvement_frequency: 0,
-            max_nodes: options.improvement_nodes,
-            threads: 1,
             // The sub-search starts from an incumbent and is looking for a better point
             // near it, which is not what a feasibility search is for. Inherited, it
             // runs again on every neighbourhood: on `eil33-2` that came to 51 seconds
             // of a 96 second solve, spent re-establishing feasibility that the
             // neighbourhood already had.
             jump_moves: 0,
-            // What is left of the caller's budget, not a fresh copy of it. A time
-            // limit is a duration and the sub-search starts its own clock, so passing
-            // the original handed it the whole limit again: an improvement beginning
-            // at fifty-five seconds of a sixty second run could spend another sixty.
+            // Stopped no later than the end of what is left of the caller's budget.
+            // Handed the caller's time limit, a duration the sub-search counts from its
+            // own start, it took the whole limit again: an improvement beginning at
+            // fifty-five seconds of a sixty second run could spend another sixty.
             // Measured, n13-3 returned at 71.6s against a 60s limit.
-            time_limit: remaining,
-            ..*options
+            ..sub_search(options, remaining)
         },
         None,
         separation,
