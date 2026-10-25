@@ -563,6 +563,16 @@ impl Lp {
     }
 
     /// Rows currently in the model, including any added since construction.
+    /// Whether enough of the structural columns carry a cost for perturbing costs to
+    /// help the dual method; see [`PERTURB_MIN_COSTED`].
+    fn mostly_costed(&self) -> bool {
+        let costed = self.cost[..self.n_structural]
+            .iter()
+            .filter(|&&c| c != 0.0)
+            .count();
+        costed as f64 >= PERTURB_MIN_COSTED * self.n_structural as f64
+    }
+
     pub fn n_rows(&self) -> usize {
         self.m
     }
@@ -902,7 +912,28 @@ struct Solver<'a> {
     /// parent's optimum and repairs a bound in a few pivots, so a long warm solve is a
     /// different animal and switching on it is what cost `neos-787933` its solve.
     devex_switchable: bool,
+    /// Costs shifted for the dual method, when it is running on them; see
+    /// [`Solver::perturb_costs`]. `None` means the model's own.
+    perturbed: Option<Vec<f64>>,
 }
+
+/// How far a cost is shifted for the dual method, relative to its size; see
+/// [`Solver::perturb_costs`].
+const COST_PERTURBATION: f64 = 5e-7;
+/// Pivots in a row at a zero ratio before a warm dual solve perturbs its costs.
+const PERTURB_AFTER: usize = 10;
+/// Pivots a perturbed dual solve may take, beyond one per row, before it hands over.
+const PERTURBED_SPELL: usize = 1000;
+/// The share of structural columns that must carry a cost before a stalled dual solve
+/// perturbs its costs.
+///
+/// Where few do, the relaxation is mostly a question of feasibility, its objective flat
+/// across a whole region, and that is what the primal method the dual hands over to is
+/// for. Perturbing there invents an objective and the dual method spends its spell
+/// optimizing it: `cbs-cta`, a cost on 4% of its columns, went from 152 pivots a child
+/// to 282, and `ns1208400`, on 0.1%, from 1454 to 2251. The models perturbing helps
+/// carry costs on 30% to all of their columns.
+const PERTURB_MIN_COSTED: f64 = 0.1;
 
 /// What the ratio test decided.
 enum Step {
@@ -1028,6 +1059,7 @@ impl<'a> Solver<'a> {
             farkas: None,
             devex_active: lp.tol.primal_devex,
             devex_switchable: true,
+            perturbed: None,
         };
         solver.recompute_basic_values();
         solver
@@ -1083,6 +1115,7 @@ impl<'a> Solver<'a> {
             farkas: None,
             devex_active: lp.tol.primal_devex,
             devex_switchable: false,
+            perturbed: None,
             basic: start.basic.clone(),
             status,
             z,
@@ -1145,6 +1178,47 @@ impl<'a> Solver<'a> {
         worst
     }
 
+    /// The cost the solve is running on for column `j`.
+    fn cost(&self, j: usize) -> f64 {
+        self.perturbed.as_ref().map_or(self.lp.cost[j], |costs| costs[j])
+    }
+
+    /// Shift every nonbasic column's cost a little further onto the side its bound
+    /// needs, for the dual method to run on.
+    ///
+    /// A dual degenerate basis, many reduced costs at zero, ties the ratio test at zero
+    /// over and over while the dual objective stands still. The warm dual method then
+    /// hands the node to the primal method, which did most of the work on the models
+    /// where this happens: 63192 primal pivots to 3992 dual in 30 seconds on
+    /// `drayage-25-23`, three nodes. Made distinct, the reduced costs break those ties,
+    /// which is why dual simplex codes perturb their costs. Moving each one away from
+    /// zero on the side the basis already wants keeps the basis dual feasible. The
+    /// shift is relative to the cost's size, varies by column so that no two land
+    /// together again, and is undone when the dual method stops; see [`Solver::run`].
+    fn perturb_costs(&mut self) {
+        let mut costs = self.lp.cost.clone();
+        for (j, cost) in costs.iter_mut().enumerate() {
+            let Status::NonBasic(at) = self.status[j] else {
+                continue;
+            };
+            if self.lp.lower[j] == self.lp.upper[j] {
+                continue;
+            }
+            // A fixed spread from the column index: deterministic, and different for
+            // neighbouring columns.
+            let spread = 1.0
+                + ((j as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as f64
+                    / (1u64 << 53) as f64;
+            let shift = COST_PERTURBATION * (1.0 + cost.abs()) * spread;
+            match at {
+                At::Lower => *cost += shift,
+                At::Upper => *cost -= shift,
+                At::Zero => {}
+            }
+        }
+        self.perturbed = Some(costs);
+    }
+
     /// The phase-1 gradient of the basic costs, or the true costs in phase 2.
     fn load_basic_costs(&mut self, phase_one: bool) {
         let tol = self.lp.tol.primal_feasibility;
@@ -1160,14 +1234,14 @@ impl<'a> Solver<'a> {
                     0.0
                 }
             } else {
-                self.lp.cost[j]
+                self.cost(j)
             };
         }
     }
 
     /// Reduced cost of nonbasic `j` given the current duals.
     fn reduced_cost(&mut self, j: usize, phase_one: bool) -> f64 {
-        let cj = if phase_one { 0.0 } else { self.lp.cost[j] };
+        let cj = if phase_one { 0.0 } else { self.cost(j) };
         let dot = if j < self.lp.n_structural {
             let (rows, vals) = self.lp.matrix.column(j);
             rows.iter()
@@ -1789,6 +1863,7 @@ impl<'a> Solver<'a> {
         let tol = self.lp.tol.dual_feasibility;
         let pivot_tol = self.lp.tol.pivot;
         let mut rho: Vec<f64> = Vec::new();
+        let mut perturbed_at = 0usize;
         // Degenerate steps in a row before switching to Bland's rule. The primal
         // method has had this since it first cycled; the dual method had nothing,
         // and since every warm start enters through the dual method, that is nearly
@@ -1824,7 +1899,9 @@ impl<'a> Solver<'a> {
                 stalled = 0;
                 bland_run *= 2;
             }
-            if cutoff.is_some_and(|limit| self.objective() > limit) {
+            // The cutoff compares the objective with an incumbent, which says something
+            // only of the model's own costs.
+            if self.perturbed.is_none() && cutoff.is_some_and(|limit| self.objective() > limit) {
                 return Some(LpStatus::CutOff);
             }
 
@@ -2004,7 +2081,30 @@ impl<'a> Solver<'a> {
                 // same signal. The primal loop continues from this basis and brings its
                 // own way out of a cycle, so nothing is given up by leaving here.
                 degenerate = if best_ratio <= tol { degenerate + 1 } else { 0 };
+                // A warm solve that has started tying at zero gets its costs perturbed,
+                // once, and only then: the many that finish in a few pivots pay nothing
+                // for it. A cold entry's degeneracy has its own cure above and was not
+                // measured with this.
+                if degenerate == PERTURB_AFTER
+                    && self.perturbed.is_none()
+                    && self.lp.mostly_costed()
+                {
+                    self.perturb_costs();
+                    perturbed_at = *iterations;
+                    degenerate = 0;
+                }
                 if degenerate > STALL_LIMIT {
+                    return None;
+                }
+                // Perturbed costs are costs the dual method can go on optimizing for as
+                // long as it is let, and on a model whose own costs are nearly all zero
+                // that is a solve of its own: `ns1208400` ran past 26000 pivots on a
+                // child the primal method finishes in a few hundred. So it gets a
+                // bounded spell, and what it has not finished goes to the primal method
+                // as an unperturbed stall would.
+                if self.perturbed.is_some()
+                    && *iterations - perturbed_at > PERTURBED_SPELL + self.lp.m
+                {
                     return None;
                 }
             }
@@ -2369,7 +2469,20 @@ impl<'a> Solver<'a> {
             } else {
                 max_iterations / DUAL_SHARE
             };
-            if let Some(status) = self.run_dual(budget, cutoff, &mut iterations) {
+            let outcome = self.run_dual(budget, cutoff, &mut iterations);
+            if self.perturbed.take().is_some() {
+                match outcome {
+                    // Optimal for the shifted costs. Usually still optimal for the
+                    // real ones; when not, the basis is primal feasible and the primal
+                    // method below finishes it.
+                    Some(LpStatus::Optimal) if self.is_dual_feasible() => {
+                        return self.done(LpStatus::Optimal, iterations);
+                    }
+                    Some(LpStatus::Optimal) | None => {}
+                    // Infeasibility holds whatever the costs, and a limit is a limit.
+                    Some(status) => return self.done(status, iterations),
+                }
+            } else if let Some(status) = outcome {
                 return self.done(status, iterations);
             }
         }

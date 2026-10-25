@@ -85,6 +85,15 @@ seconds on one thread.
   elimination, which took them one at a time and rebuilt every column each one's row
   touched. On `neos8`, 46324 rows, a factorization took 1.5 seconds; the root relaxation
   goes from 52 seconds to 3.7, and the model now closes.
+- **A warm dual solve stalled on zero ratios perturbs its costs** before handing the
+  node to the primal method. After ten pivots in a row at a zero ratio, each nonbasic
+  column's cost is shifted slightly onto the side its bound needs, the dual method runs
+  on for a bounded spell, and the true costs come back at the end. Only on models where
+  at least a tenth of the columns carry a cost; on nearly flat objectives it invented
+  one and spent its spell optimizing it. Over the warm child solves of a fixed probe,
+  pivots fall to 0.84 and time to 0.80 of what they were: `nursesched-sprint02` from
+  736 pivots a child to 50, `n2seq36q` from 424 to 123, `neos-1171448` from 217 to 63.
+  Timed searches are mixed.
 
 ### Benchmarks
 
