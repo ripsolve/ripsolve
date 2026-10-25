@@ -1,0 +1,3371 @@
+{
+ "rows": [
+  [
+   "30n20b8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     302.0
+    ]
+   }
+  ],
+  [
+   "50v-10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 3487.4199896454797,
+    "bound": 3209.6811167245023,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3311.1799841
+    ]
+   }
+  ],
+  [
+   "academictimetablesmall",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 3491.0,
+    "bound": 0.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "air05",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 26400.0,
+    "bound": 26340.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     26374.0
+    ]
+   }
+  ],
+  [
+   "app1-1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": 0.0,
+    "bound": -6.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -3.0
+    ]
+   }
+  ],
+  [
+   "app1-2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -41.0
+    ]
+   }
+  ],
+  [
+   "assign1-5-8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 211.9999999999999,
+    "bound": 195.6329529798914,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     211.999999999998
+    ]
+   }
+  ],
+  [
+   "atlanta-ip",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     90.009878614
+    ]
+   }
+  ],
+  [
+   "b1c1s1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 37380.53,
+    "bound": 13667.76303709717,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     24544.25
+    ]
+   }
+  ],
+  [
+   "bab2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -357544.3115
+    ]
+   }
+  ],
+  [
+   "bab6",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -284248.2307000001
+    ]
+   }
+  ],
+  [
+   "beasleyC3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 771.0,
+    "bound": 732.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     753.9999999999128
+    ]
+   }
+  ],
+  [
+   "binkar10_1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 6742.20002399999,
+    "bound": 6707.314042355367,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6742.1998835
+    ]
+   }
+  ],
+  [
+   "blp-ar98",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6205.2147104
+    ]
+   }
+  ],
+  [
+   "blp-ic98",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 4598.3270352,
+    "bound": 4418.900433862553,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     4491.44758395
+    ]
+   }
+  ],
+  [
+   "bnatt400",
+   {
+    "status": "optimal",
+    "seconds": 1.6,
+    "objective": 1.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     1.0
+    ]
+   }
+  ],
+  [
+   "bnatt500",
+   {
+    "status": "Infeasible",
+    "seconds": 7.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "bppc4-08",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 55.99999999999999,
+    "bound": 51.58999999999997,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     53.0
+    ]
+   }
+  ],
+  [
+   "brazil3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     24.0
+    ]
+   }
+  ],
+  [
+   "buildingenergy",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     33283.853236
+    ]
+   }
+  ],
+  [
+   "cbs-cta",
+   {
+    "status": "optimal",
+    "seconds": 25.9,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "chromaticindex1024-7",
+   {
+    "status": "optimal",
+    "seconds": 17.5,
+    "objective": 4.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     4.0
+    ]
+   }
+  ],
+  [
+   "chromaticindex512-7",
+   {
+    "status": "optimal",
+    "seconds": 8.1,
+    "objective": 4.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     4.0
+    ]
+   }
+  ],
+  [
+   "cmflsp50-24-8-8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     55789389.886
+    ]
+   }
+  ],
+  [
+   "CMS750_4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     252.0
+    ]
+   }
+  ],
+  [
+   "co-100",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.7,
+    "objective": 9681460.130000003,
+    "bound": 920123.3231129427,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2639942.06
+    ]
+   }
+  ],
+  [
+   "cod105",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": -9.0,
+    "bound": -18.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -12.0
+    ]
+   }
+  ],
+  [
+   "comp07-2idx",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6.0
+    ]
+   }
+  ],
+  [
+   "comp21-2idx",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     74.0
+    ]
+   }
+  ],
+  [
+   "cost266-UUE",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 26497169.87999999,
+    "bound": 22597425.01853872,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     25148940.55999998
+    ]
+   }
+  ],
+  [
+   "cryptanalysiskb128n5obj14",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "cryptanalysiskb128n5obj16",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "csched007",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     350.9999999999955
+    ]
+   }
+  ],
+  [
+   "csched008",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     173.0
+    ]
+   }
+  ],
+  [
+   "cvs16r128-89",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": -40.0,
+    "bound": -127.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -97.0
+    ]
+   }
+  ],
+  [
+   "dano3_3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     576.34463303
+    ]
+   }
+  ],
+  [
+   "dano3_5",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     576.9249159565619
+    ]
+   }
+  ],
+  [
+   "decomp2",
+   {
+    "status": "optimal",
+    "seconds": 1.4,
+    "objective": -160.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     -160.0
+    ]
+   }
+  ],
+  [
+   "drayage-100-23",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 506846.16313934315,
+    "bound": 103333.8740730284,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     103333.87407
+    ]
+   }
+  ],
+  [
+   "drayage-25-23",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 506846.16313934315,
+    "bound": 99718.79053115836,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     101282.647018
+    ]
+   }
+  ],
+  [
+   "dws008-01",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     37412.60458794508
+    ]
+   }
+  ],
+  [
+   "eil33-2",
+   {
+    "status": "optimal",
+    "seconds": 25.9,
+    "objective": 934.007916,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     934.007915999999
+    ]
+   }
+  ],
+  [
+   "eilA101-2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": 3613.58394,
+    "bound": 805.3831254334204,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     880.9201079999999
+    ]
+   }
+  ],
+  [
+   "enlight_hard",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.9,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     37.0
+    ]
+   }
+  ],
+  [
+   "ex10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 100.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     100.0
+    ]
+   }
+  ],
+  [
+   "ex9",
+   {
+    "status": "optimal",
+    "seconds": 39.7,
+    "objective": 81.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     81.0
+    ]
+   }
+  ],
+  [
+   "exp-1-500-5-5",
+   {
+    "status": "optimal",
+    "seconds": 9.3,
+    "objective": 65886.99999999993,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     65887.0
+    ]
+   }
+  ],
+  [
+   "fast0507",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 207.0,
+    "bound": 173.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     174.0
+    ]
+   }
+  ],
+  [
+   "fastxgemm-n2r6s0t2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": 527.0,
+    "bound": 26.999999999999964,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     230.0
+    ]
+   }
+  ],
+  [
+   "fhnw-binpack4-4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "fhnw-binpack4-48",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "fiball",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 616.0,
+    "bound": 137.06916764360994,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     138.0
+    ]
+   }
+  ],
+  [
+   "gen-ip002",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": -4771.0821614999995,
+    "bound": -4801.576559716277,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -4783.733392
+    ]
+   }
+  ],
+  [
+   "gen-ip054",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.8,
+    "objective": 6864.316105522999,
+    "bound": 6802.978180961938,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6840.96564179
+    ]
+   }
+  ],
+  [
+   "germanrr",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     47095869.649
+    ]
+   }
+  ],
+  [
+   "gfd-schedulen180f7d50m30k18",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.7,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1.0
+    ]
+   }
+  ],
+  [
+   "glass-sc",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 25.0,
+    "bound": 17.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     23.0
+    ]
+   }
+  ],
+  [
+   "glass4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 2850023016.66667,
+    "bound": 800004447.7571775,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1200012599.972384
+    ]
+   }
+  ],
+  [
+   "gmu-35-40",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": -2405893.580399999,
+    "bound": -2406908.692120647,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -2406733.3688
+    ]
+   }
+  ],
+  [
+   "gmu-35-50",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": -2606918.9596,
+    "bound": -2608070.2965117577,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -2607958.33
+    ]
+   }
+  ],
+  [
+   "graph20-20-1rand",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -9.0,
+    "bound": -37.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -9.0
+    ]
+   }
+  ],
+  [
+   "graphdraw-domain",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 29766.0,
+    "bound": 13250.00244622484,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     19685.99997550038
+    ]
+   }
+  ],
+  [
+   "h80x6320d",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 6387.755906000004,
+    "bound": 6351.597332809636,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6382.099048245999
+    ]
+   }
+  ],
+  [
+   "highschool1-aigio",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "hypothyroid-k1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": -2851.0,
+    "bound": -2898.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -2851.0
+    ]
+   }
+  ],
+  [
+   "ic97_potential",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3941.99993090225
+    ]
+   }
+  ],
+  [
+   "icir97_tension",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6375.0
+    ]
+   }
+  ],
+  [
+   "irish-electricity",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3723497.591396
+    ]
+   }
+  ],
+  [
+   "irp",
+   {
+    "status": "optimal",
+    "seconds": 62.3,
+    "objective": 12159.492836,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     12159.49283539698
+    ]
+   }
+  ],
+  [
+   "istanbul-no-cutoff",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 260.96471462279334,
+    "bound": 51.40494202944743,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     204.08170701
+    ]
+   }
+  ],
+  [
+   "k1mushroom",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -3288.0
+    ]
+   }
+  ],
+  [
+   "lectsched-5-obj",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     24.0
+    ]
+   }
+  ],
+  [
+   "leo1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 455794310.71999985,
+    "bound": 395544587.3411104,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     404227536.16
+    ]
+   }
+  ],
+  [
+   "leo2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 502419686.72,
+    "bound": 391733622.93273306,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     404077441.12
+    ]
+   }
+  ],
+  [
+   "lotsize",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": 3030556.0,
+    "bound": 973211.7507089222,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1480195.0
+    ]
+   }
+  ],
+  [
+   "mad",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.7,
+    "objective": 0.07239967292388529,
+    "bound": -1.0337594610398988e-14,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0268
+    ]
+   }
+  ],
+  [
+   "map10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -495.0
+    ]
+   }
+  ],
+  [
+   "map16715-04",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -111.0
+    ]
+   }
+  ],
+  [
+   "markshare_4_0",
+   {
+    "status": "optimal",
+    "seconds": 16.5,
+    "objective": 0.9999999999867071,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     1.0
+    ]
+   }
+  ],
+  [
+   "markshare2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": 38.999999999856584,
+    "bound": 0.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1.0
+    ]
+   }
+  ],
+  [
+   "mas74",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": 11801.185728998893,
+    "bound": 11322.761336522733,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     11801.18572
+    ]
+   }
+  ],
+  [
+   "mas76",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 40005.05414199799,
+    "bound": 39939.05332963787,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     40005.05398999999
+    ]
+   }
+  ],
+  [
+   "mc11",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 11848.0,
+    "bound": 11182.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     11688.99999999966
+    ]
+   }
+  ],
+  [
+   "mcsched",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 214829.0,
+    "bound": 202810.37274774862,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     211913.0
+    ]
+   }
+  ],
+  [
+   "mik-250-20-75-4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": -52301.000000000015,
+    "bound": -53635.68294615233,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -52301.0
+    ]
+   }
+  ],
+  [
+   "milo-v12-6-r2-40-1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     326481.14282799
+    ]
+   }
+  ],
+  [
+   "momentum1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     109143.4935
+    ]
+   }
+  ],
+  [
+   "mushroom-best",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 8124.895731707317,
+    "bound": 1.2682926829268215e-05,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0553337612
+    ]
+   }
+  ],
+  [
+   "mzzv11",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -21718.0
+    ]
+   }
+  ],
+  [
+   "mzzv42z",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 0.0,
+    "bound": -21622.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -20540.0
+    ]
+   }
+  ],
+  [
+   "n2seq36q",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 62800.0,
+    "bound": 52000.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     52200.0
+    ]
+   }
+  ],
+  [
+   "n3div36",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 140000.0,
+    "bound": 126000.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     130800.0
+    ]
+   }
+  ],
+  [
+   "n5-3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 8104.999999999999,
+    "bound": 7627.722579605881,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     8104.999999993999
+    ]
+   }
+  ],
+  [
+   "neos-1122047",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     161.0
+    ]
+   }
+  ],
+  [
+   "neos-1171448",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -277.27142857142866,
+    "bound": -309.00000000000193,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -309.0
+    ]
+   }
+  ],
+  [
+   "neos-1171737",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": 0.0,
+    "bound": -194.99999999999986,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -195.0
+    ]
+   }
+  ],
+  [
+   "neos-1354092",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     46.0
+    ]
+   }
+  ],
+  [
+   "neos-1445765",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -2346.0,
+    "bound": -22755.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -17783.0
+    ]
+   }
+  ],
+  [
+   "neos-1456979",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     176.0
+    ]
+   }
+  ],
+  [
+   "neos-1582420",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": 94.0,
+    "bound": 91.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     90.99999999999996
+    ]
+   }
+  ],
+  [
+   "neos-2075418-temuka",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.7,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "neos-2657525-crna",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1.810748
+    ]
+   }
+  ],
+  [
+   "neos-2746589-doon",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2008.199999999999
+    ]
+   }
+  ],
+  [
+   "neos-2978193-inde",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": -2.3880616860000017,
+    "bound": -2.418518186000001,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -2.38806169
+    ]
+   }
+  ],
+  [
+   "neos-2987310-joes",
+   {
+    "status": "optimal",
+    "seconds": 11.7,
+    "objective": -607702988.2909062,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     -607702988.3
+    ]
+   }
+  ],
+  [
+   "neos-3004026-krka",
+   {
+    "status": "optimal",
+    "seconds": 2.6,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "neos-3024952-loue",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     26756.0
+    ]
+   }
+  ],
+  [
+   "neos-3046615-murg",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 1651.0,
+    "bound": 572.9400907560758,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1600.0
+    ]
+   }
+  ],
+  [
+   "neos-3083819-nubu",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 6309545.0,
+    "bound": 6303700.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6307996.0
+    ]
+   }
+  ],
+  [
+   "neos-3216931-puriri",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     71320.0
+    ]
+   }
+  ],
+  [
+   "neos-3381206-awhea",
+   {
+    "status": "optimal",
+    "seconds": 9.6,
+    "objective": 453.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     453.0
+    ]
+   }
+  ],
+  [
+   "neos-3402294-bobin",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.06724999999999949
+    ]
+   }
+  ],
+  [
+   "neos-3402454-bohle",
+   {
+    "status": "TimeLimit",
+    "seconds": 82.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "neos-3555904-turama",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": -34.699999999999996,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -34.7
+    ]
+   }
+  ],
+  [
+   "neos-3627168-kasai",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 989643.0999999999,
+    "bound": 970813.6653125699,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     988585.6199999998
+    ]
+   }
+  ],
+  [
+   "neos-3656078-kumeu",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -13172.2
+    ]
+   }
+  ],
+  [
+   "neos-3754480-nidda",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 13754.112643269458,
+    "bound": -376161.4270009503,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     12941.73838561778
+    ]
+   }
+  ],
+  [
+   "neos-3988577-wolgan",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "neos-4300652-rahue",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2.1416
+    ]
+   }
+  ],
+  [
+   "neos-4338804-snowy",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 3033.0,
+    "bound": 1447.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1471.0
+    ]
+   }
+  ],
+  [
+   "neos-4387871-tavua",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     33.384729927
+    ]
+   }
+  ],
+  [
+   "neos-4413714-turia",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     45.3701670199998
+    ]
+   }
+  ],
+  [
+   "neos-4532248-waihi",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     61.59999999999999
+    ]
+   }
+  ],
+  [
+   "neos-4647030-tutaki",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     27265.70599999996
+    ]
+   }
+  ],
+  [
+   "neos-4722843-widden",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     25009.662227
+    ]
+   }
+  ],
+  [
+   "neos-4738912-atrato",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 297611854.9142494,
+    "bound": 264373823.68842873,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     283627956.595
+    ]
+   }
+  ],
+  [
+   "neos-4763324-toguru",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1613.03884585
+    ]
+   }
+  ],
+  [
+   "neos-4954672-berkel",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 3913043.0,
+    "bound": 1805243.0607573534,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2612710.0
+    ]
+   }
+  ],
+  [
+   "neos-5049753-cuanza",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     561.9999971689
+    ]
+   }
+  ],
+  [
+   "neos-5052403-cygnet",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 261.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     182.0
+    ]
+   }
+  ],
+  [
+   "neos-5093327-huahum",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 9158.0,
+    "bound": 4642.391796267813,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     6259.999997125895
+    ]
+   }
+  ],
+  [
+   "neos-5104907-jarama",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     935.0
+    ]
+   }
+  ],
+  [
+   "neos-5107597-kakapo",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3644.99999999952
+    ]
+   }
+  ],
+  [
+   "neos-5114902-kasavu",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.8,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     655.0
+    ]
+   }
+  ],
+  [
+   "neos-5188808-nattai",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.110283622999984
+    ]
+   }
+  ],
+  [
+   "neos-5195221-niemur",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0038354326
+    ]
+   }
+  ],
+  [
+   "neos-631710",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 203.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     203.0
+    ]
+   }
+  ],
+  [
+   "neos-662469",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 1570525.0,
+    "bound": 184365.74323694682,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     184379.9999999999
+    ]
+   }
+  ],
+  [
+   "neos-787933",
+   {
+    "status": "optimal",
+    "seconds": 55.9,
+    "objective": 30.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     30.0
+    ]
+   }
+  ],
+  [
+   "neos-827175",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     112.00152
+    ]
+   }
+  ],
+  [
+   "neos-848589",
+   {
+    "status": "TimeLimit",
+    "seconds": 81.5,
+    "objective": 10710792.240600012,
+    "bound": 0.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2351.40309999697
+    ]
+   }
+  ],
+  [
+   "neos-860300",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 4085.0,
+    "bound": 2619.971210165789,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3200.999999999998
+    ]
+   }
+  ],
+  [
+   "neos-873061",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     113.6562385063
+    ]
+   }
+  ],
+  [
+   "neos-911970",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 54.8999999999998,
+    "bound": 53.911513150779,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     54.76
+    ]
+   }
+  ],
+  [
+   "neos-933966",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     318.0
+    ]
+   }
+  ],
+  [
+   "neos-950242",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": 4.0,
+    "bound": 1.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     4.0
+    ]
+   }
+  ],
+  [
+   "neos-957323",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -234.7629679029999,
+    "bound": -237.75763560947414,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -237.7566815
+    ]
+   }
+  ],
+  [
+   "neos-960392",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -210.0,
+    "bound": -238.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -238.0
+    ]
+   }
+  ],
+  [
+   "neos17",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 0.1500025774225777,
+    "bound": 0.13607136196466899,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.1500025774
+    ]
+   }
+  ],
+  [
+   "neos5",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 14.99999999999997,
+    "bound": 14.499999999999998,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     15.0
+    ]
+   }
+  ],
+  [
+   "neos8",
+   {
+    "status": "optimal",
+    "seconds": 5.8,
+    "objective": -3719.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     -3719.0
+    ]
+   }
+  ],
+  [
+   "neos859080",
+   {
+    "status": "Infeasible",
+    "seconds": 3.5,
+    "objective": null,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=inf=",
+     null
+    ]
+   }
+  ],
+  [
+   "net12",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     214.0
+    ]
+   }
+  ],
+  [
+   "netdiversion",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     242.0
+    ]
+   }
+  ],
+  [
+   "nexp-150-20-8-5",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 269.0,
+    "bound": 79.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     231.0
+    ]
+   }
+  ],
+  [
+   "ns1116954",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "ns1208400",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 2.0,
+    "bound": -9.049878901823405e-14,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2.0
+    ]
+   }
+  ],
+  [
+   "ns1644855",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -1524.33333333333
+    ]
+   }
+  ],
+  [
+   "ns1760995",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -549.21438505
+    ]
+   }
+  ],
+  [
+   "ns1830653",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     20622.0
+    ]
+   }
+  ],
+  [
+   "ns1952667",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     0.0
+    ]
+   }
+  ],
+  [
+   "nu25-pr12",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.6,
+    "objective": 53905.0,
+    "bound": 53615.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     53904.99999999999
+    ]
+   }
+  ],
+  [
+   "nursesched-medium-hint03",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     115.0
+    ]
+   }
+  ],
+  [
+   "nursesched-sprint02",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     57.99999999999999
+    ]
+   }
+  ],
+  [
+   "nw04",
+   {
+    "status": "optimal",
+    "seconds": 51.6,
+    "objective": 16862.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     16862.0
+    ]
+   }
+  ],
+  [
+   "opm2-z10-s4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -19136.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -33269.0
+    ]
+   }
+  ],
+  [
+   "p200x1188c",
+   {
+    "status": "optimal",
+    "seconds": 5.5,
+    "objective": 15078.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     15078.0
+    ]
+   }
+  ],
+  [
+   "peg-solitaire-a3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1.0
+    ]
+   }
+  ],
+  [
+   "pg",
+   {
+    "status": "optimal",
+    "seconds": 11.0,
+    "objective": -8674.342607117022,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     -8674.34260712
+    ]
+   }
+  ],
+  [
+   "pg5_34",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": -14335.149276082555,
+    "bound": -14347.6649168808,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -14339.35345
+    ]
+   }
+  ],
+  [
+   "physiciansched3-3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     2623271.326667
+    ]
+   }
+  ],
+  [
+   "physiciansched6-2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     49324.0
+    ]
+   }
+  ],
+  [
+   "piperout-08",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     125054.9999999999
+    ]
+   }
+  ],
+  [
+   "piperout-27",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     8123.999999999973
+    ]
+   }
+  ],
+  [
+   "pk1",
+   {
+    "status": "optimal",
+    "seconds": 22.7,
+    "objective": 11.000000000000002,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     11.0
+    ]
+   }
+  ],
+  [
+   "proteindesign121hz512p9",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 1509.0,
+    "bound": 1431.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1473.0
+    ]
+   }
+  ],
+  [
+   "proteindesign122trx11p8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 1767.0,
+    "bound": 1728.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1747.0
+    ]
+   }
+  ],
+  [
+   "qap10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": 340.0,
+    "bound": 334.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     339.9999999983871
+    ]
+   }
+  ],
+  [
+   "radiationm18-12-05",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     17566.0
+    ]
+   }
+  ],
+  [
+   "radiationm40-10-02",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     155328.0
+    ]
+   }
+  ],
+  [
+   "rail01",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -38.2349889,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -70.5699643
+    ]
+   }
+  ],
+  [
+   "rail02",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": -94.61658299999995,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -200.4499077
+    ]
+   }
+  ],
+  [
+   "rail507",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 187.0,
+    "bound": 172.14556667654878,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     174.0
+    ]
+   }
+  ],
+  [
+   "ran14x18-disj-8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 3740.9999962315796,
+    "bound": 3594.5285394547964,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3712.0
+    ]
+   }
+  ],
+  [
+   "rd-rplusc-21",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     165395.275295
+    ]
+   }
+  ],
+  [
+   "reblock115",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": -35043027.17909945,
+    "bound": -37626670.081367955,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -36800603.2332
+    ]
+   }
+  ],
+  [
+   "rmatr100-p10",
+   {
+    "status": "optimal",
+    "seconds": 39.3,
+    "objective": 423.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     423.0
+    ]
+   }
+  ],
+  [
+   "rmatr200-p5",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     4521.0
+    ]
+   }
+  ],
+  [
+   "rocI-4-11",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -6020203.0
+    ]
+   }
+  ],
+  [
+   "rocII-5-11",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -6.675504731538
+    ]
+   }
+  ],
+  [
+   "rococoB10-011000",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 78125.0,
+    "bound": 9499.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     19449.0
+    ]
+   }
+  ],
+  [
+   "rococoC10-001000",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     11460.0
+    ]
+   }
+  ],
+  [
+   "roi2alpha3n4",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": -46.1314457105,
+    "bound": -74.39378087129155,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -63.20849503
+    ]
+   }
+  ],
+  [
+   "roi5alpha10n8",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": -18.126280579250015,
+    "bound": -76.75095146452428,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -52.322274351
+    ]
+   }
+  ],
+  [
+   "roll3000",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     12889.999992
+    ]
+   }
+  ],
+  [
+   "s100",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": -0.12219683094657674,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -0.1697235270583
+    ]
+   }
+  ],
+  [
+   "s250r10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -0.1717804834232
+    ]
+   }
+  ],
+  [
+   "satellites2-40",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -19.0
+    ]
+   }
+  ],
+  [
+   "satellites2-60-fs",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -19.0000000001
+    ]
+   }
+  ],
+  [
+   "savsched1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     3217.7
+    ]
+   }
+  ],
+  [
+   "sct2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": -74.22661677374961,
+    "bound": -231.06356706666733,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -230.9891623
+    ]
+   }
+  ],
+  [
+   "seymour",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 438.0,
+    "bound": 410.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     423.0
+    ]
+   }
+  ],
+  [
+   "seymour1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 411.0728615650077,
+    "bound": 407.86323424145667,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     410.76370139
+    ]
+   }
+  ],
+  [
+   "sing326",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     7753674.85376
+    ]
+   }
+  ],
+  [
+   "sing44",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     8128831.1772
+    ]
+   }
+  ],
+  [
+   "snp-02-004-104",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     586803238.6567289
+    ]
+   }
+  ],
+  [
+   "sorrell3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": -12.0,
+    "bound": -205.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -16.0
+    ]
+   }
+  ],
+  [
+   "sp150x300d",
+   {
+    "status": "optimal",
+    "seconds": 0.2,
+    "objective": 69.0,
+    "bound": null,
+    "verdict": "closed",
+    "miplib": [
+     "=opt=",
+     69.0
+    ]
+   }
+  ],
+  [
+   "sp97ar",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 732114514.2400006,
+    "bound": 654975876.5106353,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     660705645.759
+    ]
+   }
+  ],
+  [
+   "sp98ar",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 579763521.6000003,
+    "bound": 526403173.9586305,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     529740623.2
+    ]
+   }
+  ],
+  [
+   "splice1k1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -394.0
+    ]
+   }
+  ],
+  [
+   "square41",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.9,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     15.0
+    ]
+   }
+  ],
+  [
+   "square47",
+   {
+    "status": "TimeLimit",
+    "seconds": 81.9,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     15.9999999997877
+    ]
+   }
+  ],
+  [
+   "supportcase10",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 16.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     7.0
+    ]
+   }
+  ],
+  [
+   "supportcase12",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.7,
+    "objective": 0.0,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -7559.533053817
+    ]
+   }
+  ],
+  [
+   "supportcase18",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 50.0,
+    "bound": 48.0,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     48.0
+    ]
+   }
+  ],
+  [
+   "supportcase19",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.9,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     12677205.99992052
+    ]
+   }
+  ],
+  [
+   "supportcase22",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=best=",
+     110.0
+    ]
+   }
+  ],
+  [
+   "supportcase26",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 1942.3587468974458,
+    "bound": 1480.1292334774523,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     1745.123813
+    ]
+   }
+  ],
+  [
+   "supportcase33",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -345.0
+    ]
+   }
+  ],
+  [
+   "supportcase40",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": 25055.922842860222,
+    "bound": 22995.781051039696,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     24256.3122898
+    ]
+   }
+  ],
+  [
+   "supportcase42",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.8,
+    "objective": 40.0,
+    "bound": 7.710875021999534,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     7.75863072227
+    ]
+   }
+  ],
+  [
+   "supportcase6",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     51906.47737
+    ]
+   }
+  ],
+  [
+   "supportcase7",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -1132.223177
+    ]
+   }
+  ],
+  [
+   "swath1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": 379.07129574999993,
+    "bound": 345.7850270666667,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     379.07129575
+    ]
+   }
+  ],
+  [
+   "swath3",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": 400.20529744999976,
+    "bound": 371.8559204333334,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     397.76134365
+    ]
+   }
+  ],
+  [
+   "tbfp-network",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 60.03819444450001,
+    "bound": 23.261535493825797,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     24.16319444
+    ]
+   }
+  ],
+  [
+   "thor50dday",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     40417.0
+    ]
+   }
+  ],
+  [
+   "timtab1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.4,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     764771.99999978
+    ]
+   }
+  ],
+  [
+   "tr12-30",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": 131413.99999999997,
+    "bound": 129676.0406797152,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     130595.9999999999
+    ]
+   }
+  ],
+  [
+   "traininstance2",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.5,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     71820.0
+    ]
+   }
+  ],
+  [
+   "traininstance6",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.9,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     28290.0
+    ]
+   }
+  ],
+  [
+   "trento1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": 318171459.0,
+    "bound": 5182968.550210625,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     5189487.0
+    ]
+   }
+  ],
+  [
+   "triptim1",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     22.8680999999999
+    ]
+   }
+  ],
+  [
+   "uccase12",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     11507.4050616
+    ]
+   }
+  ],
+  [
+   "uccase9",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.1,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     10993.131409
+    ]
+   }
+  ],
+  [
+   "uct-subprob",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": 338.0,
+    "bound": 263.79693698191375,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     314.0
+    ]
+   }
+  ],
+  [
+   "unitcal_7",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.0,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     19635558.244
+    ]
+   }
+  ],
+  [
+   "var-smallemery-m6j6",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.3,
+    "objective": -139.53125000000074,
+    "bound": -155.1179032552159,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -149.37501
+    ]
+   }
+  ],
+  [
+   "wachplan",
+   {
+    "status": "TimeLimit",
+    "seconds": 80.2,
+    "objective": null,
+    "bound": null,
+    "verdict": "open",
+    "miplib": [
+     "=opt=",
+     -8.0
+    ]
+   }
+  ]
+ ],
+ "tally": {
+  "closed": 23,
+  "open": 217,
+  "wrong": 0
+ },
+ "limit": 80.0,
+ "threads": 12
+}

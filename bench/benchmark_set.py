@@ -105,6 +105,16 @@ def verdict(result, reference):
             return "closed"
         scale = max(1.0, abs(value))
         return "closed" if abs(result["objective"] - value) <= GAP * scale + 1e-6 else "wrong"
+    # An open run's bound must not pass the optimum. The sense is read off the side of
+    # the optimum the incumbent is on; with no incumbent, or one at the optimum, there
+    # is nothing to read it from.
+    objective, bound = result.get("objective"), result.get("bound")
+    if tag == "=opt=" and objective is not None and bound is not None:
+        slack = GAP * max(1.0, abs(value)) + 1e-6
+        if objective > value + slack and bound > value + slack:
+            return "wrong"
+        if objective < value - slack and bound < value - slack:
+            return "wrong"
     return "open"
 
 
@@ -143,4 +153,5 @@ def main():
     print(f"wrote {out}")
 
 
-main()
+if __name__ == "__main__":
+    main()

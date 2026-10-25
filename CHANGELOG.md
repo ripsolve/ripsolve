@@ -124,6 +124,13 @@ seconds on one thread.
   results are in `docs/baselines/binary-2026-10-23.json` and the README.
 - `bench/benchmark_set.py` runs MIPLIB 2017's 240 benchmark instances and checks each
   answer against MIPLIB.
+- MIPLIB 2017's 240 benchmark instances at 80 seconds on twelve threads, the 60
+  seconds of Mittelmann's runs scaled to this machine, which runs HiGHS 1.33 times
+  slower than his: 23 closed, none wrong, and no run past 82.2 seconds. The check now
+  also counts a bound that passes MIPLIB's optimum as wrong. `ex10`, which closes in
+  about 26 seconds, ran out of time in two of seven runs with its root relaxation
+  unfinished, for reasons not yet found. The results are in
+  `docs/baselines/benchmark-2026-10-25.json`.
 
 ## 0.4.0
 
