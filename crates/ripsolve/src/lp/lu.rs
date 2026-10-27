@@ -45,9 +45,68 @@ pub struct Lu {
     u_entries: Vec<(usize, f64)>,
     /// Diagonal of `U`.
     diag: Vec<f64>,
+    /// The same factors the other way round: `U` by column, each `(k', value)` with
+    /// `k' < k`, and `L` by row, each `(k', multiplier)` with `k' < k`.
+    ///
+    /// Each triangular solve has a form that scatters a finished entry into the ones
+    /// after it, and so skips the entries that are zero, and a form that gathers every
+    /// entry into each one as it is reached, and so reads the whole factor whatever the
+    /// right-hand side. Held one way only, FTRAN's pass through `U` and BTRAN's through
+    /// `L'` were the gathering kind. The vectors a simplex solves for are mostly zero,
+    /// 46 nonzeros in a right-hand side of 131991 on `ns1116954`, so holding both
+    /// orientations lets all four passes skip.
+    ut_start: Vec<usize>,
+    ut_entries: Vec<(usize, f64)>,
+    lt_start: Vec<usize>,
+    lt_entries: Vec<(usize, f64)>,
+    /// What Forrest-Tomlin updates have done to `U` since the factorization, if any;
+    /// see [`Lu::replace`]. `None` is the factors as produced, solved by the plain loops.
+    updated: Option<Box<Updated>>,
     /// What producing these factors cost, in the units [`Lu::cost`] describes.
     cost: usize,
 }
+
+/// `U` as Forrest-Tomlin updates have left it, over the factors as produced.
+///
+/// An update replaces one column of `U` with a new one and eliminates the row of the
+/// same step, which moves that step to the end of the triangular order. Neither the
+/// flat factors nor their order are rewritten for it: entries that leave `U` are marked
+/// dead, the new columns are appended to `spikes` with their rows' copies in
+/// `row_extra`, and `order` says which way round the steps now go. A refactorization
+/// discards all of it.
+#[derive(Clone)]
+struct Updated {
+    /// The steps in triangular order; a step moved to the end leaves `usize::MAX`
+    /// behind.
+    order: Vec<usize>,
+    /// Each step's slot in `order`.
+    slot: Vec<usize>,
+    /// The step whose column sits at each basis position: `pcol` inverted.
+    step_of: Vec<usize>,
+    /// Entries no longer in `U`, by id: an entry of the factors is identified by its
+    /// index in `u_entries`, a spike entry by `u_entries.len()` plus its index in
+    /// `spikes`.
+    dead: Vec<bool>,
+    /// The id of each entry of `ut_entries`.
+    ut_ids: Vec<u32>,
+    /// Steps whose column has been replaced, with where the replacement is in
+    /// `spikes`.
+    column: Vec<Option<(u32, u32)>>,
+    /// Replacement columns, `(step, value)`.
+    spikes: Vec<(usize, f64)>,
+    /// Entries replacement columns put in each row, `(step, value, id)`.
+    row_extra: Vec<Vec<(usize, f64, u32)>>,
+    /// The row operations each update eliminated its row with, in order: the row's step
+    /// and `(step, multiplier)` for each row subtracted from it.
+    row_etas: Vec<(usize, Vec<(usize, f64)>)>,
+    /// Scratch for an update.
+    work: Vec<f64>,
+    spike: Vec<f64>,
+}
+
+/// Why [`Lu::replace`] refused an update. The factors are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unstable;
 
 /// Working memory for [`Lu::factor`], kept between factorizations.
 ///
@@ -185,7 +244,94 @@ const FACTOR_CLOCK_INTERVAL: usize = 1024;
 const FACTOR_ENTRY_COST: usize = 7;
 const FACTOR_ROW_COST: usize = 70;
 
+/// A spike entry at or below this is left out of `U`, as the factorization leaves out
+/// the entries it computes that small.
+const SPIKE_ZERO: f64 = 1e-12;
+
+/// How far a Forrest-Tomlin update's new diagonal may stray, relative to its size, from
+/// the value the determinant fixes it at before the update is refused; see
+/// [`Lu::replace`].
+const REPLACE_TOLERANCE: f64 = 1e-8;
+
+/// The largest multiplier a Forrest-Tomlin update may eliminate its row with before it
+/// is refused; see [`Lu::replace`].
+///
+/// The elimination has no choice of pivot, so a multiplier is whatever an entry of `U`
+/// divided by its diagonal comes to, and the factorization's own threshold lets that be
+/// a hundred. The error it carries compounds from one update to the next. Over random
+/// sparse bases taking 1178 updates without a refactorization, the worst solve residual
+/// was 1e-4 unbounded, 5e-6 at a bound of a thousand and 3e-10 at a hundred, where the
+/// product form on the same pivots reached 1e-9.
+///
+/// Real bases cross a hundred far more often than random ones, every seven updates on
+/// `piperout-27`, so a refused update must be cheap: it goes into the product form's
+/// eta file, as every pivot did before, rather than forcing a refactorization, which
+/// tripled that model's relaxation. Unbounded, `qap10`'s relaxation did not finish in
+/// 150 seconds; bounded at a hundred it takes 19.
+const MAX_MULTIPLIER: f64 = 100.0;
+
+/// The id, in `entries`, of each entry of the transpose [`transpose`] makes, in the
+/// same order.
+fn transpose_ids(m: usize, start: &[usize], entries: &[(usize, f64)]) -> (Vec<usize>, Vec<u32>) {
+    let mut out_start = vec![0usize; m + 1];
+    for &(k2, _) in entries {
+        out_start[k2 + 1] += 1;
+    }
+    for k in 0..m {
+        out_start[k + 1] += out_start[k];
+    }
+    let mut next = out_start.clone();
+    let mut ids = vec![0u32; entries.len()];
+    for (i, &(k2, _)) in entries.iter().enumerate().take(start[m]) {
+        ids[next[k2]] = i as u32;
+        next[k2] += 1;
+    }
+    (out_start, ids)
+}
+
+/// A triangular factor held by step, `entries[start[k]..start[k + 1]]` as `(k', value)`,
+/// held the other way round: by `k'`, as `(k, value)`, each list in increasing `k`.
+fn transpose(m: usize, start: &[usize], entries: &[(usize, f64)]) -> (Vec<usize>, Vec<(usize, f64)>) {
+    let mut out_start = vec![0usize; m + 1];
+    for &(k2, _) in entries {
+        out_start[k2 + 1] += 1;
+    }
+    for k in 0..m {
+        out_start[k + 1] += out_start[k];
+    }
+    let mut next = out_start.clone();
+    let mut out = vec![(0usize, 0.0f64); entries.len()];
+    for k in 0..m {
+        for &(k2, v) in &entries[start[k]..start[k + 1]] {
+            out[next[k2]] = (k, v);
+            next[k2] += 1;
+        }
+    }
+    (out_start, out)
+}
+
 impl Lu {
+    /// Factors of nothing, a placeholder for a basis that has yet to be factorized.
+    /// Solving with it is a bug; it exists so the first factorization has a slot.
+    pub fn empty(m: usize) -> Self {
+        Self {
+            m,
+            prow: Vec::new(),
+            pcol: Vec::new(),
+            l_start: Vec::new(),
+            l_entries: Vec::new(),
+            u_start: Vec::new(),
+            u_entries: Vec::new(),
+            diag: Vec::new(),
+            ut_start: Vec::new(),
+            ut_entries: Vec::new(),
+            lt_start: Vec::new(),
+            lt_entries: Vec::new(),
+            updated: None,
+            cost: 0,
+        }
+    }
+
     pub fn dimension(&self) -> usize {
         self.m
     }
@@ -546,6 +692,8 @@ impl Lu {
         for (j, _) in u_entries.iter_mut() {
             *j = col_pos[*j];
         }
+        let (ut_start, ut_entries) = transpose(m, &u_start, &u_entries);
+        let (lt_start, lt_entries) = transpose(m, &l_start, &l_entries);
 
         Ok(Lu {
             m,
@@ -556,6 +704,11 @@ impl Lu {
             u_start,
             u_entries,
             diag,
+            ut_start,
+            ut_entries,
+            lt_start,
+            lt_entries,
+            updated: None,
             cost,
         })
     }
@@ -578,8 +731,23 @@ impl Lu {
         &self.u_entries[self.u_start[k]..self.u_start[k + 1]]
     }
 
+    fn u_col(&self, k: usize) -> &[(usize, f64)] {
+        &self.ut_entries[self.ut_start[k]..self.ut_start[k + 1]]
+    }
+
+    fn l_row(&self, k: usize) -> &[(usize, f64)] {
+        &self.lt_entries[self.lt_start[k]..self.lt_start[k + 1]]
+    }
+
     /// Solve `B d = a`, writing `d` (indexed by basis position) into `out`.
     pub fn ftran(&self, a: &[f64], out: &mut Vec<f64>) {
+        self.ftran_spike(a, out, None);
+    }
+
+    /// [`Lu::ftran`], keeping in `spike` the vector the solve has reached between `L`
+    /// and `U`, `R L^-1 a`, which is what [`Lu::replace`] needs to put `a` into the
+    /// factors.
+    pub fn ftran_spike(&self, a: &[f64], out: &mut Vec<f64>, spike: Option<&mut Vec<f64>>) {
         let m = self.m;
         debug_assert_eq!(a.len(), m);
         // Permute the right-hand side into pivot order, then solve L z = b.
@@ -592,13 +760,39 @@ impl Lu {
                 }
             }
         }
-        // Back-substitute U w = z.
-        for k in (0..m).rev() {
-            let mut acc = work[k];
-            for &(k2, v) in self.u_row(k) {
-                acc -= v * work[k2];
+        if let Some(up) = &self.updated {
+            for (row, eta) in &up.row_etas {
+                let correction: f64 = eta.iter().map(|&(k, r)| r * work[k]).sum();
+                work[*row] -= correction;
             }
-            work[k] = acc / self.diag[k];
+        }
+        if let Some(spike) = spike {
+            spike.clear();
+            spike.extend_from_slice(&work);
+        }
+        if let Some(up) = &self.updated {
+            // Back-substitute U w = z, by column, in the order the updates left.
+            let base = self.u_entries.len();
+            for &k in up.order.iter().rev() {
+                if k == usize::MAX || work[k] == 0.0 {
+                    continue;
+                }
+                let w = work[k] / self.diag[k];
+                work[k] = w;
+                self.for_column(up, base, k, |k2, v| work[k2] -= v * w);
+            }
+        } else {
+            // Back-substitute U w = z, by column.
+            for k in (0..m).rev() {
+                if work[k] == 0.0 {
+                    continue;
+                }
+                let w = work[k] / self.diag[k];
+                work[k] = w;
+                for &(k2, v) in self.u_col(k) {
+                    work[k2] -= v * w;
+                }
+            }
         }
         out.clear();
         out.resize(m, 0.0);
@@ -613,22 +807,42 @@ impl Lu {
         debug_assert_eq!(c.len(), m);
         // Permute by column order, then solve U' v = c (U' is lower triangular).
         let mut work: Vec<f64> = (0..m).map(|k| c[self.pcol[k]]).collect();
-        for k in 0..m {
-            let v = work[k] / self.diag[k];
-            work[k] = v;
-            if v != 0.0 {
-                for &(k2, u) in self.u_row(k) {
-                    work[k2] -= u * v;
+        if let Some(up) = &self.updated {
+            for &k in &up.order {
+                if k == usize::MAX || work[k] == 0.0 {
+                    continue;
+                }
+                let v = work[k] / self.diag[k];
+                work[k] = v;
+                self.for_row(up, k, |k2, u| work[k2] -= u * v);
+            }
+            for (row, eta) in up.row_etas.iter().rev() {
+                let z = work[*row];
+                if z != 0.0 {
+                    for &(k, r) in eta {
+                        work[k] -= r * z;
+                    }
+                }
+            }
+        } else {
+            for k in 0..m {
+                let v = work[k] / self.diag[k];
+                work[k] = v;
+                if v != 0.0 {
+                    for &(k2, u) in self.u_row(k) {
+                        work[k2] -= u * v;
+                    }
                 }
             }
         }
-        // Then L' u = v, which is upper triangular in this ordering.
+        // Then L' u = v, which is upper triangular in this ordering, by row of `L`.
         for k in (0..m).rev() {
-            let mut acc = work[k];
-            for &(k2, mult) in self.l_col(k) {
-                acc -= mult * work[k2];
+            let v = work[k];
+            if v != 0.0 {
+                for &(k2, mult) in self.l_row(k) {
+                    work[k2] -= mult * v;
+                }
             }
-            work[k] = acc;
         }
         out.clear();
         out.resize(m, 0.0);
@@ -637,7 +851,216 @@ impl Lu {
         }
     }
 
+    /// Every entry `(step, value)` still in column `k` of the updated `U`, off the
+    /// diagonal.
+    #[inline]
+    fn for_column(&self, up: &Updated, base: usize, k: usize, mut f: impl FnMut(usize, f64)) {
+        if let Some((start, end)) = up.column[k] {
+            for i in start as usize..end as usize {
+                if !up.dead[base + i] {
+                    let (k2, v) = up.spikes[i];
+                    f(k2, v);
+                }
+            }
+        } else {
+            let range = self.ut_start[k]..self.ut_start[k + 1];
+            for (&(k2, v), &id) in self.ut_entries[range.clone()].iter().zip(&up.ut_ids[range]) {
+                if !up.dead[id as usize] {
+                    f(k2, v);
+                }
+            }
+        }
+    }
+
+    /// Every entry `(step, value)` still in row `k` of the updated `U`, off the
+    /// diagonal.
+    #[inline]
+    fn for_row(&self, up: &Updated, k: usize, mut f: impl FnMut(usize, f64)) {
+        let start = self.u_start[k];
+        for (i, &(k2, v)) in self.u_row(k).iter().enumerate() {
+            if !up.dead[start + i] {
+                f(k2, v);
+            }
+        }
+        for &(k2, v, id) in &up.row_extra[k] {
+            if !up.dead[id as usize] {
+                f(k2, v);
+            }
+        }
+    }
+
+    /// Updates applied since the factorization.
+    pub fn replacements(&self) -> usize {
+        self.updated.as_ref().map_or(0, |up| up.row_etas.len())
+    }
+
+    /// Replace the basis column at `position` by the one whose solve was `d`,
+    /// `d = B^-1 a_q`, by a Forrest-Tomlin update.
+    ///
+    /// The new column's image under `L`, the spike `s = L^-1 a_q`, replaces column `t`
+    /// of `U`, `t` the step that position was pivoted at. That leaves `U` triangular
+    /// but for row `t`, whose entries lie after `t`; moving `t` to the end of the order
+    /// and eliminating them with the rows they fall in restores it. The eliminations
+    /// are a row operation `R`, kept and replayed by the solves between `L` and `U`.
+    /// The spike is what [`Lu::ftran_spike`] kept from the solve that produced `d`;
+    /// without it, it is multiplied back out as `U d`, which is the same vector at the
+    /// cost of a pass over `U`.
+    ///
+    /// The update is refused, with the factors left as they were, when it would
+    /// eliminate with a multiplier past [`MAX_MULTIPLIER`], or when the new diagonal
+    /// disagrees past [`REPLACE_TOLERANCE`] with the old one times `d`'s entry at
+    /// `position`, which is what the ratio of the determinants fixes it at.
+    pub fn replace(
+        &mut self,
+        d: &[f64],
+        spike: Option<&[f64]>,
+        position: usize,
+    ) -> Result<usize, Unstable> {
+        let m = self.m;
+        let base = self.u_entries.len();
+        if self.updated.is_none() {
+            let (_, ut_ids) = transpose_ids(m, &self.u_start, &self.u_entries);
+            let mut step_of = vec![0usize; m];
+            for (k, &p) in self.pcol.iter().enumerate() {
+                step_of[p] = k;
+            }
+            self.updated = Some(Box::new(Updated {
+                order: (0..m).collect(),
+                slot: (0..m).collect(),
+                step_of,
+                dead: vec![false; base],
+                ut_ids,
+                column: vec![None; m],
+                spikes: Vec::new(),
+                row_extra: vec![Vec::new(); m],
+                row_etas: Vec::new(),
+                work: vec![0.0; m],
+                spike: vec![0.0; m],
+            }));
+        }
+        let mut up = self.updated.take().expect("set above");
+        let result = self.replace_in(&mut up, d, spike, position, base);
+        self.updated = Some(up);
+        result
+    }
+
+    fn replace_in(
+        &mut self,
+        up: &mut Updated,
+        d: &[f64],
+        given: Option<&[f64]>,
+        position: usize,
+        base: usize,
+    ) -> Result<usize, Unstable> {
+        let t = up.step_of[position];
+        let mut spike = std::mem::take(&mut up.spike);
+        if let Some(given) = given {
+            spike.copy_from_slice(given);
+        } else {
+            // `U w`, with `w` the solve in step order.
+            spike.iter_mut().for_each(|v| *v = 0.0);
+            for k in 0..self.m {
+                let w = d[self.pcol[k]];
+                if w == 0.0 {
+                    continue;
+                }
+                spike[k] += self.diag[k] * w;
+                self.for_column(up, base, k, |k2, v| spike[k2] += v * w);
+            }
+        }
+
+        // Eliminate row t's entries, every one after t in the order, nearest first.
+        let mut work = std::mem::take(&mut up.work);
+        let mut pending = std::collections::BinaryHeap::new();
+        self.for_row(up, t, |k2, v| {
+            work[k2] = v;
+            pending.push(std::cmp::Reverse(up.slot[k2]));
+        });
+        let mut eta = Vec::new();
+        let mut diagonal = spike[t];
+        let mut last = usize::MAX;
+        while let Some(std::cmp::Reverse(slot)) = pending.pop() {
+            if slot == last {
+                continue;
+            }
+            last = slot;
+            let c = up.order[slot];
+            let value = work[c];
+            work[c] = 0.0;
+            if value == 0.0 {
+                continue;
+            }
+            let r = value / self.diag[c];
+            if r.abs() > MAX_MULTIPLIER {
+                up.work = work;
+                for &std::cmp::Reverse(slot) in pending.iter() {
+                    let k = up.order[slot];
+                    up.work[k] = 0.0;
+                }
+                up.spike = spike;
+                return Err(Unstable);
+            }
+            eta.push((c, r));
+            diagonal -= r * spike[c];
+            self.for_row(up, c, |k2, v| {
+                if work[k2] == 0.0 {
+                    pending.push(std::cmp::Reverse(up.slot[k2]));
+                }
+                work[k2] -= r * v;
+            });
+        }
+        up.work = work;
+
+        let expected = self.diag[t] * d[position];
+        if diagonal == 0.0
+            || diagonal.is_nan()
+            || (diagonal - expected).abs() > REPLACE_TOLERANCE * diagonal.abs().max(expected.abs())
+        {
+            up.spike = spike;
+            return Err(Unstable);
+        }
+
+        // Commit. Column t's entries and row t's leave U.
+        if let Some((start, end)) = up.column[t] {
+            for i in start..end {
+                up.dead[base + i as usize] = true;
+            }
+        } else {
+            for i in self.ut_start[t]..self.ut_start[t + 1] {
+                up.dead[up.ut_ids[i] as usize] = true;
+            }
+        }
+        for i in self.u_start[t]..self.u_start[t + 1] {
+            up.dead[i] = true;
+        }
+        for &(_, _, id) in &up.row_extra[t] {
+            up.dead[id as usize] = true;
+        }
+        up.row_extra[t].clear();
+        // The spike becomes column t, every entry above the diagonal now t is last.
+        let start = up.spikes.len() as u32;
+        for (k, &v) in spike.iter().enumerate() {
+            if k == t || v.abs() <= SPIKE_ZERO {
+                continue;
+            }
+            let id = (base + up.spikes.len()) as u32;
+            up.spikes.push((k, v));
+            up.dead.push(false);
+            up.row_extra[k].push((t, v, id));
+        }
+        up.column[t] = Some((start, up.spikes.len() as u32));
+        self.diag[t] = diagonal;
+        up.order[up.slot[t]] = usize::MAX;
+        up.slot[t] = up.order.len();
+        up.order.push(t);
+        let added = up.spikes.len() - start as usize + eta.len() + 1;
+        up.row_etas.push((t, eta));
+        up.spike = spike;
+        Ok(added)
+    }
+
     /// Stored nonzeros in both factors, for diagnostics and refactorization policy.
+    /// Counted once, though each is held in both orientations.
     pub fn nnz(&self) -> usize {
         self.m + self.l_entries.len() + self.u_entries.len()
     }
@@ -710,6 +1133,29 @@ mod tests {
         }
     }
 
+    /// The largest residual of both solves over a few right-hand sides.
+    fn residual(m: usize, columns: &[(Vec<usize>, Vec<f64>)], lu: &Lu) -> f64 {
+        let dense = densify(m, columns);
+        let mut rng = Rng(7);
+        let mut worst = 0.0f64;
+        for _ in 0..4 {
+            let a: Vec<f64> = (0..m).map(|_| rng.value()).collect();
+            let mut d = Vec::new();
+            lu.ftran(&a, &mut d);
+            for i in 0..m {
+                let got: f64 = (0..m).map(|p| dense[p][i] * d[p]).sum();
+                worst = worst.max((got - a[i]).abs());
+            }
+            let mut y = Vec::new();
+            lu.btran(&a, &mut y);
+            for p in 0..m {
+                let got: f64 = (0..m).map(|i| dense[p][i] * y[i]).sum();
+                worst = worst.max((got - a[p]).abs());
+            }
+        }
+        worst
+    }
+
     fn sparse(m: usize, dense: &[Vec<f64>]) -> Vec<(Vec<usize>, Vec<f64>)> {
         dense
             .iter()
@@ -725,6 +1171,78 @@ mod tests {
                 (rows, vals)
             })
             .collect()
+    }
+
+    /// A long run of Forrest-Tomlin updates must keep solving the basis it describes.
+    ///
+    /// Each update replaces a random position's column with a random sparse one, after
+    /// checking the new basis is comfortably nonsingular through the pivot `d[r]`, and
+    /// every solve is then checked against the explicit matrix. Runs long enough for
+    /// steps to be moved to the end of the order repeatedly, the same step more than
+    /// once, and for spikes to land in rows earlier updates eliminated.
+    #[test]
+    fn forrest_tomlin_updates_keep_solving_the_basis() {
+        for seed in 0..12u64 {
+            let mut rng = Rng(100 + seed);
+            let m = 8 + rng.below(25);
+            // A sparse nonsingular start: a diagonal plus a scattering above and below.
+            let mut dense: Vec<Vec<f64>> = (0..m)
+                .map(|p| {
+                    let mut col = vec![0.0; m];
+                    col[p] = 4.0 + rng.below(5) as f64;
+                    for _ in 0..rng.below(3) {
+                        col[rng.below(m)] += rng.value();
+                    }
+                    col
+                })
+                .collect();
+            let mut lu = loop {
+                if let Ok(lu) = Lu::factor(m, &sparse(m, &dense), 1e-12, None) {
+                    break lu;
+                }
+                let p = rng.below(m);
+                dense[p][p] += 7.0;
+            };
+            let mut taken = 0;
+            for _ in 0..10 * m {
+                let position = rng.below(m);
+                let mut col = vec![0.0; m];
+                for _ in 0..1 + rng.below(4) {
+                    col[rng.below(m)] = rng.value();
+                }
+                let (mut d, mut spike) = (Vec::new(), Vec::new());
+                lu.ftran_spike(&col, &mut d, Some(&mut spike));
+                if d[position].abs() < 0.05 {
+                    continue;
+                }
+                let replacements = lu.replacements();
+                // Alternately with the spike kept and multiplied back out.
+                let given = (taken % 2 == 0).then_some(spike.as_slice());
+                if lu.replace(&d, given, position).is_err() {
+                    // Start the next run of updates from fresh factors: what is checked
+                    // here is the updates, and a solve would put this one in an eta file.
+                    dense[position] = col;
+                    lu = Lu::factor(m, &sparse(m, &dense), 1e-12, None).unwrap();
+                    continue;
+                }
+                assert_eq!(lu.replacements(), replacements + 1);
+                dense[position] = col;
+                taken += 1;
+                // Against a fresh factorization of the same basis, so the check measures
+                // the updates rather than how well conditioned a random basis happens
+                // to be. Up to a hundred updates accumulate here without the
+                // refactorization a solve would make; the product form's residual on
+                // these same sequences reaches 1e-9.
+                let columns = sparse(m, &dense);
+                let fresh = Lu::factor(m, &columns, 1e-12, None).unwrap();
+                let (updated, reference) = (residual(m, &columns, &lu), residual(m, &columns, &fresh));
+                assert!(
+                    updated <= 1e-8 + 100.0 * reference,
+                    "seed {seed}, update {taken}: residual {updated:e} against {reference:e} refactorized"
+                );
+            }
+            assert!(taken > m, "seed {seed}: only {taken} updates taken");
+        }
     }
 
     #[test]

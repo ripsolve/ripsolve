@@ -51,6 +51,19 @@ const CLOCK_INTERVAL: usize = 256;
 /// [`Lp::clock_interval`].
 const CLOCK_SPAN: usize = 1 << 20;
 
+/// The share of the matrix's nonzeros above which a pivot row is formed column by
+/// column rather than row by row; see [`Solver::form_row`].
+///
+/// Row by row costs the lengths of the rows `rho` touches, column by column the whole
+/// matrix plus every nonbasic column, so the switch is where those meet, with some
+/// allowance for the scattered writes the row form makes.
+const ROW_WISE_SHARE: f64 = 0.3;
+
+/// How far the pivot element may differ, relative to its size, between the entering
+/// column and the pivot row before the factors are taken to have drifted; see
+/// [`Solver::check_pivot`].
+const PIVOT_DRIFT: f64 = 1e-7;
+
 /// Primal iterations after which pricing switches to devex; see [`Solver::consider_devex`].
 ///
 /// Above what an ordinary solve takes and far below what a stalled one does. On the binary
@@ -346,6 +359,9 @@ pub struct Lp {
     upper: Vec<f64>,
     /// The original `A`, column-major, `m x n_structural`.
     matrix: SparseMatrix,
+    /// `A` by row, built the first time a solve forms a pivot row from it and dropped
+    /// when rows are added; see [`Lp::rows`].
+    rows: std::sync::OnceLock<SparseMatrix>,
     /// Which structural columns must take integer values. Logicals are continuous.
     integer: Vec<bool>,
     /// When to give up, if the caller set a wall-clock budget.
@@ -388,6 +404,7 @@ impl Clone for Lp {
             lower: self.lower.clone(),
             upper: self.upper.clone(),
             matrix: self.matrix.clone(),
+            rows: self.rows.clone(),
             integer: self.integer.clone(),
             deadline: self.deadline,
             interrupt: self.interrupt.clone(),
@@ -423,6 +440,7 @@ impl Lp {
             lower,
             upper,
             matrix: problem.matrix.clone(),
+            rows: std::sync::OnceLock::new(),
             integer,
             deadline: None,
             interrupt: None,
@@ -452,6 +470,7 @@ impl Lp {
             }
         }
         self.matrix = self.matrix.with_rows_appended(rows.len(), &by_column);
+        self.rows = std::sync::OnceLock::new();
 
         // Logicals for the new rows land at the end of the variable order, after the
         // existing `n + m` variables, so nothing already indexed moves.
@@ -577,6 +596,16 @@ impl Lp {
         self.m
     }
 
+    /// `A` by row: its column `i` is row `i` of the model, as `(columns, values)`.
+    ///
+    /// A pivot row is `rho' A` for `rho = B^-T e_r`, and `rho` is usually sparse, so
+    /// reading `A` along the rows `rho` touches costs a fraction of a pass over every
+    /// column. Built on first use rather than with the model, since a solve that never
+    /// pivots, which is most warm starts in a search, has no use for it.
+    fn rows(&self) -> &SparseMatrix {
+        self.rows.get_or_init(|| self.matrix.to_csr())
+    }
+
     fn n_total(&self) -> usize {
         self.n_structural + self.m
     }
@@ -675,8 +704,10 @@ impl Lp {
             }
             solver.run(max_iterations, None)
         };
-        self.factors.insert(0, (basic, basis));
-        self.factors.truncate(FACTOR_CACHE);
+        if let Some(basis) = basis {
+            self.factors.insert(0, (basic, basis));
+            self.factors.truncate(FACTOR_CACHE);
+        }
         solution
     }
 
@@ -839,8 +870,10 @@ impl Lp {
         // Most recent first, oldest evicted. The key comparison is a slice equality
         // over the basis columns, which is negligible against the cost of the
         // factorization it avoids.
-        self.factors.insert(0, (basic, basis));
-        self.factors.truncate(FACTOR_CACHE);
+        if let Some(basis) = basis {
+            self.factors.insert(0, (basic, basis));
+            self.factors.truncate(FACTOR_CACHE);
+        }
         solution
     }
 }
@@ -915,7 +948,41 @@ struct Solver<'a> {
     /// Costs shifted for the dual method, when it is running on them; see
     /// [`Solver::perturb_costs`]. `None` means the model's own.
     perturbed: Option<Vec<f64>>,
+    /// Every variable's reduced cost against the duals `y` and the basic costs
+    /// `cost_b`, carried across pivots rather than recomputed; see
+    /// [`Solver::sync_duals`]. Meaningful for nonbasic variables only.
+    d: Vec<f64>,
+    /// The costs `d`, `y` and `cost_b` currently describe: `Some(phase_one)`, or `None`
+    /// when they have to be recomputed before they are read.
+    duals: Option<bool>,
+    /// Whether `y` and `d` were computed from scratch since they were last carried.
+    fresh: bool,
+    /// The last row formed by [`Solver::form_row`], dense over every variable, with
+    /// the positions it wrote listed in `row_nz` and flagged in `row_mark`.
+    row: Vec<f64>,
+    row_nz: Vec<usize>,
+    row_mark: Vec<bool>,
+    /// Scratch for a change in the phase 1 basic costs, and the duals it moves.
+    shift: Vec<f64>,
+    shift_y: Vec<f64>,
+    /// Set when the two computations of a pivot element disagreed; the basis is
+    /// refactorized after the pivot. See [`Solver::check_pivot`].
+    drifted: bool,
+    /// How pricing reads each column, kept beside `status`; see [`Solver::scan`].
+    side: Vec<u8>,
+    /// Each row's basic variable's bound violation and phase 1 cost, kept current
+    /// across steps while `rows_ready`; see [`Solver::worst_violation`].
+    violation: Vec<f64>,
+    row_phase_one: Vec<f64>,
+    rows_ready: bool,
 }
+
+/// Values of [`Solver::side`]: a column pricing skips, because it is basic or fixed,
+/// and the directions it may move in otherwise.
+const SIDE_SKIP: u8 = 0;
+const SIDE_LOWER: u8 = 1;
+const SIDE_UPPER: u8 = 2;
+const SIDE_FREE: u8 = 3;
 
 /// How far a cost is shifted for the dual method, relative to its size; see
 /// [`Solver::perturb_costs`].
@@ -1060,7 +1127,21 @@ impl<'a> Solver<'a> {
             devex_active: lp.tol.primal_devex,
             devex_switchable: true,
             perturbed: None,
+            d: vec![0.0; lp.n_total()],
+            duals: None,
+            fresh: false,
+            row: vec![0.0; lp.n_total()],
+            row_nz: Vec::new(),
+            row_mark: vec![false; lp.n_total()],
+            shift: vec![0.0; m],
+            shift_y: Vec::new(),
+            drifted: false,
+            side: Vec::new(),
+            violation: vec![0.0; m],
+            row_phase_one: vec![0.0; m],
+            rows_ready: false,
         };
+        solver.side = (0..lp.n_total()).map(|j| solver.side_of(j)).collect();
         solver.recompute_basic_values();
         solver
     }
@@ -1098,7 +1179,7 @@ impl<'a> Solver<'a> {
         let factorized = factors.is_some();
         let mut solver = Solver {
             lp,
-            basis: factors.unwrap_or_else(|| Basis::all_logical(m)),
+            basis: factors.unwrap_or_else(|| Basis::unfactored(m)),
             factorized,
             basic_values: Vec::new(),
             dual_steepest: false,
@@ -1116,6 +1197,19 @@ impl<'a> Solver<'a> {
             devex_active: lp.tol.primal_devex,
             devex_switchable: false,
             perturbed: None,
+            d: vec![0.0; lp.n_total()],
+            duals: None,
+            fresh: false,
+            row: vec![0.0; lp.n_total()],
+            row_nz: Vec::new(),
+            row_mark: vec![false; lp.n_total()],
+            shift: vec![0.0; m],
+            shift_y: Vec::new(),
+            drifted: false,
+            side: Vec::new(),
+            violation: vec![0.0; m],
+            row_phase_one: vec![0.0; m],
+            rows_ready: false,
             basic: start.basic.clone(),
             status,
             z,
@@ -1127,7 +1221,12 @@ impl<'a> Solver<'a> {
             rhs: vec![0.0; m],
             entry_hint: Entry::Dual,
         };
-        solver.recompute_basic_values();
+        solver.side = (0..lp.n_total()).map(|j| solver.side_of(j)).collect();
+        // Without factors the basic values wait for the refactorization every caller
+        // makes first, which computes them anyway.
+        if solver.factorized {
+            solver.recompute_basic_values();
+        }
         solver
     }
 
@@ -1164,13 +1263,61 @@ impl<'a> Solver<'a> {
             self.z[self.basic[i]] = v;
         }
         self.basic_values = out;
+        self.rows_ready = false;
+    }
+
+    /// Column `j`'s entry in [`Solver::side`].
+    fn side_of(&self, j: usize) -> u8 {
+        match self.status[j] {
+            Status::Basic { .. } => SIDE_SKIP,
+            // A fixed variable has nowhere to go.
+            Status::NonBasic(_) if self.lp.lower[j] == self.lp.upper[j] => SIDE_SKIP,
+            Status::NonBasic(At::Lower) => SIDE_LOWER,
+            Status::NonBasic(At::Upper) => SIDE_UPPER,
+            Status::NonBasic(At::Zero) => SIDE_FREE,
+        }
+    }
+
+    fn set_status(&mut self, j: usize, status: Status) {
+        self.status[j] = status;
+        self.side[j] = self.side_of(j);
+    }
+
+    /// Refresh row `i`'s entries in `violation` and `row_phase_one`.
+    fn note_row(&mut self, i: usize) {
+        let j = self.basic[i];
+        self.violation[i] = (self.lp.lower[j] - self.z[j]).max(self.z[j] - self.lp.upper[j]);
+        self.row_phase_one[i] = self.phase_one_cost(j);
+    }
+
+    fn ready_rows(&mut self) {
+        if !self.rows_ready {
+            for i in 0..self.lp.m {
+                self.note_row(i);
+            }
+            self.rows_ready = true;
+        }
+        #[cfg(debug_assertions)]
+        for i in 0..self.lp.m {
+            let (violation, cost) = (self.violation[i], self.row_phase_one[i]);
+            self.note_row(i);
+            debug_assert!(
+                violation.to_bits() == self.violation[i].to_bits()
+                    && cost == self.row_phase_one[i],
+                "row {i} carried out of date"
+            );
+        }
     }
 
     /// The largest amount by which any basic variable sits outside its bounds.
-    fn worst_violation(&self) -> f64 {
+    ///
+    /// Read from `violation`, which a step refreshes only in the rows it moves: once a
+    /// pass gathering every basic variable's value and bounds, it was 7% of
+    /// `neos-827175`'s relaxation.
+    fn worst_violation(&mut self) -> f64 {
+        self.ready_rows();
         let mut worst: f64 = 0.0;
-        for &j in &self.basic {
-            let over = (self.lp.lower[j] - self.z[j]).max(self.z[j] - self.lp.upper[j]);
+        for &over in &self.violation {
             if over > worst {
                 worst = over;
             }
@@ -1217,26 +1364,218 @@ impl<'a> Solver<'a> {
             }
         }
         self.perturbed = Some(costs);
+        self.duals = None;
     }
 
     /// The phase-1 gradient of the basic costs, or the true costs in phase 2.
     fn load_basic_costs(&mut self, phase_one: bool) {
-        let tol = self.lp.tol.primal_feasibility;
         for i in 0..self.lp.m {
             let j = self.basic[i];
             self.cost_b[i] = if phase_one {
-                let v = self.z[j];
-                if v < self.lp.lower[j] - tol {
-                    -1.0
-                } else if v > self.lp.upper[j] + tol {
-                    1.0
-                } else {
-                    0.0
-                }
+                self.phase_one_cost(j)
             } else {
                 self.cost(j)
             };
         }
+    }
+
+    /// Variable `j`'s cost in phase 1: the sign of its bound violation, zero when it has
+    /// none, which is every nonbasic variable.
+    fn phase_one_cost(&self, j: usize) -> f64 {
+        let tol = self.lp.tol.primal_feasibility;
+        let v = self.z[j];
+        if v < self.lp.lower[j] - tol {
+            -1.0
+        } else if v > self.lp.upper[j] + tol {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Recompute the duals and every nonbasic reduced cost from scratch.
+    fn refresh_duals(&mut self, phase_one: bool) {
+        self.load_basic_costs(phase_one);
+        let mut y = std::mem::take(&mut self.y);
+        self.basis.btran(&self.cost_b, &mut y);
+        self.y = y;
+        for j in 0..self.lp.n_total() {
+            self.d[j] = if matches!(self.status[j], Status::NonBasic(_)) {
+                self.reduced_cost(j, phase_one)
+            } else {
+                0.0
+            };
+        }
+        self.duals = Some(phase_one);
+        self.fresh = true;
+    }
+
+    /// Bring `y` and `d` up to date with the costs the coming iteration prices on.
+    ///
+    /// They were recomputed from scratch every iteration, a BTRAN and a pass over the
+    /// whole matrix, which on `nursesched-sprint02` was 60% of a primal pivot. A pivot
+    /// moves every reduced cost by a multiple of the pivot row, which the iteration has
+    /// in hand anyway, so they are carried across it instead; see
+    /// [`Solver::update_duals`]. The phase 2 costs never change between pivots. Phase
+    /// 1's do, whenever a step moves a basic variable into or out of violation, and
+    /// only those positions' change is carried, through a BTRAN of that change, which
+    /// is mostly zero. Each refactorization recomputes them from scratch, which keeps
+    /// the drift of the carried values to a few dozen updates.
+    fn sync_duals(&mut self, phase_one: bool) {
+        if self.duals != Some(phase_one) {
+            self.refresh_duals(phase_one);
+            return;
+        }
+        if !phase_one {
+            return;
+        }
+        self.ready_rows();
+        let mut changed = false;
+        for i in 0..self.lp.m {
+            let cost = self.row_phase_one[i];
+            self.shift[i] = cost - self.cost_b[i];
+            if self.shift[i] != 0.0 {
+                self.cost_b[i] = cost;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.fresh = false;
+        let mut shift_y = std::mem::take(&mut self.shift_y);
+        self.basis.btran(&self.shift, &mut shift_y);
+        for (y, dy) in self.y.iter_mut().zip(&shift_y) {
+            *y += dy;
+        }
+        self.form_row(&shift_y);
+        for &j in &self.row_nz {
+            if matches!(self.status[j], Status::NonBasic(_)) {
+                self.d[j] -= self.row[j];
+            }
+        }
+        self.shift_y = shift_y;
+    }
+
+    /// Form `v' [A | -I]` over the nonbasic variables into `row`, listing the
+    /// positions written in `row_nz`.
+    ///
+    /// Row by row when `v` is sparse enough, reading only the rows it touches; column
+    /// by column otherwise. Basic variables may be written by the row form and are for
+    /// the caller to skip.
+    fn form_row(&mut self, v: &[f64]) {
+        for &j in &self.row_nz {
+            self.row[j] = 0.0;
+            self.row_mark[j] = false;
+        }
+        self.row_nz.clear();
+        let lp = self.lp;
+        let n = lp.n_structural;
+        let rows = lp.rows();
+        let work: usize = (0..lp.m)
+            .filter(|&i| v[i] != 0.0)
+            .map(|i| rows.column(i).0.len() + 1)
+            .sum();
+        if (work as f64) < ROW_WISE_SHARE * (lp.matrix.nnz() + lp.n_total()) as f64 {
+            for (i, &vi) in v.iter().enumerate().take(lp.m) {
+                if vi == 0.0 {
+                    continue;
+                }
+                let (cols, vals) = rows.column(i);
+                for (&j, &a) in cols.iter().zip(vals) {
+                    if !self.row_mark[j] {
+                        self.row_mark[j] = true;
+                        self.row_nz.push(j);
+                    }
+                    self.row[j] += vi * a;
+                }
+                let logical = n + i;
+                self.row_mark[logical] = true;
+                self.row_nz.push(logical);
+                self.row[logical] = -vi;
+            }
+        } else {
+            for j in 0..lp.n_total() {
+                if !matches!(self.status[j], Status::NonBasic(_)) {
+                    continue;
+                }
+                let value = if j < n {
+                    let (rows, vals) = lp.matrix.column(j);
+                    rows.iter().zip(vals).map(|(&i, &a)| v[i] * a).sum::<f64>()
+                } else {
+                    -v[j - n]
+                };
+                if value != 0.0 {
+                    self.row_mark[j] = true;
+                    self.row_nz.push(j);
+                    self.row[j] = value;
+                }
+            }
+        }
+    }
+
+    /// Carry `y` and `d` across a pivot of `entering` into row `r`.
+    ///
+    /// Reads the pivot row `row = rho' [A | -I]` with `rho = B^-T e_r` of the basis
+    /// before the pivot, and `alpha`, the entering column against it. With
+    /// `theta = d_q / alpha_r`, every reduced cost falls by `theta` times its entry in
+    /// the pivot row, the duals rise by `theta rho`, and the leaving variable, whose
+    /// entry is one, ends at `-theta`.
+    fn update_duals(&mut self, entering: usize, r: usize, phase_one: bool) {
+        let pivot = self.alpha[r];
+        let theta = self.d[entering] / pivot;
+        self.fresh = false;
+        if theta != 0.0 {
+            for &j in &self.row_nz {
+                if matches!(self.status[j], Status::NonBasic(_)) {
+                    self.d[j] -= theta * self.row[j];
+                }
+            }
+            for (y, &rho) in self.y.iter_mut().zip(&self.rho) {
+                *y += theta * rho;
+            }
+        }
+        let leaving = self.basic[r];
+        self.d[leaving] = -theta;
+        self.d[entering] = 0.0;
+        // The leaving variable goes nonbasic, where phase 1 costs nothing; the entering
+        // one was nonbasic, so its cost is already what the duals were computed with.
+        if phase_one {
+            self.d[leaving] -= self.cost_b[r];
+            self.cost_b[r] = 0.0;
+        } else {
+            self.cost_b[r] = self.cost(entering);
+        }
+    }
+
+    /// Compare the pivot element as the entering column has it, `alpha_r`, with the
+    /// pivot row's entry for the entering column, after [`Solver::pivot_row`].
+    ///
+    /// The two are the same number, `e_r' B^-1 a_q`, reached through FTRAN and through
+    /// BTRAN, and the difference between them is the most direct reading there is of
+    /// how far the factors have drifted from the basis they describe. Past
+    /// [`PIVOT_DRIFT`] the basis is refactorized once this pivot is taken: the updates
+    /// carry error forward, a Forrest-Tomlin update's row elimination especially, and a
+    /// pivot count says nothing about how much.
+    fn check_pivot(&mut self, entering: usize, r: usize) {
+        let from_column = self.alpha[r];
+        let from_row = if self.row_mark[entering] {
+            self.row[entering]
+        } else {
+            0.0
+        };
+        let scale = from_column.abs().min(from_row.abs()).max(self.lp.tol.pivot);
+        if (from_column - from_row).abs() > PIVOT_DRIFT * scale {
+            self.drifted = true;
+        }
+    }
+
+    /// Form the pivot row for row `r` into `rho` and `row`, before the basis moves.
+    fn pivot_row(&mut self, r: usize) {
+        let mut rho = std::mem::take(&mut self.rho);
+        self.basis.btran_unit(r, &mut rho);
+        self.form_row(&rho);
+        self.rho = rho;
     }
 
     /// Reduced cost of nonbasic `j` given the current duals.
@@ -1294,39 +1633,32 @@ impl<'a> Solver<'a> {
         // rule is doing double duty as a numerical safeguard, and a partial rule needs
         // its own before it can replace that. Speed bought this way is not worth a
         // wrong answer.
-        self.scan(0, self.lp.n_total(), phase_one, bland)
+        self.sync_duals(phase_one);
+        self.scan(bland)
     }
 
-    /// Price `count` columns starting at `start`, wrapping at the end.
+    /// Price every column.
     ///
     /// Returns the best candidate found, or under `bland` the first one that improves.
-    fn scan(
-        &mut self,
-        start: usize,
-        count: usize,
-        phase_one: bool,
-        bland: bool,
-    ) -> Option<(usize, f64)> {
+    ///
+    /// Reads `side` rather than the status and both bounds: this loop was a third of
+    /// the primal method's own time on `neos-827175` and `dano3_3`, most of it loading
+    /// those.
+    fn scan(&self, bland: bool) -> Option<(usize, f64)> {
         let tol = self.lp.tol.dual_feasibility;
-        let n = self.lp.n_total();
         let mut best: Option<(usize, f64)> = None;
         let mut best_score = 0.0;
 
-        for step in 0..count {
-            let j = if start == 0 { step } else { (start + step) % n };
-            let Status::NonBasic(at) = self.status[j] else {
-                continue;
-            };
-            // A fixed variable has nowhere to go.
-            if self.lp.lower[j] == self.lp.upper[j] {
+        for (j, &side) in self.side.iter().enumerate() {
+            if side == SIDE_SKIP {
                 continue;
             }
-            let d = self.reduced_cost(j, phase_one);
-            let sigma = match at {
-                At::Lower if d < -tol => 1.0,
-                At::Upper if d > tol => -1.0,
-                At::Zero if d < -tol => 1.0,
-                At::Zero if d > tol => -1.0,
+            let d = self.d[j];
+            let sigma = match side {
+                SIDE_LOWER if d < -tol => 1.0,
+                SIDE_UPPER if d > tol => -1.0,
+                SIDE_FREE if d < -tol => 1.0,
+                SIDE_FREE if d > tol => -1.0,
                 _ => continue,
             };
             if bland {
@@ -1497,8 +1829,15 @@ impl<'a> Solver<'a> {
         let delta = sigma * step;
         self.z[entering] += delta;
         for i in 0..self.lp.m {
+            let a = self.alpha[i];
+            if a == 0.0 {
+                continue;
+            }
             let j = self.basic[i];
-            self.z[j] -= self.alpha[i] * delta;
+            self.z[j] -= a * delta;
+            if self.rows_ready {
+                self.note_row(i);
+            }
         }
     }
 
@@ -1515,6 +1854,14 @@ impl<'a> Solver<'a> {
     /// which is why the callers now assert it rather than trust it.
     fn refactorize(&mut self) -> Result<(), LpStatus> {
         let lp = self.lp;
+        // Recomputing the duals after each refactorization is what keeps the error in
+        // the carried ones bounded, and a repair below changes the basis outright.
+        self.duals = None;
+        self.drifted = false;
+        self.rows_ready = false;
+        // Until a factorization succeeds the factors held are not this basis's, and
+        // must not be handed back to the cache as if they were.
+        self.factorized = false;
         for attempt in 0..lp.m + 1 {
             // Each attempt is a whole factorization, and the caller's clock is only
             // read between simplex iterations, so a long run of repairs is invisible to
@@ -1574,10 +1921,10 @@ impl<'a> Solver<'a> {
                     } else {
                         At::Zero
                     };
-                    self.status[displaced] = Status::NonBasic(at);
+                    self.set_status(displaced, Status::NonBasic(at));
                     self.z[displaced] = lp.value_at(displaced, at);
                     self.basic[row] = replacement;
-                    self.status[replacement] = Status::Basic { row };
+                    self.set_status(replacement, Status::Basic { row });
                 }
             }
         }
@@ -1607,10 +1954,8 @@ impl<'a> Solver<'a> {
     /// primal method instead of getting a wrong answer from the dual one.
     fn is_dual_feasible(&mut self) -> bool {
         let tol = self.lp.tol.dual_feasibility;
-        self.load_basic_costs(false);
-        let mut y = std::mem::take(&mut self.y);
-        self.basis.btran(&self.cost_b, &mut y);
-        self.y = y;
+        // From scratch, not carried: this is the check on everything carried.
+        self.refresh_duals(false);
 
         for j in 0..self.lp.n_total() {
             let Status::NonBasic(at) = self.status[j] else {
@@ -1620,7 +1965,7 @@ impl<'a> Solver<'a> {
             if self.lp.lower[j] == self.lp.upper[j] {
                 continue;
             }
-            let d = self.reduced_cost(j, false);
+            let d = self.d[j];
             let ok = match at {
                 At::Lower => d >= -tol,
                 At::Upper => d <= tol,
@@ -1637,18 +1982,22 @@ impl<'a> Solver<'a> {
     ///
     /// Under `bland` it returns the *first* infeasible row by basic variable index
     /// instead of the worst, which is the leaving half of Bland's rule.
-    fn most_infeasible_row(&self, bland: bool) -> Option<(usize, At)> {
+    ///
+    /// Reads the violations from `violation`, and the basic variable's value and
+    /// bounds only in the rows that are violated.
+    fn most_infeasible_row(&mut self, bland: bool) -> Option<(usize, At)> {
+        self.ready_rows();
         let tol = self.lp.tol.primal_feasibility;
         let mut worst = tol;
         let mut found: Option<(usize, At)> = None;
         for i in 0..self.lp.m {
-            let j = self.basic[i];
-            let v = self.z[j];
-            let (below, above) = (self.lp.lower[j] - v, v - self.lp.upper[j]);
-            let violation = below.max(above);
+            let violation = self.violation[i];
             if violation <= tol {
                 continue;
             }
+            let j = self.basic[i];
+            let v = self.z[j];
+            let (below, above) = (self.lp.lower[j] - v, v - self.lp.upper[j]);
             let side = if below > above { At::Lower } else { At::Upper };
             if bland {
                 // Lowest basic variable index wins, regardless of how bad it is.
@@ -1743,9 +2092,8 @@ impl<'a> Solver<'a> {
     ///     w_leaving <- max(w_q / alpha_rq^2, 1)
     /// ```
     ///
-    /// It costs one BTRAN and a pass over the columns to form the pivot row, which is
-    /// the same order as pricing itself, so devex roughly doubles the per-iteration work
-    /// outside the solves. That is the price of the rule.
+    /// It reads the pivot row the iteration forms anyway to carry the reduced costs
+    /// across the pivot, in `row`, so it costs a pass over that row's nonzeros.
     ///
     /// Weights only ever rise, so they drift away from the norms they approximate as the
     /// basis leaves the reference framework behind. When the largest passes
@@ -1753,32 +2101,24 @@ impl<'a> Solver<'a> {
     /// goes back to one, which is what keeps the approximation honest without ever
     /// computing an exact norm.
     ///
-    /// Must be called before [`Basis::update`], because `rho` is a row of the *old*
-    /// `B^-1`.
+    /// Must be called after [`Solver::pivot_row`] and before [`Basis::update`], because
+    /// `rho` is a row of the *old* `B^-1`.
     fn update_column_weights(&mut self, entering: usize, r: usize) {
         let pivot = self.alpha[r];
         if pivot.abs() <= self.lp.tol.pivot {
             return;
         }
-        let mut rho = std::mem::take(&mut self.rho);
-        self.basis.btran_unit(r, &mut rho);
         let reference = Self::clamp_weight(self.col_weights[entering]).max(1.0);
         let leaving = self.basic[r];
 
+        // Only the columns the pivot row reaches can rise, and weights never fall, so
+        // the largest is among them or was already over the limit and reset.
         let mut largest = 0.0f64;
-        for j in 0..self.lp.n_total() {
+        for &j in &self.row_nz {
             if j == entering || !matches!(self.status[j], Status::NonBasic(_)) {
                 continue;
             }
-            let arj = if j < self.lp.n_structural {
-                let (rows, vals) = self.lp.matrix.column(j);
-                rows.iter()
-                    .zip(vals)
-                    .map(|(&i, &a)| rho[i] * a)
-                    .sum::<f64>()
-            } else {
-                -rho[j - self.lp.n_structural]
-            };
+            let arj = self.row[j];
             if arj != 0.0 {
                 let ratio = arj / pivot;
                 let candidate = ratio * ratio * reference;
@@ -1792,7 +2132,7 @@ impl<'a> Solver<'a> {
         // The leaving variable is about to become nonbasic, and its direction is the
         // entering one's scaled by the pivot.
         self.col_weights[leaving] = Self::clamp_weight(reference / (pivot * pivot)).max(1.0);
-        self.rho = rho;
+        largest = largest.max(self.col_weights[leaving]);
 
         if largest > DEVEX_RESET {
             self.col_weights.fill(1.0);
@@ -1905,14 +2245,11 @@ impl<'a> Solver<'a> {
                 return Some(LpStatus::CutOff);
             }
 
-            // Refresh the duals every iteration. Each pivot changes the basis and so
-            // changes every reduced cost; pricing the ratio test against duals left
-            // over from a previous iteration silently picks the wrong entering column
-            // and the solve converges to a point that is not the optimum.
-            self.load_basic_costs(false);
-            let mut y = std::mem::take(&mut self.y);
-            self.basis.btran(&self.cost_b, &mut y);
-            self.y = y;
+            // The reduced costs the ratio test reads. Each pivot changes every one of
+            // them, and pricing against values left over from before it picks the wrong
+            // entering column; they were recomputed here every iteration until they
+            // were carried across each pivot instead; see [`Solver::sync_duals`].
+            self.sync_duals(false);
 
             let Some((r, violated)) = self.most_infeasible_row(bland) else {
                 // Primal feasible. For a warm start that is the optimum, because the
@@ -1932,6 +2269,7 @@ impl<'a> Solver<'a> {
             };
 
             self.basis.btran_unit(r, &mut rho);
+            self.form_row(&rho);
             // The leaving variable must rise to its lower bound, or fall to its upper.
             let rising = violated == At::Lower;
 
@@ -1939,22 +2277,15 @@ impl<'a> Solver<'a> {
             let mut best_ratio = f64::INFINITY;
             let mut best_pivot = 0.0;
             let mut rejected_small = false;
-            for j in 0..self.lp.n_total() {
+            for k in 0..self.row_nz.len() {
+                let j = self.row_nz[k];
                 let Status::NonBasic(at) = self.status[j] else {
                     continue;
                 };
                 if self.lp.lower[j] == self.lp.upper[j] {
                     continue;
                 }
-                let arj = if j < self.lp.n_structural {
-                    let (rows, vals) = self.lp.matrix.column(j);
-                    rows.iter()
-                        .zip(vals)
-                        .map(|(&i, &a)| rho[i] * a)
-                        .sum::<f64>()
-                } else {
-                    -rho[j - self.lp.n_structural]
-                };
+                let arj = self.row[j];
                 // Moving z_j by t moves the leaving variable by -arj * t. A column at
                 // its lower bound can only increase, one at its upper only decrease;
                 // keep those that push the leaving variable the way it needs to go.
@@ -1974,7 +2305,7 @@ impl<'a> Solver<'a> {
                     rejected_small = true;
                     continue;
                 }
-                let d = self.reduced_cost(j, false);
+                let d = self.d[j];
                 let ratio = (d.abs() / arj.abs()).max(0.0);
                 let pivot = arj.abs();
                 // Ties go to the largest pivot, which is numerically safest. Under
@@ -1995,6 +2326,23 @@ impl<'a> Solver<'a> {
                 }
             }
 
+            // A column the row does not reach has an entry of exactly zero, and the test
+            // above, run over every column as it was, counted such a column as rejected
+            // for size wherever its bound let it serve. That is kept as it was until it
+            // is changed on its own: it decides whether an empty list below is a proof.
+            if best.is_none() && !rejected_small {
+                rejected_small = (0..self.lp.n_total()).any(|j| {
+                    let Status::NonBasic(at) = self.status[j] else {
+                        return false;
+                    };
+                    self.row[j] == 0.0
+                        && self.lp.lower[j] != self.lp.upper[j]
+                        && match at {
+                            At::Lower | At::Upper => !rising,
+                            At::Zero => true,
+                        }
+                });
+            }
             let Some((entering, _)) = best else {
                 // The dual is unbounded, so the primal has no feasible point. That
                 // reasoning rests on two things, and an infeasibility claim is the most
@@ -2026,7 +2374,7 @@ impl<'a> Solver<'a> {
             let mut col = std::mem::take(&mut self.col);
             self.lp.column_into(entering, &mut col);
             let mut alpha = std::mem::take(&mut self.alpha);
-            self.basis.ftran(&col, &mut alpha);
+            self.basis.ftran_entering(&col, &mut alpha);
             self.col = col;
             self.alpha = alpha;
             self.count_entering_density();
@@ -2042,6 +2390,7 @@ impl<'a> Solver<'a> {
                 continue;
             }
 
+            self.check_pivot(entering, r);
             let leaving = self.basic[r];
             let target = self.lp.value_at(leaving, violated);
             // Move the entering variable exactly far enough to place the leaving one
@@ -2110,8 +2459,15 @@ impl<'a> Solver<'a> {
             }
             self.z[entering] += step;
             for i in 0..self.lp.m {
+                let a = self.alpha[i];
+                if a == 0.0 {
+                    continue;
+                }
                 let bj = self.basic[i];
-                self.z[bj] -= self.alpha[i] * step;
+                self.z[bj] -= a * step;
+                if self.rows_ready {
+                    self.note_row(i);
+                }
             }
             self.z[leaving] = target;
 
@@ -2120,15 +2476,22 @@ impl<'a> Solver<'a> {
             if self.steepest_rows {
                 self.update_row_weights(r, &rho);
             }
+            std::mem::swap(&mut self.rho, &mut rho);
+            self.update_duals(entering, r, false);
+            std::mem::swap(&mut self.rho, &mut rho);
 
             self.basis.update(&self.alpha, r);
             self.basic[r] = entering;
-            self.status[entering] = Status::Basic { row: r };
-            self.status[leaving] = Status::NonBasic(violated);
+            self.set_status(entering, Status::Basic { row: r });
+            self.set_status(leaving, Status::NonBasic(violated));
+            if self.rows_ready {
+                self.note_row(r);
+            }
 
             *iterations += 1;
             if (self.basis.updates() >= self.lp.tol.refactor_interval
-                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT))
+                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT)
+                || self.drifted)
                 && let Err(status) = self.refactorize()
             {
                 return Some(status);
@@ -2345,10 +2708,12 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// Finish, handing the final basis and its factorization back for caching.
-    fn done(self, status: LpStatus, iterations: usize) -> (LpSolution, Vec<usize>, Basis) {
+    /// Finish, handing the final basis and its factorization back for caching, or no
+    /// factorization if the last attempt at one failed.
+    fn done(self, status: LpStatus, iterations: usize) -> (LpSolution, Vec<usize>, Option<Basis>) {
         let solution = self.finish(status, iterations);
-        (solution, self.basic, self.basis)
+        let basis = self.factorized.then_some(self.basis);
+        (solution, self.basic, basis)
     }
 
     fn finish(&self, status: LpStatus, iterations: usize) -> LpSolution {
@@ -2380,7 +2745,7 @@ impl<'a> Solver<'a> {
         mut self,
         max_iterations: usize,
         cutoff: Option<f64>,
-    ) -> (LpSolution, Vec<usize>, Basis) {
+    ) -> (LpSolution, Vec<usize>, Option<Basis>) {
         // Degenerate (zero-length) steps in a row before switching to Bland's rule.
         /// Degenerate steps in a row before the *primal* method switches to Bland's rule.
         ///
@@ -2471,6 +2836,8 @@ impl<'a> Solver<'a> {
             };
             let outcome = self.run_dual(budget, cutoff, &mut iterations);
             if self.perturbed.take().is_some() {
+                // The duals were carried on the shifted costs.
+                self.duals = None;
                 match outcome {
                     // Optimal for the shifted costs. Usually still optimal for the
                     // real ones; when not, the basis is primal feasible and the primal
@@ -2494,11 +2861,6 @@ impl<'a> Solver<'a> {
             }
             let phase_one = self.worst_violation() > slack;
 
-            self.load_basic_costs(phase_one);
-            let mut y = std::mem::take(&mut self.y);
-            self.basis.btran(&self.cost_b, &mut y);
-            self.y = y;
-
             // A solve this long is one Dantzig is not going to finish; see
             // `Solver::consider_devex`.
             self.consider_devex(iterations);
@@ -2511,7 +2873,14 @@ impl<'a> Solver<'a> {
             if bland {
                 self.bland_iterations += 1;
             }
-            let Some((entering, sigma)) = self.price(phase_one, bland) else {
+            let priced = self.price(phase_one, bland);
+            // Optimality and infeasibility are decided on duals computed from scratch,
+            // never on carried ones, which have drifted by however many pivots.
+            if priced.is_none() && !self.fresh {
+                self.duals = None;
+                continue;
+            }
+            let Some((entering, sigma)) = priced else {
                 // No improving column. In phase 2 that is optimality; in phase 1 it
                 // means the sum of bound violations sits at its minimum, and since
                 // that minimum is global for an LP, a nonzero one proves the model has
@@ -2562,7 +2931,7 @@ impl<'a> Solver<'a> {
             let mut col = std::mem::take(&mut self.col);
             self.lp.column_into(entering, &mut col);
             let mut alpha = std::mem::take(&mut self.alpha);
-            self.basis.ftran(&col, &mut alpha);
+            self.basis.ftran_entering(&col, &mut alpha);
             self.col = col;
             self.alpha = alpha;
             self.count_entering_density();
@@ -2578,6 +2947,7 @@ impl<'a> Solver<'a> {
                         LpStatus::Unbounded
                     };
                     if status == LpStatus::Infeasible {
+                        self.refresh_duals(true);
                         self.farkas = Some(self.y.clone());
                     }
                     return self.done(status, iterations);
@@ -2585,7 +2955,7 @@ impl<'a> Solver<'a> {
                 Step::BoundFlip { step } => {
                     self.take_step(entering, sigma, step);
                     let at = if sigma > 0.0 { At::Upper } else { At::Lower };
-                    self.status[entering] = Status::NonBasic(at);
+                    self.set_status(entering, Status::NonBasic(at));
                     self.z[entering] = self.lp.value_at(entering, at);
                     let degenerate = step.abs() <= 1e-12;
                     self.degenerate_iterations += usize::from(degenerate);
@@ -2597,17 +2967,23 @@ impl<'a> Solver<'a> {
                     to,
                 } => {
                     // Before the basis moves: the pivot row is a row of the old inverse.
+                    self.pivot_row(leaving_row);
+                    self.check_pivot(entering, leaving_row);
                     if self.devex() {
                         self.update_column_weights(entering, leaving_row);
                     }
+                    self.update_duals(entering, leaving_row, phase_one);
                     self.take_step(entering, sigma, step);
                     let leaving = self.basic[leaving_row];
 
                     self.basis.update(&self.alpha, leaving_row);
                     self.basic[leaving_row] = entering;
-                    self.status[entering] = Status::Basic { row: leaving_row };
-                    self.status[leaving] = Status::NonBasic(to);
+                    self.set_status(entering, Status::Basic { row: leaving_row });
+                    self.set_status(leaving, Status::NonBasic(to));
                     self.z[leaving] = self.lp.value_at(leaving, to);
+                    if self.rows_ready {
+                        self.note_row(leaving_row);
+                    }
 
                     let degenerate = step.abs() <= 1e-12;
                     self.degenerate_iterations += usize::from(degenerate);
@@ -2617,7 +2993,8 @@ impl<'a> Solver<'a> {
 
             iterations += 1;
             if (self.basis.updates() >= self.lp.tol.refactor_interval
-                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT))
+                || self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT)
+                || self.drifted)
                 && let Err(status) = self.refactorize()
             {
                 debug_assert_ne!(status, LpStatus::Infeasible, "refactorize claimed infeasibility");

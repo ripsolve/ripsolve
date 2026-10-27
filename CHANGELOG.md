@@ -114,6 +114,45 @@ seconds on one thread.
   pivots fall to 0.84 and time to 0.80 of what they were: `nursesched-sprint02` from
   736 pivots a child to 50, `n2seq36q` from 424 to 123, `neos-1171448` from 217 to 63.
   Timed searches are mixed.
+- **Reduced costs are carried across pivots** instead of recomputed. Both simplex
+  methods solved for the duals and priced every column afresh each pivot, a BTRAN and
+  a pass over the whole matrix; they now update them from the pivot row, which is
+  formed from the rows of the matrix it touches, and recompute them only at a
+  refactorization. Optimality and infeasibility are still decided on duals computed
+  from scratch. Devex reads the same pivot row instead of forming its own.
+- **The LU factors are kept in both orientations**, so that every triangular solve
+  skips the zeros of its right-hand side; FTRAN through `U` and BTRAN through `L'`
+  read every entry of the factor whatever they were given.
+- **Pivots go into the factors as Forrest-Tomlin updates**, not into an eta file
+  every BTRAN replays whole. An update that would eliminate with a multiplier above a
+  hundred is refused and goes into the eta file as before. The pivot element is now
+  compared between the entering column and the pivot row on every pivot, and the
+  basis refactorized when they disagree past 1e-7.
+
+  Together, on the root relaxations of the 41 benchmark instances HiGHS closes within
+  a minute and this solver does not, the 33 that finish take 0.58 of the time they
+  did (geometric mean), 333 seconds in all against 588: `hypothyroid-k1` 103s to 39,
+  `qap10` 35 to 17, `nursesched-sprint02` 13.5 to 5.4, `dano3_3` 75 to 40. Every
+  optimum is unchanged. Three, `ex10`, `physiciansched6-2` and `unitcal_7`, still do
+  not finish in 150 seconds.
+- **Pricing and the ratio tests read state carried per column and per row.** Which
+  side of its bounds each nonbasic sits on, and how far each basic variable is outside
+  its bounds, are now updated as pivots change them instead of being worked out from
+  the status and bounds at every scan. The primal method's pricing scan had been a
+  third of its own time on `neos-827175` and `dano3_3`. On the 29 of the 41 above whose
+  root relaxations finish in five seconds, root time falls to 0.90 with the same
+  pivots; `neos-827175` 54s to 44, `dano3_3` 45 to 38. Child solves are unchanged.
+- **A warm start whose factors are not cached no longer factorizes the all-logical
+  basis** only to discard it at the refactorization that follows. Factors from a
+  refactorization that failed are no longer put in the cache under the basis they do
+  not belong to.
+
+  Over the 240 benchmark instances at 80 seconds on 12 threads, 24 close against 23,
+  `neos-1582420` the new one. Root cuts depend on which optimal vertex the relaxation
+  ends at, and the new engine ends at different ones: `neos8` now takes 27 seconds
+  against 7, its first cut round leaving the bound where it was instead of closing the
+  gap, while `neos-911970` and `neos-860300` end with better bounds and
+  `neos-4738912-atrato`, `swath3` and `neos17` with worse.
 
 ### Benchmarks
 

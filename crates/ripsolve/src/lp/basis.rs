@@ -6,21 +6,30 @@
 //! basis refactorized, which both bounds the replay cost and stops error
 //! accumulating.
 //!
-//! # Why product form rather than Forrest-Tomlin
+//! # Forrest-Tomlin, with product form behind it
 //!
-//! Forrest-Tomlin updates the `U` factor in place and keeps the eta file shorter,
-//! which is what a mature solver does. Product form is a few lines by comparison
-//! and is what makes the correctness argument easy to see: after a pivot on row
-//! `r`, the new basis is `B_new = B_old E`, where `E` is the identity with column
-//! `r` replaced by `d = B_old^-1 a_q`. So `B_new^-1 = E^-1 B_old^-1`, and after `k`
-//! pivots `B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1`. FTRAN therefore applies the factors
-//! first and the etas in order; BTRAN applies the transposed etas in reverse and
-//! the factors last.
+//! A pivot normally goes into the factors themselves, as a Forrest-Tomlin update:
+//! the entering column replaces one column of `U` and a row operation restores the
+//! triangle; see [`Lu::replace`]. The update costs about what the new column has in
+//! nonzeros, and a solve after it reads only what `U` now holds. The product form
+//! this replaced kept every pivot as a separate eta, and BTRAN had to read each one
+//! whole whatever its right-hand side: on `ns1116954`, 131991 rows, replaying them
+//! was 17% of the root relaxation.
+//!
+//! Product form remains for what Forrest-Tomlin does not cover here: a pivot taken
+//! after rows were appended to the basis, see [`Extension`], and one whose update the
+//! factors refuse as numerically unsafe, after which the pivots to the next
+//! refactorization all go in the eta file. After a pivot on row `r`, the new basis is
+//! `B_new = B_old E`, where `E` is the identity with column `r` replaced by
+//! `d = B_old^-1 a_q`. So `B_new^-1 = E^-1 B_old^-1`, and after `k` pivots
+//! `B_k^-1 = E_k^-1 ... E_1^-1 B_0^-1`. FTRAN therefore applies the factors first and
+//! the etas in order; BTRAN applies the transposed etas in reverse and the factors
+//! last.
 //!
 //! The interface ([`Basis::ftran`], [`Basis::btran`], [`Basis::update`],
 //! [`Basis::refactorize`]) is unchanged from the dense explicit inverse this
-//! replaced, so Forrest-Tomlin can supersede product form later without the simplex
-//! driver noticing, exactly as this change did.
+//! replaced, and Forrest-Tomlin came in behind it without the simplex driver
+//! noticing.
 
 use crate::lp::lu::{FactorError, Lu, Scratch};
 
@@ -86,6 +95,10 @@ pub struct Basis {
     /// refactorization; see [`Basis::eta_file_is_expensive`].
     eta_nnz: usize,
     replayed: usize,
+    /// What [`Basis::ftran_entering`] kept of its solve for the update that follows it,
+    /// and whether it still applies.
+    spike: Vec<f64>,
+    spike_ready: bool,
 }
 
 /// Solves a pivot asks of the basis, each of which replays the whole eta file: the
@@ -109,6 +122,29 @@ impl Basis {
             scratch: Scratch::default(),
             eta_nnz: 0,
             replayed: 0,
+            spike: Vec::new(),
+            spike_ready: false,
+        }
+    }
+
+    /// A basis of dimension `m` that holds no factors yet, for a solver that will
+    /// refactorize before its first solve.
+    ///
+    /// A warm start whose factors are not in the cache used to build
+    /// [`Basis::all_logical`] here and throw it away at that first refactorization,
+    /// which is an `m`-column factorization and its allocations for nothing.
+    pub fn unfactored(m: usize) -> Self {
+        Self {
+            m,
+            lu: Lu::empty(m),
+            etas: Vec::new(),
+            ext: Vec::new(),
+            post: Vec::new(),
+            scratch: Scratch::default(),
+            eta_nnz: 0,
+            replayed: 0,
+            spike: Vec::new(),
+            spike_ready: false,
         }
     }
 
@@ -129,6 +165,7 @@ impl Basis {
             return;
         }
         debug_assert_eq!(basic.len(), self.m);
+        self.spike_ready = false;
         // Scatter each row once and read it off per basis position, rather than
         // searching the row for every column.
         let mut dense = vec![0.0; n_structural];
@@ -189,7 +226,7 @@ impl Basis {
 
     /// Pivots applied since the last refactorization.
     pub fn updates(&self) -> usize {
-        self.etas.len() + self.post.len()
+        self.lu.replacements() + self.etas.len() + self.post.len()
     }
 
     /// Whether the eta file has cost enough to be worth rebuilding.
@@ -221,6 +258,20 @@ impl Basis {
                 .map(|e| e.column.len() + 1)
                 .sum::<usize>()
             + self.ext.iter().map(|e| e.row.len() + 1).sum::<usize>()
+    }
+
+    /// [`Basis::ftran`] for the column about to enter the basis, keeping what the
+    /// update that puts it there needs; see [`Basis::update`].
+    pub fn ftran_entering(&mut self, a: &[f64], out: &mut Vec<f64>) {
+        if self.etas.is_empty() && self.ext.is_empty() && self.post.is_empty() {
+            let mut spike = std::mem::take(&mut self.spike);
+            self.lu.ftran_spike(a, out, Some(&mut spike));
+            self.spike = spike;
+            self.spike_ready = true;
+        } else {
+            self.ftran(a, out);
+            self.spike_ready = false;
+        }
     }
 
     /// FTRAN: solve `B d = a`, returning `d = B^-1 a`.
@@ -297,6 +348,8 @@ impl Basis {
     /// Record a pivot on row `r`, where `d = B^-1 a_q` for the entering column.
     ///
     /// The caller is responsible for having rejected a pivot too small to be safe.
+    /// When `d` came from [`Basis::ftran_entering`] with nothing solved for another
+    /// column since, the update reuses what that solve kept.
     pub fn update(&mut self, d: &[f64], r: usize) {
         debug_assert_eq!(d.len(), self.m);
         if self.m == 0 {
@@ -304,6 +357,18 @@ impl Basis {
         }
         let pivot = d[r];
         debug_assert!(pivot != 0.0, "pivot on a zero element");
+        // Into the factors where nothing sits on top of them; see the module notes. An
+        // update the factors refuse goes into the eta file below instead, with every
+        // pivot after it until the next refactorization.
+        let spike_ready = std::mem::take(&mut self.spike_ready);
+        if self.etas.is_empty() && self.ext.is_empty() && self.post.is_empty() {
+            let spike = spike_ready.then_some(self.spike.as_slice());
+            if let Ok(added) = self.lu.replace(d, spike, r) {
+                self.eta_nnz += added;
+                self.replayed += SOLVES_PER_PIVOT * self.eta_nnz;
+                return;
+            }
+        }
         let column = d
             .iter()
             .enumerate()
@@ -333,6 +398,7 @@ impl Basis {
         deadline: Option<std::time::Instant>,
     ) -> Result<(), BasisError> {
         if self.m == 0 {
+            self.spike_ready = false;
             self.etas.clear();
             self.ext.clear();
             self.post.clear();
@@ -343,6 +409,7 @@ impl Basis {
         match Lu::factor_with(self.m, columns, ZERO_TOL, deadline, &mut self.scratch) {
             Ok(lu) => {
                 self.lu = lu;
+                self.spike_ready = false;
                 self.etas.clear();
                 // A fresh factorization covers the appended rows like any other.
                 self.ext.clear();
