@@ -1,4 +1,7 @@
 pub mod basis;
+pub mod cholesky;
+pub mod hvec;
+pub mod ipm;
 pub mod lu;
 pub mod simplex;
 

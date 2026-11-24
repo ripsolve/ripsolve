@@ -24,20 +24,36 @@ fn main() {
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let mut problem = Problem::from_file(std::path::Path::new(&path)).unwrap();
         let started = Instant::now();
-        ripsolve::presolve::presolve(&mut problem, 20);
+        if std::env::var_os("ROOTLP_NOPRESOLVE").is_none() {
+            ripsolve::presolve::presolve(&mut problem, 20);
+        }
         let presolved = started.elapsed().as_secs_f64();
 
         let dual = std::env::var_os("ROOTLP_DUAL").is_some();
         let started = Instant::now();
         let mut lp = Lp::relaxation(&problem);
-        let solved = if dual {
+        if std::env::var_os("ROOTLP_DENSITY").is_some() {
+            let mut tol = lp.tolerances();
+            tol.entering_density_stats = true;
+            lp = lp.with_tolerances(tol);
+        }
+        if std::env::var_os("ROOTLP_DEVEX").is_some() {
+            let mut tol = lp.tolerances();
+            tol.primal_devex = true;
+            lp = lp.with_tolerances(tol);
+        }
+        let solved = if std::env::var_os("ROOTLP_IPM").is_some() {
+            lp.solve_interior(cap)
+        } else if std::env::var_os("ROOTLP_BOXED").is_some() {
+            lp.solve_cold_dual_boxed(cap)
+        } else if dual {
             lp.solve_cold_dual(cap)
         } else {
             lp.solve_with_limit(cap)
         };
         let elapsed = started.elapsed().as_secs_f64();
         let status = match solved.status {
-            LpStatus::Optimal => format!("optimal {:.4}", solved.objective),
+            LpStatus::Optimal => format!("optimal {:.4} ({:e})", solved.objective, solved.objective),
             other => format!("{other:?}"),
         };
         println!(
@@ -48,5 +64,17 @@ fn main() {
             solved.iterations,
             solved.iterations as f64 / elapsed.max(1e-9),
         );
+        if std::env::var_os("RS_TRACE_DUAL").is_some() {
+            eprintln!("    bland {} degenerate {}", solved.bland_iterations, solved.degenerate_iterations);
+        }
+        if solved.entering_solves > 0 {
+            println!(
+                "    entering: {} solves, mean {:.1} nonzeros of {}, {:.0}% hypersparse",
+                solved.entering_solves,
+                solved.entering_nonzeros as f64 / solved.entering_solves as f64,
+                problem.n_rows(),
+                100.0 * solved.entering_sparse_solves as f64 / solved.entering_solves as f64,
+            );
+        }
     }
 }

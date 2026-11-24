@@ -22,6 +22,8 @@
 //! stops once a pivot cannot be beaten. Searching every remaining entry at every
 //! step would itself be quadratic.
 
+use crate::lp::hvec::HVec;
+
 /// The factorization `P B Q = L U`, with `L` unit lower triangular.
 ///
 /// Both factors are held flat, one array of entries with a start offset per pivot
@@ -35,6 +37,10 @@ pub struct Lu {
     prow: Vec<usize>,
     /// Basis position of pivot `k`.
     pcol: Vec<usize>,
+    /// `prow` and `pcol` inverted: the step each row and each basis position is
+    /// pivoted at.
+    row_step: Vec<usize>,
+    col_step: Vec<usize>,
     /// `L` by pivot step, in permuted index space: step `k`'s entries are
     /// `l_entries[l_start[k]..l_start[k + 1]]`, each `(k', multiplier)` with `k' > k`.
     l_start: Vec<usize>,
@@ -270,6 +276,32 @@ const REPLACE_TOLERANCE: f64 = 1e-8;
 /// 150 seconds; bounded at a hundred it takes 19.
 const MAX_MULTIPLIER: f64 = 100.0;
 
+/// Share of the dimension a hypersparse pass may reach before it is done whole
+/// instead; see [`Lu::ftran_h`].
+const HYPER_REACH: f64 = 0.10;
+
+/// Working memory for [`Lu::ftran_h`] and [`Lu::btran_h`], kept between solves. Held
+/// zeroed and unmarked between them, which each solve restores on the way out.
+#[derive(Clone, Default)]
+pub struct SolveWork {
+    w: Vec<f64>,
+    mark: Vec<bool>,
+    list: Vec<usize>,
+    stack: Vec<usize>,
+}
+
+impl SolveWork {
+    fn ready(&mut self, m: usize) {
+        if self.w.len() != m {
+            self.w.clear();
+            self.w.resize(m, 0.0);
+            self.mark.clear();
+            self.mark.resize(m, false);
+        }
+        self.list.clear();
+    }
+}
+
 /// The id, in `entries`, of each entry of the transpose [`transpose`] makes, in the
 /// same order.
 fn transpose_ids(m: usize, start: &[usize], entries: &[(usize, f64)]) -> (Vec<usize>, Vec<u32>) {
@@ -318,6 +350,8 @@ impl Lu {
             m,
             prow: Vec::new(),
             pcol: Vec::new(),
+            row_step: Vec::new(),
+            col_step: Vec::new(),
             l_start: Vec::new(),
             l_entries: Vec::new(),
             u_start: Vec::new(),
@@ -699,6 +733,8 @@ impl Lu {
             m,
             prow,
             pcol,
+            row_step: row_pos.clone(),
+            col_step: col_pos.clone(),
             l_start,
             l_entries,
             u_start,
@@ -851,6 +887,296 @@ impl Lu {
         }
     }
 
+    /// [`Lu::ftran_spike`] on a vector that lists its nonzeros, in place: `x` comes in
+    /// by row and goes out by basis position.
+    ///
+    /// Each triangular pass reaches only the steps the right-hand side can, which a
+    /// search through the factor's graph finds before any arithmetic is done; the
+    /// steps found are then taken in the factor's order. A pass whose reach passes
+    /// [`HYPER_REACH`] of the dimension is done whole instead, as are the ones after
+    /// it, because past that the search costs more than it saves.
+    pub fn ftran_h(&self, x: &mut HVec, spike: Option<&mut HVec>, sw: &mut SolveWork) {
+        let m = self.m;
+        sw.ready(m);
+        let limit = (HYPER_REACH * m as f64) as usize;
+        let mut dense = x.dense || x.idx.len() > limit;
+        if dense {
+            for k in 0..m {
+                sw.w[k] = x.val[self.prow[k]];
+            }
+        } else {
+            for &i in &x.idx {
+                let v = x.val[i];
+                if v != 0.0 {
+                    let k = self.row_step[i];
+                    sw.w[k] = v;
+                    sw.list.push(k);
+                    sw.mark[k] = true;
+                }
+            }
+        }
+        x.reset(m);
+
+        // L z = b.
+        if !dense && !self.reach(sw, limit, |k, f| self.l_col(k).iter().for_each(|&(k2, _)| f(k2))) {
+            dense = true;
+        }
+        if dense {
+            for k in 0..m {
+                let z = sw.w[k];
+                if z != 0.0 {
+                    for &(k2, mult) in self.l_col(k) {
+                        sw.w[k2] -= mult * z;
+                    }
+                }
+            }
+        } else {
+            sw.list.sort_unstable();
+            for &k in &sw.list {
+                let z = sw.w[k];
+                if z != 0.0 {
+                    for &(k2, mult) in self.l_col(k) {
+                        sw.w[k2] -= mult * z;
+                    }
+                }
+            }
+        }
+        if let Some(up) = &self.updated {
+            for (row, eta) in &up.row_etas {
+                let correction: f64 = eta.iter().map(|&(k, r)| r * sw.w[k]).sum();
+                if correction != 0.0 {
+                    sw.w[*row] -= correction;
+                    if !dense && !sw.mark[*row] {
+                        sw.mark[*row] = true;
+                        sw.list.push(*row);
+                    }
+                }
+            }
+        }
+        if let Some(spike) = spike {
+            spike.reset(m);
+            if dense {
+                spike.val.copy_from_slice(&sw.w[..m]);
+                spike.dense = true;
+            } else {
+                for &k in &sw.list {
+                    spike.val[k] = sw.w[k];
+                    spike.idx.push(k);
+                }
+            }
+        }
+
+        // U w = z.
+        if let Some(up) = &self.updated {
+            let base = self.u_entries.len();
+            if !dense
+                && !self.reach(sw, limit, |k, f| self.for_column(up, base, k, |k2, _| f(k2)))
+            {
+                dense = true;
+            }
+            if dense {
+                for &k in up.order.iter().rev() {
+                    if k == usize::MAX || sw.w[k] == 0.0 {
+                        continue;
+                    }
+                    let w = sw.w[k] / self.diag[k];
+                    sw.w[k] = w;
+                    self.for_column(up, base, k, |k2, v| sw.w[k2] -= v * w);
+                }
+            } else {
+                let mut list = std::mem::take(&mut sw.list);
+                list.sort_unstable_by_key(|&k| std::cmp::Reverse(up.slot[k]));
+                for &k in &list {
+                    if sw.w[k] == 0.0 {
+                        continue;
+                    }
+                    let w = sw.w[k] / self.diag[k];
+                    sw.w[k] = w;
+                    self.for_column(up, base, k, |k2, v| sw.w[k2] -= v * w);
+                }
+                sw.list = list;
+            }
+        } else {
+            if !dense && !self.reach(sw, limit, |k, f| self.u_col(k).iter().for_each(|&(k2, _)| f(k2))) {
+                dense = true;
+            }
+            let mut list = std::mem::take(&mut sw.list);
+            if !dense {
+                list.sort_unstable_by(|a, b| b.cmp(a));
+            }
+            let steps: Box<dyn Iterator<Item = usize>> =
+                if dense { Box::new((0..m).rev()) } else { Box::new(list.iter().copied()) };
+            for k in steps {
+                if sw.w[k] == 0.0 {
+                    continue;
+                }
+                let w = sw.w[k] / self.diag[k];
+                sw.w[k] = w;
+                for &(k2, v) in self.u_col(k) {
+                    sw.w[k2] -= v * w;
+                }
+            }
+            sw.list = list;
+        }
+        self.finish(sw, x, dense, &self.pcol);
+    }
+
+    /// [`Lu::btran`] on a vector that lists its nonzeros, in place: `x` comes in by
+    /// basis position and goes out by row. See [`Lu::ftran_h`].
+    pub fn btran_h(&self, x: &mut HVec, sw: &mut SolveWork) {
+        let m = self.m;
+        sw.ready(m);
+        let limit = (HYPER_REACH * m as f64) as usize;
+        let mut dense = x.dense || x.idx.len() > limit;
+        if dense {
+            for k in 0..m {
+                sw.w[k] = x.val[self.pcol[k]];
+            }
+        } else {
+            for &p in &x.idx {
+                let v = x.val[p];
+                if v != 0.0 {
+                    let k = self.col_step[p];
+                    sw.w[k] = v;
+                    sw.list.push(k);
+                    sw.mark[k] = true;
+                }
+            }
+        }
+        x.reset(m);
+
+        // U' v = c.
+        if let Some(up) = &self.updated {
+            if !dense && !self.reach(sw, limit, |k, f| self.for_row(up, k, |k2, _| f(k2))) {
+                dense = true;
+            }
+            let mut list = std::mem::take(&mut sw.list);
+            if !dense {
+                list.sort_unstable_by_key(|&k| up.slot[k]);
+            }
+            let steps: Box<dyn Iterator<Item = usize>> = if dense {
+                Box::new(up.order.iter().copied().filter(|&k| k != usize::MAX))
+            } else {
+                Box::new(list.iter().copied())
+            };
+            for k in steps {
+                if sw.w[k] == 0.0 {
+                    continue;
+                }
+                let v = sw.w[k] / self.diag[k];
+                sw.w[k] = v;
+                self.for_row(up, k, |k2, u| sw.w[k2] -= u * v);
+            }
+            sw.list = list;
+            for (row, eta) in up.row_etas.iter().rev() {
+                let z = sw.w[*row];
+                if z != 0.0 {
+                    for &(k, r) in eta {
+                        sw.w[k] -= r * z;
+                        if !dense && !sw.mark[k] {
+                            sw.mark[k] = true;
+                            sw.list.push(k);
+                        }
+                    }
+                }
+            }
+        } else {
+            if !dense && !self.reach(sw, limit, |k, f| self.u_row(k).iter().for_each(|&(k2, _)| f(k2))) {
+                dense = true;
+            }
+            let mut list = std::mem::take(&mut sw.list);
+            if !dense {
+                list.sort_unstable();
+            }
+            let steps: Box<dyn Iterator<Item = usize>> =
+                if dense { Box::new(0..m) } else { Box::new(list.iter().copied()) };
+            for k in steps {
+                if sw.w[k] == 0.0 {
+                    continue;
+                }
+                let v = sw.w[k] / self.diag[k];
+                sw.w[k] = v;
+                for &(k2, u) in self.u_row(k) {
+                    sw.w[k2] -= u * v;
+                }
+            }
+            sw.list = list;
+        }
+
+        // L' u = v.
+        if !dense && !self.reach(sw, limit, |k, f| self.l_row(k).iter().for_each(|&(k2, _)| f(k2))) {
+            dense = true;
+        }
+        let mut list = std::mem::take(&mut sw.list);
+        if !dense {
+            list.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        let steps: Box<dyn Iterator<Item = usize>> =
+            if dense { Box::new((0..m).rev()) } else { Box::new(list.iter().copied()) };
+        for k in steps {
+            let v = sw.w[k];
+            if v != 0.0 {
+                for &(k2, mult) in self.l_row(k) {
+                    sw.w[k2] -= mult * v;
+                }
+            }
+        }
+        sw.list = list;
+        self.finish(sw, x, dense, &self.prow);
+    }
+
+    /// Extend `sw.list` to every step reachable from it along `edges`, marking each.
+    /// Gives up, returning false, once the list passes `limit`; the marks and the list
+    /// are left as they are, which the caller's dense pass does not read.
+    fn reach(
+        &self,
+        sw: &mut SolveWork,
+        limit: usize,
+        edges: impl Fn(usize, &mut dyn FnMut(usize)),
+    ) -> bool {
+        let SolveWork { list, mark, stack, .. } = sw;
+        stack.clear();
+        stack.extend_from_slice(list);
+        while let Some(k) = stack.pop() {
+            edges(k, &mut |k2| {
+                if !mark[k2] {
+                    mark[k2] = true;
+                    list.push(k2);
+                    stack.push(k2);
+                }
+            });
+            if list.len() > limit {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Write the solve out of step space into `x` through `perm`, and leave the
+    /// scratch zeroed for the next one.
+    fn finish(&self, sw: &mut SolveWork, x: &mut HVec, dense: bool, perm: &[usize]) {
+        let m = self.m;
+        if dense {
+            for k in 0..m {
+                x.val[perm[k]] = sw.w[k];
+                sw.w[k] = 0.0;
+                sw.mark[k] = false;
+            }
+            x.dense = true;
+        } else {
+            for &k in &sw.list {
+                let v = sw.w[k];
+                if v != 0.0 {
+                    x.val[perm[k]] = v;
+                    x.idx.push(perm[k]);
+                }
+                sw.w[k] = 0.0;
+                sw.mark[k] = false;
+            }
+        }
+        sw.list.clear();
+    }
+
     /// Every entry `(step, value)` still in column `k` of the updated `U`, off the
     /// diagonal.
     #[inline]
@@ -913,7 +1239,7 @@ impl Lu {
     pub fn replace(
         &mut self,
         d: &[f64],
-        spike: Option<&[f64]>,
+        spike: Option<&HVec>,
         position: usize,
     ) -> Result<usize, Unstable> {
         let m = self.m;
@@ -948,14 +1274,23 @@ impl Lu {
         &mut self,
         up: &mut Updated,
         d: &[f64],
-        given: Option<&[f64]>,
+        given: Option<&HVec>,
         position: usize,
         base: usize,
     ) -> Result<usize, Unstable> {
         let t = up.step_of[position];
+        // `spike` is held zeroed between updates. Where it is set from a list, the list
+        // is what is read back and what zeroes it again; otherwise both are whole.
         let mut spike = std::mem::take(&mut up.spike);
+        let listed = given.filter(|g| !g.dense).map(|g| g.idx.as_slice());
         if let Some(given) = given {
-            spike.copy_from_slice(given);
+            if given.dense {
+                spike.copy_from_slice(&given.val);
+            } else {
+                for &k in &given.idx {
+                    spike[k] = given.val[k];
+                }
+            }
         } else {
             // `U w`, with `w` the solve in step order.
             spike.iter_mut().for_each(|v| *v = 0.0);
@@ -998,6 +1333,7 @@ impl Lu {
                     up.work[k] = 0.0;
                 }
                 up.spike = spike;
+                Self::clear_spike(&mut up.spike, listed);
                 return Err(Unstable);
             }
             eta.push((c, r));
@@ -1017,6 +1353,7 @@ impl Lu {
             || (diagonal - expected).abs() > REPLACE_TOLERANCE * diagonal.abs().max(expected.abs())
         {
             up.spike = spike;
+            Self::clear_spike(&mut up.spike, listed);
             return Err(Unstable);
         }
 
@@ -1039,14 +1376,18 @@ impl Lu {
         up.row_extra[t].clear();
         // The spike becomes column t, every entry above the diagonal now t is last.
         let start = up.spikes.len() as u32;
-        for (k, &v) in spike.iter().enumerate() {
+        let mut put = |k: usize, v: f64| {
             if k == t || v.abs() <= SPIKE_ZERO {
-                continue;
+                return;
             }
             let id = (base + up.spikes.len()) as u32;
             up.spikes.push((k, v));
             up.dead.push(false);
             up.row_extra[k].push((t, v, id));
+        };
+        match listed {
+            Some(list) => list.iter().for_each(|&k| put(k, spike[k])),
+            None => spike.iter().enumerate().for_each(|(k, &v)| put(k, v)),
         }
         up.column[t] = Some((start, up.spikes.len() as u32));
         self.diag[t] = diagonal;
@@ -1056,8 +1397,17 @@ impl Lu {
         let added = up.spikes.len() - start as usize + eta.len() + 1;
         up.row_etas.push((t, eta));
         up.spike = spike;
+        Self::clear_spike(&mut up.spike, listed);
         Ok(added)
     }
+
+    fn clear_spike(spike: &mut [f64], listed: Option<&[usize]>) {
+        match listed {
+            Some(list) => list.iter().for_each(|&k| spike[k] = 0.0),
+            None => spike.fill(0.0),
+        }
+    }
+
 
     /// Stored nonzeros in both factors, for diagnostics and refactorization policy.
     /// Counted once, though each is held in both orientations.
@@ -1217,7 +1567,12 @@ mod tests {
                 }
                 let replacements = lu.replacements();
                 // Alternately with the spike kept and multiplied back out.
-                let given = (taken % 2 == 0).then_some(spike.as_slice());
+                let spike = HVec {
+                    val: spike,
+                    idx: Vec::new(),
+                    dense: true,
+                };
+                let given = (taken % 2 == 0).then_some(&spike);
                 if lu.replace(&d, given, position).is_err() {
                     // Start the next run of updates from fresh factors: what is checked
                     // here is the updates, and a solve would put this one in an eta file.
@@ -1243,6 +1598,85 @@ mod tests {
             }
             assert!(taken > m, "seed {seed}: only {taken} updates taken");
         }
+    }
+
+    #[test]
+    fn hypersparse_solves_match_the_dense_ones_through_updates() {
+        let close = |a: &[f64], b: &[f64]| {
+            a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-9 * (1.0 + x.abs().max(y.abs())))
+        };
+        let mut sparse_solves = 0;
+        for seed in 0..6u64 {
+            let mut rng = Rng(700 + seed);
+            let m = 200 + rng.below(200);
+            let mut dense: Vec<Vec<f64>> = (0..m)
+                .map(|p| {
+                    let mut col = vec![0.0; m];
+                    col[p] = 4.0 + rng.below(5) as f64;
+                    if rng.below(3) == 0 {
+                        col[rng.below(m)] += rng.value();
+                    }
+                    col
+                })
+                .collect();
+            let mut lu = loop {
+                if let Ok(lu) = Lu::factor(m, &sparse(m, &dense), 1e-12, None) {
+                    break lu;
+                }
+                let p = rng.below(m);
+                dense[p][p] += 7.0;
+            };
+            let mut sw = SolveWork::default();
+            for _ in 0..3 * m {
+                // A solve of each kind against the dense one, on a sparse right-hand side.
+                let mut rhs = vec![0.0; m];
+                for _ in 0..1 + rng.below(3) {
+                    rhs[rng.below(m)] = rng.value();
+                }
+                let mut x = HVec::default();
+                let mut want = Vec::new();
+                x.set_dense(&rhs);
+                lu.ftran_h(&mut x, None, &mut sw);
+                lu.ftran(&rhs, &mut want);
+                assert!(close(&x.val, &want), "seed {seed}: ftran_h differs");
+                sparse_solves += usize::from(!x.dense);
+                if !x.dense {
+                    let listed: std::collections::HashSet<usize> = x.idx.iter().copied().collect();
+                    assert_eq!(listed.len(), x.idx.len(), "seed {seed}: listed twice");
+                    assert!((0..m).all(|i| x.val[i] == 0.0 || listed.contains(&i)), "seed {seed}: unlisted");
+                }
+                x.set_dense(&rhs);
+                lu.btran_h(&mut x, &mut sw);
+                lu.btran(&rhs, &mut want);
+                assert!(close(&x.val, &want), "seed {seed}: btran_h differs");
+
+                // Then an update through the sparse spike.
+                let position = rng.below(m);
+                let mut col = vec![0.0; m];
+                col[position] = 3.0 + rng.value();
+                if rng.below(2) == 0 {
+                    col[rng.below(m)] += rng.value();
+                }
+                let mut d = HVec::default();
+                let mut spike = HVec::default();
+                d.set_dense(&col);
+                lu.ftran_h(&mut d, Some(&mut spike), &mut sw);
+                if d.val[position].abs() < 0.05 {
+                    continue;
+                }
+                if lu.replace(&d.val, Some(&spike), position).is_err() {
+                    dense[position] = col;
+                    lu = Lu::factor(m, &sparse(m, &dense), 1e-12, None).unwrap();
+                    continue;
+                }
+                dense[position] = col;
+                let columns = sparse(m, &dense);
+                let fresh = Lu::factor(m, &columns, 1e-12, None).unwrap();
+                let (updated, reference) = (residual(m, &columns, &lu), residual(m, &columns, &fresh));
+                assert!(updated <= 1e-8 + 100.0 * reference, "seed {seed}: residual {updated:e}");
+            }
+        }
+        assert!(sparse_solves > 1000, "only {sparse_solves} solves stayed sparse");
     }
 
     #[test]

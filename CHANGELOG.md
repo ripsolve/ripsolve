@@ -26,6 +26,13 @@
 
 ### Fixed
 
+- **A singular basis is repaired without listing a logical twice.** The repair swaps a
+  logical into the position the factorization could not pivot, preferring the one of
+  the same index, and took it even when it was already basic at another position. A
+  later repair there parked it while the first position still listed it, and phase 1
+  then read a violation off a column it priced as nonbasic: the cold dual entry on
+  `piperout-27` reported a relaxation whose optimum is 7114.21 infeasible. It now
+  finds the optimum in 11724 pivots.
 - **A bound proven before a restart is kept.** A later pass that stopped before proving
   a bound of its own reported none: `h80x6320d` at 30 seconds on one thread said "no
   bound proven" after its first pass had proven 6344, and now reports a gap of 1.55%.
@@ -70,6 +77,40 @@
   reports `TimeLimit` if that comes first.
 
 ### Performance
+
+- **An interior-point method races the simplex methods at the root.** With three or
+  more threads, a Mehrotra predictor-corrector method runs beside the primal and dual
+  simplex methods on the root relaxation, and whichever finishes first is used. It
+  factors the normal equations with a supernodal sparse Cholesky under an approximate
+  minimum degree ordering, or factors their column form when that is smaller, as on
+  models with far more rows than columns. A crossover then turns its point into a
+  basis: it crashes the columns the point has off their bounds into a basis, pushes
+  the remaining ones onto bounds, moves the duals until every basic reduced cost is
+  zero, and finishes with a short warm simplex solve. Of the 61 benchmark roots that
+  neither simplex method solves in a minute, it solves 22 in two minutes, among them
+  `s100` and `s250r10`, which HiGHS's simplex and interior-point methods both fail to
+  solve in two minutes; `bab6` takes 25 seconds and `neos-3988577-wolgan` 17.
+  At 80 seconds on 12 threads it gets 8 of those 22 through the root where the run
+  without it does not: `bab6`, `map16715-04`, `neos-3988577-wolgan`, `neos-873061`,
+  `nursesched-medium-hint03`, `sing44`, `thor50dday` and `uccase12`. It costs none
+  of them a root it reached before. `--no-root-interior` turns it off.
+- **The root relaxation is solved by the dual method first.** Its costs are perturbed
+  from the first pivot, whatever they are, and a model whose costs point at bounds its
+  columns lack is boxed for it and finished warm without the box. Over MIPLIB's 240
+  benchmark instances, root relaxations alone on one thread, the dual method takes 0.49
+  of the primal's time where both finish: `neos-827175`'s takes 6191 pivots and 4
+  seconds against 80128 and 56, `graph20-20-1rand`'s 1403 against 83203. It has models
+  it wanders on, so it gets one and a half pivots per row and column before the primal
+  method starts afresh. With this and the other entries here, the 240 at 80 seconds
+  on 12 threads close 30 against 23, with no wrong answers: `dano3_3`,
+  `neos-1122047`, `neos-1582420`, `neos-2987310-joes`, `neos-787933`, `neos-827175`,
+  `neos-860300` and `ns1208400` close, and `neos-3381206-awhea`, whose root bound
+  lands either side of an integer by chance, no longer does.
+- **Solves skip the zeros of sparse vectors.** The basis solves find which positions a
+  right-hand side can reach before doing any arithmetic, and the simplex loops that
+  read the results read only those, where they read every row before. A dual pivot on
+  `neos-1122047`, 57791 rows, goes from 3.1 to 0.8 milliseconds, on `unitcal_7` from
+  2.9 to 0.7; small models are unchanged.
 
 General MIP, which the pure binary set does not exercise. Measured on instances from
 MIPLIB 2017's benchmark set that HiGHS and SCIP both close in seconds, at thirty

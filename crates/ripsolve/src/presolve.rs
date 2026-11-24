@@ -54,6 +54,10 @@ pub enum Outcome {
 
 const TOL: f64 = 1e-9;
 
+/// The share of a continuous column's range a propagated bound has to move it by to
+/// be taken; see [`propagate`].
+const CONTINUOUS_STEP: f64 = 1e-3;
+
 /// A row's coefficients, as `(column, value)` pairs.
 type Row = Vec<(usize, f64)>;
 
@@ -85,6 +89,41 @@ pub fn presolve_with(
     deadline: Option<std::time::Instant>,
     dual: bool,
 ) -> Outcome {
+    presolve_linking(problem, max_rounds, deadline, dual, None)
+}
+
+/// A column probing found to follow a binary: `at_zero` when the binary is 0 and
+/// `at_one` when it is 1, so `column = at_zero + (at_one - at_zero) * switch` at every
+/// integer point of the model presolve leaves.
+///
+/// Presolve cannot act on one, since it renumbers nothing; [`crate::reduce`] does,
+/// by substituting the column out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Link {
+    pub column: usize,
+    pub switch: usize,
+    pub at_zero: f64,
+    pub at_one: f64,
+}
+
+/// [`presolve_with`], also collecting the [`Link`]s its probing finds.
+pub fn presolve_links(
+    problem: &mut Problem,
+    max_rounds: usize,
+    deadline: Option<std::time::Instant>,
+) -> (Outcome, Vec<Link>) {
+    let mut links = Vec::new();
+    let outcome = presolve_linking(problem, max_rounds, deadline, true, Some(&mut links));
+    (outcome, links)
+}
+
+fn presolve_linking(
+    problem: &mut Problem,
+    max_rounds: usize,
+    deadline: Option<std::time::Instant>,
+    dual: bool,
+    links: Option<&mut Vec<Link>>,
+) -> Outcome {
     let n = problem.n_cols();
     let m = problem.n_rows();
     let mut stats = Stats::default();
@@ -115,11 +154,32 @@ pub fn presolve_with(
     }
 
     // Probing last, on the model the cheap reductions have already shrunk.
-    if !probe_columns(problem, &mut stats, deadline) {
+    if !probe_columns(problem, &mut stats, deadline, links) {
         return Outcome::Infeasible;
     }
 
     debug_assert_eq!(problem.n_cols(), n);
+    Outcome::Reduced(stats)
+}
+
+/// Only the row-at-a-time reductions, with no conflict passes and no probing.
+///
+/// For [`crate::reduce`], which alternates with this: each of its eliminations can
+/// leave a row the cheap reductions now settle, and each of theirs a column it can
+/// eliminate. The expensive half runs once, later, on what is left.
+pub fn presolve_cheap(problem: &mut Problem, max_rounds: usize) -> Outcome {
+    let mut stats = Stats::default();
+    let csr = problem.matrix.to_csr();
+    let mut rows: Vec<Row> = (0..problem.n_rows())
+        .map(|i| {
+            let (cols, vals) = csr.column(i);
+            cols.iter().copied().zip(vals.iter().copied()).collect()
+        })
+        .collect();
+    if !cheap_reductions(problem, &mut rows, max_rounds, true, &mut stats) {
+        return Outcome::Infeasible;
+    }
+    rebuild_matrix(problem, &rows);
     Outcome::Reduced(stats)
 }
 
@@ -337,6 +397,23 @@ fn propagate(
         if new_lb > new_ub + TOL {
             return Propagation::Infeasible;
         }
+        // A continuous column's bounds are only taken when they move by a share of its
+        // range. Two rows can pass a continuous bound back and forth, each tightening
+        // the other by a constant factor towards a limit they never reach: x6 + 2 x7 = -2
+        // and 3 x4 + 2 x6 + x7 = -1 take x7 from -1.5 to -1.125 to -1.03 and on, and after
+        // twenty rounds x6 sits at 9.3e-10 with its rounding error read as a
+        // contradiction, on a model with an optimum. An integer column rounds, so it
+        // cannot creep.
+        let (new_lb, new_ub) = if problem.is_integer(j) {
+            (new_lb, new_ub)
+        } else {
+            let (old_lb, old_ub) = (problem.col_lb[j], problem.col_ub[j]);
+            let range = old_ub - old_lb;
+            let step = CONTINUOUS_STEP * if range.is_finite() { range.max(1.0) } else { 1.0 };
+            let lb = if new_lb > old_lb + step || old_lb == f64::NEG_INFINITY { new_lb } else { old_lb };
+            let ub = if new_ub < old_ub - step || old_ub == f64::INFINITY { new_ub } else { old_ub };
+            (lb, ub)
+        };
         if new_lb > problem.col_lb[j] + TOL || new_ub < problem.col_ub[j] - TOL {
             let was_fixed = problem.col_lb[j] == problem.col_ub[j];
             problem.col_lb[j] = new_lb;
@@ -764,6 +841,7 @@ fn probe_columns(
     problem: &mut Problem,
     stats: &mut Stats,
     deadline: Option<std::time::Instant>,
+    mut links: Option<&mut Vec<Link>>,
 ) -> bool {
     use crate::heuristic::Sweep;
     // Matrix entries between two readings of the clock. Counting probes instead prices
@@ -791,7 +869,12 @@ fn probe_columns(
     let mut candidates: Vec<(usize, usize)> = (0..n)
         .filter(|&j| crate::heuristic::is_binary_column(problem, j) && !state.fixed(j))
         .map(|j| {
-            let reach = conflicts.degree(2 * j as u32) + conflicts.degree(2 * j as u32 + 1);
+            // Rows as well as conflicts: a column in no clique can still force others
+            // through a row, as each column of `nu25-pr12`'s flow equations does, and
+            // counting conflicts alone never probed them.
+            let reach = conflicts.degree(2 * j as u32)
+                + conflicts.degree(2 * j as u32 + 1)
+                + problem.matrix.column(j).0.len();
             (j, reach)
         })
         .collect();
@@ -880,8 +963,17 @@ fn probe_columns(
                 state.fixed_since(mark, &mut settled);
                 for &k in &settled {
                     let held = under_zero[k];
-                    if state.fixed(k) && (held - state.value(k)).abs() <= TOL {
+                    if !state.fixed(k) {
+                        continue;
+                    }
+                    if (held - state.value(k)).abs() <= TOL {
                         agreed.push((k, held));
+                    } else if held.is_finite()
+                        && k != j
+                        && let Some(links) = links.as_deref_mut()
+                    {
+                        // Each value of j forces k to its own value, so k follows j.
+                        links.push(Link { column: k, switch: j, at_zero: held, at_one: state.value(k) });
                     }
                 }
                 state.rewind(mark);

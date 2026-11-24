@@ -31,7 +31,8 @@
 //! replaced, and Forrest-Tomlin came in behind it without the simplex driver
 //! noticing.
 
-use crate::lp::lu::{FactorError, Lu, Scratch};
+use crate::lp::hvec::HVec;
+use crate::lp::lu::{FactorError, Lu, Scratch, SolveWork};
 
 /// Why a refactorization could not produce a usable basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,8 +98,10 @@ pub struct Basis {
     replayed: usize,
     /// What [`Basis::ftran_entering`] kept of its solve for the update that follows it,
     /// and whether it still applies.
-    spike: Vec<f64>,
+    spike: HVec,
     spike_ready: bool,
+    /// Working memory for the hypersparse solves.
+    work: SolveWork,
 }
 
 /// Solves a pivot asks of the basis, each of which replays the whole eta file: the
@@ -122,8 +125,9 @@ impl Basis {
             scratch: Scratch::default(),
             eta_nnz: 0,
             replayed: 0,
-            spike: Vec::new(),
+            spike: HVec::default(),
             spike_ready: false,
+            work: SolveWork::default(),
         }
     }
 
@@ -143,8 +147,9 @@ impl Basis {
             scratch: Scratch::default(),
             eta_nnz: 0,
             replayed: 0,
-            spike: Vec::new(),
+            spike: HVec::default(),
             spike_ready: false,
+            work: SolveWork::default(),
         }
     }
 
@@ -264,9 +269,11 @@ impl Basis {
     /// update that puts it there needs; see [`Basis::update`].
     pub fn ftran_entering(&mut self, a: &[f64], out: &mut Vec<f64>) {
         if self.etas.is_empty() && self.ext.is_empty() && self.post.is_empty() {
-            let mut spike = std::mem::take(&mut self.spike);
+            let mut spike = Vec::new();
             self.lu.ftran_spike(a, out, Some(&mut spike));
-            self.spike = spike;
+            self.spike.val = spike;
+            self.spike.idx.clear();
+            self.spike.dense = true;
             self.spike_ready = true;
         } else {
             self.ftran(a, out);
@@ -362,7 +369,7 @@ impl Basis {
         // pivot after it until the next refactorization.
         let spike_ready = std::mem::take(&mut self.spike_ready);
         if self.etas.is_empty() && self.ext.is_empty() && self.post.is_empty() {
-            let spike = spike_ready.then_some(self.spike.as_slice());
+            let spike = spike_ready.then_some(&self.spike);
             if let Ok(added) = self.lu.replace(d, spike, r) {
                 self.eta_nnz += added;
                 self.replayed += SOLVES_PER_PIVOT * self.eta_nnz;
@@ -375,11 +382,143 @@ impl Basis {
             .filter(|&(i, &v)| i != r && v.abs() > ZERO_TOL)
             .map(|(i, &v)| (i, v))
             .collect();
-        let eta = Eta {
+        self.push_eta(Eta {
             row: r,
             pivot,
             column,
-        };
+        });
+    }
+
+    /// Whether the solves can stay hypersparse: nothing sits above the factors but
+    /// the eta file. Rows appended since the factorization are solved densely.
+    fn plain(&self) -> bool {
+        self.ext.is_empty() && self.post.is_empty()
+    }
+
+    /// [`Basis::ftran`] in place on a vector that lists its nonzeros.
+    pub fn ftran_h(&mut self, x: &mut HVec) {
+        self.ftran_h_with(x, false);
+    }
+
+    /// [`Basis::ftran_entering`] in place on a vector that lists its nonzeros.
+    pub fn ftran_entering_h(&mut self, x: &mut HVec) {
+        self.ftran_h_with(x, true);
+    }
+
+    fn ftran_h_with(&mut self, x: &mut HVec, entering: bool) {
+        // Only the entering column's solve writes the spike; any other leaves the one
+        // the entering column kept for the update that follows it.
+        if entering {
+            self.spike_ready = false;
+        }
+        if !self.plain() {
+            let mut out = Vec::new();
+            if entering {
+                self.ftran_entering(&x.val, &mut out);
+            } else {
+                self.ftran(&x.val, &mut out);
+            }
+            x.val = out;
+            x.idx.clear();
+            x.dense = true;
+            return;
+        }
+        if entering && self.etas.is_empty() {
+            let mut spike = std::mem::take(&mut self.spike);
+            self.lu.ftran_h(x, Some(&mut spike), &mut self.work);
+            self.spike = spike;
+            self.spike_ready = true;
+        } else {
+            self.lu.ftran_h(x, None, &mut self.work);
+        }
+        for eta in &self.etas {
+            let scaled = x.val[eta.row] / eta.pivot;
+            x.val[eta.row] = scaled;
+            if scaled != 0.0 {
+                for &(i, v) in &eta.column {
+                    let was = x.val[i];
+                    if !x.dense && was == 0.0 {
+                        x.idx.push(i);
+                    }
+                    x.val[i] -= v * scaled;
+                    if was != 0.0 && x.val[i] == 0.0 {
+                        // See the same case in `btran_h`.
+                        x.dense = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Basis::btran`] in place on a vector that lists its nonzeros.
+    pub fn btran_h(&mut self, x: &mut HVec) {
+        if !self.plain() {
+            let mut out = Vec::new();
+            self.btran(&x.val, &mut out);
+            x.val = out;
+            x.idx.clear();
+            x.dense = true;
+            return;
+        }
+        for eta in self.etas.iter().rev() {
+            let mut acc = x.val[eta.row];
+            for &(i, v) in &eta.column {
+                acc -= v * x.val[i];
+            }
+            let was = x.val[eta.row];
+            if !x.dense && was == 0.0 && acc != 0.0 {
+                x.idx.push(eta.row);
+            }
+            x.val[eta.row] = acc / eta.pivot;
+            if was != 0.0 && acc == 0.0 {
+                // Cancelled to zero while listed: listing it again later would list it
+                // twice, so the list is given up instead. Exact cancellation is rare.
+                x.dense = true;
+            }
+        }
+        self.lu.btran_h(x, &mut self.work);
+    }
+
+    /// [`Basis::btran_unit`] into a vector that lists its nonzeros.
+    pub fn btran_unit_h(&mut self, r: usize, x: &mut HVec) {
+        x.set_unit(self.m, r);
+        self.btran_h(x);
+    }
+
+    /// [`Basis::update`] from a vector that lists its nonzeros.
+    pub fn update_h(&mut self, d: &HVec, r: usize) {
+        if d.dense {
+            self.update(&d.val, r);
+            return;
+        }
+        if self.m == 0 {
+            return;
+        }
+        let pivot = d.val[r];
+        debug_assert!(pivot != 0.0, "pivot on a zero element");
+        let spike_ready = std::mem::take(&mut self.spike_ready);
+        if self.etas.is_empty() && self.ext.is_empty() && self.post.is_empty() {
+            let spike = spike_ready.then_some(&self.spike);
+            if let Ok(added) = self.lu.replace(&d.val, spike, r) {
+                self.eta_nnz += added;
+                self.replayed += SOLVES_PER_PIVOT * self.eta_nnz;
+                return;
+            }
+        }
+        let column = d
+            .idx
+            .iter()
+            .map(|&i| (i, d.val[i]))
+            .filter(|&(i, v)| i != r && v.abs() > ZERO_TOL)
+            .collect();
+        self.push_eta(Eta {
+            row: r,
+            pivot,
+            column,
+        });
+    }
+
+    fn push_eta(&mut self, eta: Eta) {
         self.eta_nnz += eta.column.len() + 1;
         self.replayed += SOLVES_PER_PIVOT * self.eta_nnz;
         // A pivot taken after the basis grew sits above the extension, not beneath it.
@@ -662,3 +801,4 @@ mod tests {
         assert_eq!(b.updates(), 0);
     }
 }
+

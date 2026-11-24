@@ -85,6 +85,9 @@ enum Command {
         /// Skip the conflict-driven search that runs before the relaxation.
         #[arg(long)]
         no_cdcl: bool,
+        /// Leave the interior-point method out of the root relaxation's race.
+        #[arg(long)]
+        no_root_interior: bool,
         /// Rounds of root cut separation. Zero disables cuts.
         #[arg(long, default_value_t = 50)]
         cut_rounds: usize,
@@ -186,6 +189,7 @@ fn main() -> Result<()> {
             rapid_learning,
             no_aggregate,
             no_cdcl,
+            no_root_interior,
             cut_rounds,
             cuts_per_round,
             local_cut_frequency,
@@ -214,6 +218,7 @@ fn main() -> Result<()> {
                 rapid_learning,
                 aggregate: !no_aggregate,
                 cdcl: !no_cdcl,
+                root_interior: !no_root_interior,
                 threads: threads
                     .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
                 cut_rounds,

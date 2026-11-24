@@ -29,6 +29,7 @@
 //! uses. Replacing it is an M1b concern, not a correctness one.
 
 use crate::lp::basis::{Basis, BasisError};
+use crate::lp::hvec::HVec;
 use crate::model::Problem;
 use std::time::Instant;
 
@@ -37,6 +38,14 @@ use crate::sparse::SparseMatrix;
 /// Singular-basis repairs between clock reads. Each repair costs a factorization, so
 /// this is far smaller than the interval between simplex iterations.
 const REPAIR_CLOCK_INTERVAL: usize = 8;
+
+/// Rows the dual method may pass over for want of a safe pivot before it hands the
+/// basis to the primal method.
+const MAX_REJECTED_ROWS: usize = 50;
+
+/// Times a cold dual solve flips boxed columns to the bound the real costs want and
+/// solves on, once the perturbation is gone, before it hands over to the primal method.
+const CLEANUP_ROUNDS: usize = 3;
 
 /// Refactorize once the eta file's nonzeros reach this multiple of the factors' own.
 ///
@@ -155,6 +164,9 @@ pub struct Tolerances {
     /// them, 11.7 seconds to 29.7. Instances closed count for more than time on those
     /// already closed, which is what decides it.
     pub warm_steepest_edge: bool,
+    /// Let the dual ratio test pass boxed columns' breakpoints, flipping them to
+    /// their other bound, rather than stop at the first.
+    pub long_step: bool,
 }
 
 impl Default for Tolerances {
@@ -167,6 +179,7 @@ impl Default for Tolerances {
             primal_devex: false,
             entering_density_stats: false,
             warm_steepest_edge: true,
+            long_step: true,
         }
     }
 }
@@ -628,19 +641,6 @@ impl Lp {
         }
     }
 
-    /// Scatter column `j` of `[A | -I]` into a dense buffer of length `m`.
-    fn column_into(&self, j: usize, out: &mut [f64]) {
-        out.fill(0.0);
-        if j < self.n_structural {
-            let (rows, vals) = self.matrix.column(j);
-            for (&i, &v) in rows.iter().zip(vals) {
-                out[i] = v;
-            }
-        } else {
-            out[j - self.n_structural] = -1.0;
-        }
-    }
-
     /// The bound a nonbasic variable sits on.
     fn value_at(&self, j: usize, at: At) -> f64 {
         match at {
@@ -709,6 +709,277 @@ impl Lp {
             self.factors.truncate(FACTOR_CACHE);
         }
         solution
+    }
+
+    /// [`Lp::solve_cold_dual`] for a model that cannot be parked dual feasibly as it
+    /// stands, by boxing it first.
+    ///
+    /// What stops the cold dual entry is a column whose cost points at a bound it does
+    /// not have. Given one [`ARTIFICIAL_BOX`] away it parks there like any other, the
+    /// dual method solves the boxed model, and the true bounds go back before a warm
+    /// solve from the basis it ended on: a column left on an artificial bound is
+    /// re-parked on a real one, which the warm solve then repairs, and a column that
+    /// was not is already where the real model has it. An infeasible boxed model says
+    /// nothing about the real one, whose region the box only narrowed, so it is
+    /// reported as no answer rather than as a proof.
+    pub fn solve_cold_dual_boxed(&mut self, max_iterations: usize) -> LpSolution {
+        let tol = self.tol.dual_feasibility;
+        let mut boxed = Vec::new();
+        for j in 0..self.n_structural {
+            let (lo, hi) = (self.lower[j], self.upper[j]);
+            if lo == hi {
+                continue;
+            }
+            if self.cost[j] > tol && !lo.is_finite() {
+                self.lower[j] = if hi.is_finite() { hi - ARTIFICIAL_BOX } else { -ARTIFICIAL_BOX };
+            } else if self.cost[j] < -tol && !hi.is_finite() {
+                self.upper[j] = if lo.is_finite() { lo + ARTIFICIAL_BOX } else { ARTIFICIAL_BOX };
+            } else {
+                continue;
+            }
+            boxed.push((j, lo, hi));
+        }
+        let first = self.solve_cold_dual(max_iterations);
+        if boxed.is_empty() {
+            return first;
+        }
+        for &(j, lo, hi) in &boxed {
+            self.lower[j] = lo;
+            self.upper[j] = hi;
+        }
+        if first.status != LpStatus::Optimal {
+            return LpSolution {
+                status: LpStatus::IterationLimit,
+                farkas: None,
+                ..first
+            };
+        }
+        let mut rest = self.solve_warm(&first.basis, None, max_iterations.saturating_sub(first.iterations));
+        rest.iterations += first.iterations;
+        rest
+    }
+
+    /// Solve through the interior-point method, then cross over to a vertex.
+    ///
+    /// [`crate::lp::ipm`] ends near the middle of the optimal face. The crossover
+    /// ranks every variable by how far inside its bounds it sits against the size of
+    /// its reduced cost, makes the `m` most interior basic, and parks the rest on the
+    /// bound they are nearest, on the side their reduced cost points to; a basis that
+    /// comes out singular is repaired with logicals by the factorization. That basis is
+    /// optimal for a problem next to this one, and the simplex method finishes from
+    /// it, warm, in `max_iterations` pivots at most.
+    ///
+    /// Reports `IterationLimit` when the interior-point method does not converge.
+    pub fn solve_interior(&mut self, max_iterations: usize) -> LpSolution {
+        let began = Instant::now();
+        let result = crate::lp::ipm::solve(
+            &self.matrix,
+            &self.cost,
+            &self.lower,
+            &self.upper,
+            self.deadline,
+            self.interrupt.as_ref(),
+        );
+        if !matches!(
+            result.status,
+            crate::lp::ipm::IpmStatus::Optimal | crate::lp::ipm::IpmStatus::Approximate
+        ) {
+            return LpSolution {
+                status: LpStatus::IterationLimit,
+                objective: f64::NAN,
+                x: Vec::new(),
+                iterations: 0,
+                bland_iterations: 0,
+                degenerate_iterations: 0,
+                farkas: None,
+                entering_solves: 0,
+                entering_nonzeros: 0,
+                entering_sparse_solves: 0,
+                basis: BasisState {
+                    basic: Vec::new(),
+                    status: Vec::new(),
+                },
+            };
+        }
+        let interior = began.elapsed().as_secs_f64();
+        let start = self.crossover_basis(&result.v, &result.z);
+        let crashed = began.elapsed().as_secs_f64();
+        let mut pushed = crashed;
+        let (solved, pushes) = {
+            let lp = &*self;
+            let mut solver = Solver::warm(lp, &start, None);
+            match solver
+                .push_to_bounds(&result.v, &result.z)
+                .and_then(|pushes| Ok(pushes + solver.dual_push(
+                    &result.y,
+                    (result.status == crate::lp::ipm::IpmStatus::Optimal).then_some(&result.v[..]),
+                )?))
+                .inspect(|_| {
+                    // Bounds broken by no more than rounding are the primal method's to
+                    // finish. From a crossover basis of the presolved
+                    // `neos-3656078-kumeu` with three broken by 1e-4 in all, the primal
+                    // method took 32 pivots, where the dual method wandered 6858 and
+                    // handed over a basis 9e4 out of bounds.
+                    // Otherwise the dual method takes the basis, with any reduced costs
+                    // left a hair wrong shifted out of its way.
+                    if solver.worst_violation() < CROSSOVER_PRIMAL_FINISH {
+                        solver.entry_hint = Entry::Primal;
+                    } else {
+                        solver.shift_to_dual_feasible();
+                    }
+                })
+            {
+                Ok(pushes) => {
+                    pushed = began.elapsed().as_secs_f64();
+                    let (solved, basic, basis) = solver.run(max_iterations, None);
+                    if let Some(basis) = basis {
+                        self.factors.insert(0, (basic, basis));
+                        self.factors.truncate(FACTOR_CACHE);
+                    }
+                    (solved, pushes)
+                }
+                Err(status) => (solver.done(status, 0).0, 0),
+            }
+        };
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!(
+                "interior {} iterations {interior:.2}s objective {:.10e}; crossover crash {:.2}s, {pushes} pushes {:.2}s, {} pivots {:.2}s {:?} {:.10e}",
+                result.iterations,
+                result.objective,
+                crashed - interior,
+                pushed - crashed,
+                solved.iterations,
+                began.elapsed().as_secs_f64() - pushed,
+                solved.status,
+                solved.objective,
+            );
+        }
+        solved
+    }
+
+    /// A basis from an interior point `v` with reduced costs `z`; see
+    /// [`Lp::solve_interior`].
+    ///
+    /// Each variable is scored by how far inside its bounds it sits, relative to its
+    /// size, over its reduced cost: a variable strictly between its bounds at the
+    /// optimum scores large, one held on a bound by its reduced cost small. Starting
+    /// from the all-logical basis, the structurals are pivoted in from the highest
+    /// score down, each replacing the lowest-scored logical among the rows where its
+    /// entry is within a tenth of the largest, so the basis stays well conditioned
+    /// and never goes singular. A structural with no such row is left out.
+    fn crossover_basis(&mut self, v: &[f64], z: &[f64]) -> BasisState {
+        const RELATIVE_PIVOT: f64 = 0.1;
+        const OVERALL_PIVOT: f64 = 0.001;
+        let n = self.n_structural;
+        let total = self.n_total();
+        let m = self.m;
+        let score: Vec<f64> = (0..total)
+            .map(|j| {
+                let (lo, hi) = (self.lower[j], self.upper[j]);
+                if lo == hi {
+                    return -1.0;
+                }
+                let dist = (v[j] - lo).min(hi - v[j]).max(0.0);
+                let dist = if dist.is_finite() { dist / (1.0 + v[j].abs()) } else { 1e30 };
+                dist / (z[j].abs() + 1e-14)
+            })
+            .collect();
+        let mut candidates: Vec<usize> = (0..n).filter(|&j| score[j] >= 0.0).collect();
+        candidates.sort_by(|&a, &b| score[b].total_cmp(&score[a]));
+        // The basic logicals by score, lowest first, so the crash stops once no logical
+        // left in the basis scores below the next candidate. A logical of a tight row
+        // with a nonzero dual scores low and belongs out of the basis: left in, it
+        // forces that dual to zero, and the simplex method spent 155000 pivots on
+        // `thor50dday` undoing that.
+        let mut logicals: std::collections::BinaryHeap<std::cmp::Reverse<(OrderedScore, usize)>> =
+            (n..total).map(|j| std::cmp::Reverse((OrderedScore(score[j]), j))).collect();
+        let mut basic: Vec<usize> = (n..total).collect();
+        let mut basis = Basis::all_logical(m);
+        let mut x = HVec::new(m);
+        let mut columns: Vec<(Vec<usize>, Vec<f64>)> = Vec::new();
+        for &j in &candidates {
+            while let Some(&std::cmp::Reverse((_, l))) = logicals.peek() {
+                if position_of(&basic, l, n).is_some() {
+                    break;
+                }
+                logicals.pop();
+            }
+            match logicals.peek() {
+                Some(&std::cmp::Reverse((OrderedScore(lowest), _))) if lowest < score[j] => {}
+                _ => break,
+            }
+            x.reset(m);
+            let (rows, vals) = self.matrix.column(j);
+            for (&i, &a) in rows.iter().zip(vals) {
+                x.add(i, a);
+            }
+            basis.ftran_entering_h(&mut x);
+            let mut largest = 0.0f64;
+            let mut overall = 0.0f64;
+            x.for_each(|r, a| {
+                overall = overall.max(a.abs());
+                if basic[r] >= n && score[basic[r]] < score[j] {
+                    largest = largest.max(a.abs());
+                }
+            });
+            // A pivot small against the column's largest entry anywhere makes the basis
+            // ill conditioned, and the pushes that follow read every value through it:
+            // on `neos-3656078-kumeu` columns reached 1e6 and pushes moved basic
+            // variables well past their bounds across rows too weak to pivot on.
+            if largest < 1e-7 || largest < OVERALL_PIVOT * overall {
+                continue;
+            }
+            let mut leave = usize::MAX;
+            let mut leave_score = f64::INFINITY;
+            x.for_each(|r, a| {
+                if basic[r] >= n && a.abs() >= RELATIVE_PIVOT * largest && score[basic[r]] < leave_score {
+                    leave = r;
+                    leave_score = score[basic[r]];
+                }
+            });
+            basis.update_h(&x, leave);
+            basic[leave] = j;
+            if basis.eta_file_is_expensive(ETA_GROWTH_LIMIT) {
+                columns.resize_with(m, Default::default);
+                for (slot, &k) in columns.iter_mut().zip(&basic) {
+                    self.column_sparse_into(k, &mut slot.0, &mut slot.1);
+                }
+                if basis.refactorize(&columns, self.tol.pivot, self.deadline).is_err() {
+                    break;
+                }
+            }
+            if self.out_of_time() {
+                break;
+            }
+        }
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!(
+                "crash: {} candidates, {} structurals basic",
+                candidates.len(),
+                basic.iter().filter(|&&j| j < n).count()
+            );
+        }
+        let mut status: Vec<Status> = (0..total)
+            .map(|j| {
+                let (lo, hi) = (self.lower[j], self.upper[j]);
+                let at = match (lo.is_finite(), hi.is_finite()) {
+                    (false, false) => At::Zero,
+                    (true, false) => At::Lower,
+                    (false, true) => At::Upper,
+                    // The side the reduced cost points to, or the nearer bound when it
+                    // is too small to say.
+                    (true, true) if z[j] > 1e-9 => At::Lower,
+                    (true, true) if z[j] < -1e-9 => At::Upper,
+                    (true, true) if v[j] - lo <= hi - v[j] => At::Lower,
+                    (true, true) => At::Upper,
+                };
+                Status::NonBasic(at)
+            })
+            .collect();
+        for (row, &j) in basic.iter().enumerate() {
+            status[j] = Status::Basic { row };
+        }
+        BasisState { basic, status }
     }
 
     /// The reduced cost of every structural column at `basis`, with the bound each
@@ -878,6 +1149,31 @@ impl Lp {
     }
 }
 
+/// A score ordered by `f64::total_cmp`, for the crossover's heap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrderedScore(f64);
+
+impl Eq for OrderedScore {}
+
+impl PartialOrd for OrderedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Whether logical `l` is still basic: it sits at its own row until displaced, and a
+/// displaced logical never comes back during the crash.
+fn position_of(basic: &[usize], l: usize, n: usize) -> Option<usize> {
+    let r = l - n;
+    (basic[r] == l).then_some(r)
+}
+
 /// Mutable state for one solve.
 struct Solver<'a> {
     lp: &'a Lp,
@@ -891,8 +1187,7 @@ struct Solver<'a> {
     /// vectors keep their allocations.
     basis_columns: Vec<(Vec<usize>, Vec<f64>)>,
     /// Scratch buffers, reused across iterations to keep the loop allocation-free.
-    col: Vec<f64>,
-    alpha: Vec<f64>,
+    alpha: HVec,
     y: Vec<f64>,
     cost_b: Vec<f64>,
     rhs: Vec<f64>,
@@ -917,11 +1212,24 @@ struct Solver<'a> {
     /// Dual steepest edge weights, one per basis row; see [`Solver::leaving_row`].
     row_weights: Vec<f64>,
     /// Scratch for the steepest edge update, `B^-1` applied to the pivot row.
-    tau: Vec<f64>,
+    tau: HVec,
     /// Devex reference weights, one per column; see [`Solver::price`].
     col_weights: Vec<f64>,
     /// Scratch for the pivot row, `B^-T e_r`.
-    rho: Vec<f64>,
+    rho: HVec,
+    /// The dual ratio test's breakpoints, `(ratio, column, a_rj)`, kept to reuse.
+    dual_candidates: Vec<(f64, usize, f64)>,
+    /// The columns the long-step test flips this pivot, kept to reuse.
+    dual_flips: Vec<usize>,
+    /// The dual method is cleaning up after a perturbed solve, and must not perturb
+    /// again.
+    unperturbed: bool,
+    /// Rows the dual ratio test found no safe pivot in since the last pivot, which the
+    /// leaving-row choice passes over until then; `rejected` is the same as flags.
+    rejected_rows: Vec<usize>,
+    rejected: Vec<bool>,
+    /// `B^-1` times the flipped columns, kept to reuse.
+    flip_column: HVec,
     /// Iterations that ran under Bland's rule, and iterations whose step was zero.
     /// Reported out so a stalling solve can be read without a profiler; see
     /// `examples/pivotmix.rs`.
@@ -948,6 +1256,9 @@ struct Solver<'a> {
     /// Costs shifted for the dual method, when it is running on them; see
     /// [`Solver::perturb_costs`]. `None` means the model's own.
     perturbed: Option<Vec<f64>>,
+    /// Whether `perturbed` is a crossover's shift, see [`Solver::shift_to_dual_feasible`],
+    /// rather than the dual method's own perturbation.
+    crossover_shift: bool,
     /// Every variable's reduced cost against the duals `y` and the basic costs
     /// `cost_b`, carried across pivots rather than recomputed; see
     /// [`Solver::sync_duals`]. Meaningful for nonbasic variables only.
@@ -984,9 +1295,14 @@ const SIDE_LOWER: u8 = 1;
 const SIDE_UPPER: u8 = 2;
 const SIDE_FREE: u8 = 3;
 
+/// How far [`Lp::solve_cold_dual_boxed`] puts the bound a column is missing from the one
+/// it has, or from zero.
+const ARTIFICIAL_BOX: f64 = 1e6;
+
 /// How far a cost is shifted for the dual method, relative to its size; see
 /// [`Solver::perturb_costs`].
 const COST_PERTURBATION: f64 = 5e-7;
+
 /// Pivots in a row at a zero ratio before a warm dual solve perturbs its costs.
 const PERTURB_AFTER: usize = 10;
 /// Pivots a perturbed dual solve may take, beyond one per row, before it hands over.
@@ -1001,6 +1317,10 @@ const PERTURBED_SPELL: usize = 1000;
 /// to 282, and `ns1208400`, on 0.1%, from 1454 to 2251. The models perturbing helps
 /// carry costs on 30% to all of their columns.
 const PERTURB_MIN_COSTED: f64 = 0.1;
+
+/// A crossover's basis whose worst bound violation is below this goes to the primal
+/// method rather than the dual; see [`Lp::solve_interior`].
+const CROSSOVER_PRIMAL_FINISH: f64 = 1e-3;
 
 /// What the ratio test decided.
 enum Step {
@@ -1104,8 +1424,7 @@ impl<'a> Solver<'a> {
             status,
             z,
             basis_columns: Vec::new(),
-            col: vec![0.0; m],
-            alpha: Vec::new(),
+            alpha: HVec::default(),
             y: Vec::new(),
             cost_b: vec![0.0; m],
             rhs: vec![0.0; m],
@@ -1115,9 +1434,15 @@ impl<'a> Solver<'a> {
             dual_steepest: dual_ready,
             steepest_rows: dual_ready,
             row_weights: vec![1.0; m],
-            tau: Vec::new(),
+            tau: HVec::default(),
             col_weights: vec![1.0; lp.n_total()],
-            rho: Vec::new(),
+            rho: HVec::default(),
+            dual_candidates: Vec::new(),
+            dual_flips: Vec::new(),
+            unperturbed: false,
+            rejected_rows: Vec::new(),
+            rejected: Vec::new(),
+            flip_column: HVec::default(),
             bland_iterations: 0,
             degenerate_iterations: 0,
             entering_solves: 0,
@@ -1127,6 +1452,7 @@ impl<'a> Solver<'a> {
             devex_active: lp.tol.primal_devex,
             devex_switchable: true,
             perturbed: None,
+            crossover_shift: false,
             d: vec![0.0; lp.n_total()],
             duals: None,
             fresh: false,
@@ -1185,9 +1511,15 @@ impl<'a> Solver<'a> {
             dual_steepest: false,
             steepest_rows: lp.tol.warm_steepest_edge,
             row_weights: vec![1.0; m],
-            tau: Vec::new(),
+            tau: HVec::default(),
             col_weights: vec![1.0; lp.n_total()],
-            rho: Vec::new(),
+            rho: HVec::default(),
+            dual_candidates: Vec::new(),
+            dual_flips: Vec::new(),
+            unperturbed: false,
+            rejected_rows: Vec::new(),
+            rejected: Vec::new(),
+            flip_column: HVec::default(),
             bland_iterations: 0,
             degenerate_iterations: 0,
             entering_solves: 0,
@@ -1197,6 +1529,7 @@ impl<'a> Solver<'a> {
             devex_active: lp.tol.primal_devex,
             devex_switchable: false,
             perturbed: None,
+            crossover_shift: false,
             d: vec![0.0; lp.n_total()],
             duals: None,
             fresh: false,
@@ -1214,8 +1547,7 @@ impl<'a> Solver<'a> {
             status,
             z,
             basis_columns: Vec::new(),
-            col: vec![0.0; m],
-            alpha: Vec::new(),
+            alpha: HVec::default(),
             y: Vec::new(),
             cost_b: vec![0.0; m],
             rhs: vec![0.0; m],
@@ -1514,6 +1846,45 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// [`Solver::form_row`] from a vector that lists its nonzeros, reading only those.
+    fn form_row_h(&mut self, v: &HVec) {
+        if v.dense {
+            self.form_row(&v.val);
+            return;
+        }
+        for &j in &self.row_nz {
+            self.row[j] = 0.0;
+            self.row_mark[j] = false;
+        }
+        self.row_nz.clear();
+        let lp = self.lp;
+        let n = lp.n_structural;
+        let rows = lp.rows();
+        let work: usize = v.idx.iter().map(|&i| rows.column(i).0.len() + 1).sum();
+        if (work as f64) >= ROW_WISE_SHARE * (lp.matrix.nnz() + lp.n_total()) as f64 {
+            self.form_row(&v.val);
+            return;
+        }
+        for &i in &v.idx {
+            let vi = v.val[i];
+            if vi == 0.0 {
+                continue;
+            }
+            let (cols, vals) = rows.column(i);
+            for (&j, &a) in cols.iter().zip(vals) {
+                if !self.row_mark[j] {
+                    self.row_mark[j] = true;
+                    self.row_nz.push(j);
+                }
+                self.row[j] += vi * a;
+            }
+            let logical = n + i;
+            self.row_mark[logical] = true;
+            self.row_nz.push(logical);
+            self.row[logical] = -vi;
+        }
+    }
+
     /// Carry `y` and `d` across a pivot of `entering` into row `r`.
     ///
     /// Reads the pivot row `row = rho' [A | -I]` with `rho = B^-T e_r` of the basis
@@ -1522,7 +1893,7 @@ impl<'a> Solver<'a> {
     /// the pivot row, the duals rise by `theta rho`, and the leaving variable, whose
     /// entry is one, ends at `-theta`.
     fn update_duals(&mut self, entering: usize, r: usize, phase_one: bool) {
-        let pivot = self.alpha[r];
+        let pivot = self.alpha.val[r];
         let theta = self.d[entering] / pivot;
         self.fresh = false;
         if theta != 0.0 {
@@ -1531,9 +1902,8 @@ impl<'a> Solver<'a> {
                     self.d[j] -= theta * self.row[j];
                 }
             }
-            for (y, &rho) in self.y.iter_mut().zip(&self.rho) {
-                *y += theta * rho;
-            }
+            let y = &mut self.y;
+            self.rho.for_each(|i, rho| y[i] += theta * rho);
         }
         let leaving = self.basic[r];
         self.d[leaving] = -theta;
@@ -1558,7 +1928,7 @@ impl<'a> Solver<'a> {
     /// carry error forward, a Forrest-Tomlin update's row elimination especially, and a
     /// pivot count says nothing about how much.
     fn check_pivot(&mut self, entering: usize, r: usize) {
-        let from_column = self.alpha[r];
+        let from_column = self.alpha.val[r];
         let from_row = if self.row_mark[entering] {
             self.row[entering]
         } else {
@@ -1573,8 +1943,8 @@ impl<'a> Solver<'a> {
     /// Form the pivot row for row `r` into `rho` and `row`, before the basis moves.
     fn pivot_row(&mut self, r: usize) {
         let mut rho = std::mem::take(&mut self.rho);
-        self.basis.btran_unit(r, &mut rho);
-        self.form_row(&rho);
+        self.basis.btran_unit_h(r, &mut rho);
+        self.form_row_h(&rho);
         self.rho = rho;
     }
 
@@ -1706,7 +2076,8 @@ impl<'a> Solver<'a> {
         // The row holding the column maximum always clears this, so the test can never
         // empty the candidate set and turn a pivot into a bound flip.
         const RELATIVE_PIVOT: f64 = 1e-7;
-        let largest = self.alpha.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let mut largest = 0.0f64;
+        self.alpha.for_each(|_, v| largest = largest.max(v.abs()));
         let pivot_tol = lp.tol.pivot.max(RELATIVE_PIVOT * largest);
 
         // The entering variable's own range, if both bounds are finite.
@@ -1729,8 +2100,13 @@ impl<'a> Solver<'a> {
         // otherwise go past one by more than the tolerance, and only then.
         let mut weak: Option<(f64, usize, At, f64)> = None;
 
-        for i in 0..lp.m {
-            let beta = self.alpha[i] * sigma;
+        let listed = (!self.alpha.dense).then_some(self.alpha.idx.as_slice());
+        let rows: Box<dyn Iterator<Item = usize>> = match listed {
+            Some(list) => Box::new(list.iter().copied()),
+            None => Box::new(0..lp.m),
+        };
+        for i in rows {
+            let beta = self.alpha.val[i] * sigma;
             if beta.abs() <= lp.tol.pivot {
                 continue;
             }
@@ -1780,7 +2156,7 @@ impl<'a> Solver<'a> {
             // Clamp at zero: a basic variable already a hair past its bound would
             // otherwise produce a small negative ratio and a backwards step.
             let ratio = ((v - target) / beta).max(0.0);
-            let pivot = self.alpha[i].abs();
+            let pivot = self.alpha.val[i].abs();
             if !strong {
                 if weak.is_none_or(|(held, _, _, p)| {
                     ratio < held - 1e-12 || (ratio <= held + 1e-12 && pivot > p)
@@ -1821,6 +2197,389 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// The primal half of a crossover: from a basis whose nonbasic variables sit at an
+    /// interior point's values `v` rather than on bounds, move each such superbasic
+    /// variable to a bound, the side its reduced cost in `z` points to.
+    ///
+    /// Each move is one ratio test along the variable's column: when a basic variable
+    /// reaches a bound first it leaves and the moving one takes its place, otherwise
+    /// the moving one lands on its bound. No pricing and no phase 1. Parking them all on
+    /// bounds at once instead moves every basic variable by the sum of the jumps, and
+    /// the primal method spent tens of thousands of pivots repairing that.
+    ///
+    /// Returns the number of variables pushed.
+    fn push_to_bounds(&mut self, v: &[f64], z: &[f64]) -> Result<usize, LpStatus> {
+        let lp = self.lp;
+        let tol = lp.tol.primal_feasibility;
+        let mut superbasic = Vec::new();
+        for j in 0..lp.n_total() {
+            let Status::NonBasic(at) = self.status[j] else {
+                continue;
+            };
+            let (lo, hi) = (lp.lower[j], lp.upper[j]);
+            if lo == hi {
+                continue;
+            }
+            let x = v[j].clamp(lo, hi);
+            let on_bound = (x - lo).abs() <= tol || (hi - x).abs() <= tol || (at == At::Zero && x.abs() <= tol);
+            if on_bound {
+                continue;
+            }
+            self.z[j] = x;
+            superbasic.push(j);
+        }
+        self.refactorize()?;
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!("push: {} superbasic", superbasic.len());
+            self.trace_infeasibility("before push");
+        }
+        let mut pushes = 0;
+        for &j in &superbasic {
+            if pushes % 64 == 0 && lp.out_of_time() {
+                return Err(LpStatus::IterationLimit);
+            }
+            self.push_one(j, z)?;
+            pushes += 1;
+        }
+        // Everything read off the basis since is stale.
+        self.refactorize()?;
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            self.trace_infeasibility("after primal push");
+        }
+        Ok(pushes)
+    }
+
+    /// Where [`Solver::push_to_bounds`] sends superbasic `j`: the bound its interior
+    /// reduced cost `zj` prefers, or the nearer one, or zero for a free variable.
+    fn push_target(&self, j: usize, zj: f64) -> (f64, At, f64) {
+        let lp = self.lp;
+        let (lo, hi) = (lp.lower[j], lp.upper[j]);
+        let x = self.z[j];
+        let down = if lo.is_finite() && hi.is_finite() {
+            if zj > 0.0 {
+                true
+            } else if zj < 0.0 {
+                false
+            } else {
+                x - lo <= hi - x
+            }
+        } else if lo.is_finite() {
+            true
+        } else if hi.is_finite() {
+            false
+        } else {
+            x > 0.0
+        };
+        let (target, at) = if lo.is_finite() || hi.is_finite() {
+            if down { (lo, At::Lower) } else { (hi, At::Upper) }
+        } else {
+            (0.0, At::Zero)
+        };
+        (target, at, if down { -1.0 } else { 1.0 })
+    }
+
+    /// Push one superbasic `j` onto its bound by a ratio test along its column; see
+    /// [`Solver::push_to_bounds`].
+    fn push_one(&mut self, j: usize, z: &[f64]) -> Result<(), LpStatus> {
+        let lp = self.lp;
+        let x = self.z[j];
+        let (target, at, sigma) = self.push_target(j, z[j]);
+        let distance = (target - x).abs();
+        self.solve_entering(j);
+        let step = self.ratio_test(j, sigma, true, false);
+        match step {
+            Step::Pivot { leaving_row: r, step, to } if step < distance => {
+                let leaving = self.basic[r];
+                let delta = sigma * step;
+                self.z[j] += delta;
+                self.move_basics(delta);
+                self.z[leaving] = lp.value_at(leaving, to);
+                self.basis.update_h(&self.alpha, r);
+                self.basic[r] = j;
+                self.set_status(j, Status::Basic { row: r });
+                self.set_status(leaving, Status::NonBasic(to));
+                if self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT) {
+                    self.refactorize()?;
+                }
+            }
+            _ => {
+                let delta = target - x;
+                self.z[j] = target;
+                self.move_basics(delta);
+                self.set_status(j, Status::NonBasic(at));
+            }
+        }
+        Ok(())
+    }
+
+    /// For `RIPSOLVE_TRACE`: how far the basis is from optimal.
+    fn trace_infeasibility(&mut self, label: &str) {
+        let lp = self.lp;
+        let tol = lp.tol.dual_feasibility;
+        self.refresh_duals(false);
+        let (mut dual, mut dual_sum) = (0usize, 0.0f64);
+        for j in 0..lp.n_total() {
+            let Status::NonBasic(at) = self.status[j] else { continue };
+            if lp.lower[j] == lp.upper[j] {
+                continue;
+            }
+            let d = self.d[j];
+            let bad = match at {
+                At::Lower => (-d).max(0.0),
+                At::Upper => d.max(0.0),
+                At::Zero => d.abs(),
+            };
+            if bad > tol {
+                dual += 1;
+                dual_sum += bad;
+            }
+        }
+        let (mut primal, mut primal_sum) = (0usize, 0.0f64);
+        for &j in &self.basic {
+            let x = self.z[j];
+            let bad = (lp.lower[j] - x).max(x - lp.upper[j]).max(0.0);
+            if bad > lp.tol.primal_feasibility {
+                primal += 1;
+                primal_sum += bad;
+            }
+        }
+        eprintln!("{label}: {dual} dual infeasible (sum {dual_sum:.3e}), {primal} primal infeasible (sum {primal_sum:.3e})");
+    }
+
+    /// After a crossover's pushes, shift the cost of each nonbasic column whose reduced
+    /// cost is still slightly on the wrong side of its bound to put it at zero, so the
+    /// dual method can take the basis. [`Solver::run`] removes the shift when the dual
+    /// method stops, as it does its own perturbation.
+    ///
+    /// Without this, any dual infeasibility at all sends the solve to the primal
+    /// method. On `s100` two reduced costs, 2e-7 between them, left after the dual push
+    /// cost 66987 primal pivots and 99s where the dual method had 23 bounds to repair.
+    fn shift_to_dual_feasible(&mut self) {
+        /// Larger than this, a reduced cost is wrong rather than rounded, and the
+        /// primal method is the right one to fix it.
+        const SHIFT_LIMIT: f64 = 1e-5;
+        if self.is_dual_feasible() {
+            return;
+        }
+        let tol = self.lp.tol.dual_feasibility;
+        let mut costs = self.lp.cost.clone();
+        let mut shifted = 0usize;
+        for j in 0..self.lp.n_total() {
+            let Status::NonBasic(at) = self.status[j] else { continue };
+            if self.lp.lower[j] == self.lp.upper[j] {
+                continue;
+            }
+            let d = self.d[j];
+            let wrong = match at {
+                At::Lower => d < -tol,
+                At::Upper => d > tol,
+                At::Zero => d.abs() > tol,
+            };
+            if !wrong {
+                continue;
+            }
+            if d.abs() > SHIFT_LIMIT {
+                return;
+            }
+            costs[j] -= d;
+            shifted += 1;
+        }
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!("shifted {shifted} costs for the dual method");
+        }
+        self.perturbed = Some(costs);
+        self.crossover_shift = true;
+        self.duals = None;
+    }
+
+    /// The dual half of a crossover, after [`Solver::push_to_bounds`]: from the
+    /// interior point's row duals `y`, move the duals until every basic variable's
+    /// reduced cost is zero, keeping every nonbasic one on the side its bound needs.
+    ///
+    /// For a basic variable `j` in row `r` with reduced cost `d_j`, the duals move
+    /// along `B^-T e_r`, which leaves every other basic reduced cost at zero and takes
+    /// `d_j` to zero after a step of `|d_j|`. When some nonbasic reduced cost reaches
+    /// zero first, that variable enters in `j`'s place and `j` leaves onto the bound
+    /// its reduced cost points to, where the interior point already holds it.
+    ///
+    /// The primal push alone left `uccase12`'s basis with 7589 dual infeasibilities,
+    /// from basic variables the interior point has firmly on a bound, and the primal
+    /// method did not finish repairing them in a minute.
+    fn dual_push(&mut self, y: &[f64], converged: Option<&[f64]>) -> Result<usize, LpStatus> {
+        /// Reduced costs no larger than this may be noise in a converged interior point.
+        const NOISE: f64 = 1e-5;
+        let lp = self.lp;
+        let n = lp.n_structural;
+        let total = lp.n_total();
+        let tol = lp.tol.dual_feasibility;
+        let mut d = vec![0.0; total];
+        for j in 0..n {
+            let (rs, vs) = lp.matrix.column(j);
+            d[j] = lp.cost[j] - rs.iter().zip(vs).map(|(&i, &a)| a * y[i]).sum::<f64>();
+        }
+        for i in 0..lp.m {
+            d[n + i] = lp.cost[n + i] + y[i];
+        }
+        for j in 0..total {
+            if let Status::NonBasic(at) = self.status[j] {
+                d[j] = match at {
+                    At::Lower => d[j].max(0.0),
+                    At::Upper => d[j].min(0.0),
+                    At::Zero => 0.0,
+                };
+            }
+        }
+        let mut order: Vec<usize> = self
+            .basic
+            .iter()
+            .copied()
+            .filter(|&j| {
+                // A reduced cost at the level of the interior point's own noise, on a
+                // variable that point holds further from its bound than the reduced
+                // cost is from zero, is read as zero rather than pushed: the point is
+                // not complementary there, and taking it to its bound through a badly
+                // conditioned basis moved the presolved `neos-3656078-kumeu`'s other
+                // basic variables by up to 3.6e6, which the simplex method did not
+                // repair in 20000 pivots. Only on a converged point: on `dano3_3`'s,
+                // which stopped at a gap of 3e-4, such reduced costs are real, and
+                // reading them as zero left 1460 dual infeasibilities.
+                if let Some(v) = converged
+                    && lp.lower[j] != lp.upper[j]
+                    && d[j].abs() <= NOISE
+                {
+                    let side = if d[j] > 0.0 { lp.lower[j] } else { lp.upper[j] };
+                    if (v[j] - side).abs() > d[j].abs() {
+                        return false;
+                    }
+                }
+                d[j].abs() > tol || (d[j] != 0.0 && lp.lower[j] == lp.upper[j])
+            })
+            .collect();
+        order.sort_by(|&a, &b| d[b].abs().total_cmp(&d[a].abs()));
+        let mut rho = std::mem::take(&mut self.rho);
+        let mut pushes = 0;
+        let mut entered = 0usize;
+        let (mut skipped, mut no_bound) = (0usize, 0usize);
+        for j in order {
+            if pushes % 64 == 0 && lp.out_of_time() {
+                self.rho = rho;
+                return Err(LpStatus::IterationLimit);
+            }
+            let Status::Basic { row: r } = self.status[j] else {
+                continue;
+            };
+            let dj = d[j];
+            // The bound `j` would leave onto must exist.
+            let side = if dj > 0.0 { At::Lower } else { At::Upper };
+            if !lp.value_at(j, side).is_finite() {
+                no_bound += 1;
+                continue;
+            }
+            pushes += 1;
+            let sign = dj.signum();
+            self.basis.btran_unit_h(r, &mut rho);
+            self.form_row_h(&rho);
+            let mut largest = 0.0f64;
+            for &k in &self.row_nz {
+                if matches!(self.status[k], Status::NonBasic(_)) {
+                    largest = largest.max(self.row[k].abs());
+                }
+            }
+            let pivot_tol = 1e-9f64.max(1e-7 * largest);
+            // Harris: the largest step any reduced cost allows with the tolerance, then
+            // among those that bind within it, the largest pivot.
+            let mut bound = dj.abs();
+            for &k in &self.row_nz {
+                let Status::NonBasic(at) = self.status[k] else { continue };
+                if lp.lower[k] == lp.upper[k] {
+                    continue;
+                }
+                let a = sign * self.row[k];
+                if a.abs() <= pivot_tol {
+                    continue;
+                }
+                let limit = match at {
+                    At::Lower if a > 0.0 => (d[k] + tol) / a,
+                    At::Upper if a < 0.0 => (d[k] - tol) / a,
+                    At::Zero => tol / a.abs(),
+                    _ => continue,
+                };
+                bound = bound.min(limit);
+            }
+            let mut entering = None;
+            let mut best = 0.0f64;
+            for &k in &self.row_nz {
+                let Status::NonBasic(at) = self.status[k] else { continue };
+                if lp.lower[k] == lp.upper[k] {
+                    continue;
+                }
+                let a = sign * self.row[k];
+                if a.abs() <= pivot_tol {
+                    continue;
+                }
+                let ratio = match at {
+                    At::Lower if a > 0.0 => d[k] / a,
+                    At::Upper if a < 0.0 => d[k] / a,
+                    At::Zero => 0.0,
+                    _ => continue,
+                };
+                if ratio <= bound && a.abs() > best {
+                    best = a.abs();
+                    entering = Some((k, ratio.max(0.0)));
+                }
+            }
+            match entering {
+                Some((q, step)) if step < dj.abs() => {
+                    // Primal: `q` takes `j`'s place, `j` lands on its bound.
+                    self.solve_entering(q);
+                    let pivot = self.alpha.val[r];
+                    if pivot.abs() <= 1e-11 {
+                        skipped += 1;
+                        continue;
+                    }
+                    for &k in &self.row_nz {
+                        if matches!(self.status[k], Status::NonBasic(_)) {
+                            d[k] -= step * sign * self.row[k];
+                        }
+                    }
+                    d[q] = 0.0;
+                    d[j] = dj - step * sign;
+                    let target = lp.value_at(j, side);
+                    let theta = (self.z[j] - target) / pivot;
+                    self.z[q] += theta;
+                    self.move_basics(theta);
+                    self.z[j] = target;
+                    self.basis.update_h(&self.alpha, r);
+                    self.basic[r] = q;
+                    self.set_status(q, Status::Basic { row: r });
+                    self.set_status(j, Status::NonBasic(side));
+                    entered += 1;
+                    if self.basis.eta_file_is_expensive(ETA_GROWTH_LIMIT) {
+                        self.rho = std::mem::take(&mut rho);
+                        self.refactorize()?;
+                        rho = std::mem::take(&mut self.rho);
+                    }
+                }
+                _ => {
+                    let step = dj.abs();
+                    for &k in &self.row_nz {
+                        if matches!(self.status[k], Status::NonBasic(_)) {
+                            d[k] -= step * sign * self.row[k];
+                        }
+                    }
+                    d[j] = 0.0;
+                }
+            }
+        }
+        self.rho = rho;
+        self.refactorize()?;
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!("dual push: {pushes} pushes, {entered} entered, {skipped} small pivots, {no_bound} with no bound to leave onto");
+            self.trace_infeasibility("after dual push");
+        }
+        Ok(pushes)
+    }
+
     /// Apply a step of `sigma * step` on the entering variable.
     fn take_step(&mut self, entering: usize, sigma: f64, step: f64) {
         if step == 0.0 {
@@ -1828,17 +2587,121 @@ impl<'a> Solver<'a> {
         }
         let delta = sigma * step;
         self.z[entering] += delta;
-        for i in 0..self.lp.m {
-            let a = self.alpha[i];
-            if a == 0.0 {
-                continue;
-            }
+        self.move_basics(delta);
+    }
+
+    /// Move every basic variable the entering column reaches by `-alpha_i * delta`.
+    fn move_basics(&mut self, delta: f64) {
+        let alpha = std::mem::take(&mut self.alpha);
+        alpha.for_each(|i, a| {
             let j = self.basic[i];
             self.z[j] -= a * delta;
             if self.rows_ready {
                 self.note_row(i);
             }
+        });
+        self.alpha = alpha;
+    }
+
+    fn clear_rejected(&mut self) {
+        for &i in &self.rejected_rows {
+            self.rejected[i] = false;
         }
+        self.rejected_rows.clear();
+    }
+
+    /// Flip every boxed nonbasic column whose reduced cost (fresh, from
+    /// [`Solver::is_dual_feasible`]) wants the other bound. False when a dual
+    /// infeasibility is left that no flip can mend.
+    fn flip_to_dual_feasible(&mut self) -> bool {
+        let tol = self.lp.tol.dual_feasibility;
+        let mut flips = std::mem::take(&mut self.dual_flips);
+        flips.clear();
+        let mut mended = true;
+        for j in 0..self.lp.n_total() {
+            let Status::NonBasic(at) = self.status[j] else {
+                continue;
+            };
+            let (lo, hi) = (self.lp.lower[j], self.lp.upper[j]);
+            if lo == hi {
+                continue;
+            }
+            let d = self.d[j];
+            let wrong = match at {
+                At::Lower => d < -tol,
+                At::Upper => d > tol,
+                At::Zero => d.abs() > tol,
+            };
+            if !wrong {
+                continue;
+            }
+            if at == At::Zero || !lo.is_finite() || !hi.is_finite() {
+                mended = false;
+            } else {
+                flips.push(j);
+            }
+        }
+        if !flips.is_empty() {
+            self.flip_bounds(&flips);
+        }
+        self.dual_flips = flips;
+        mended
+    }
+
+    /// Move each nonbasic column in `flips` to its other bound, and the basic variables
+    /// with them.
+    fn flip_bounds(&mut self, flips: &[usize]) {
+        let mut moved = std::mem::take(&mut self.flip_column);
+        moved.reset(self.lp.m);
+        for &j in flips {
+            let Status::NonBasic(at) = self.status[j] else {
+                continue;
+            };
+            let (to, other) = match at {
+                At::Lower => (self.lp.upper[j], At::Upper),
+                At::Upper => (self.lp.lower[j], At::Lower),
+                At::Zero => continue,
+            };
+            let delta = to - self.z[j];
+            if j < self.lp.n_structural {
+                let (rows, vals) = self.lp.matrix.column(j);
+                for (&i, &v) in rows.iter().zip(vals) {
+                    moved.add(i, v * delta);
+                }
+            } else {
+                moved.add(j - self.lp.n_structural, -delta);
+            }
+            self.z[j] = to;
+            self.set_status(j, Status::NonBasic(other));
+        }
+        self.basis.ftran_h(&mut moved);
+        moved.for_each(|i, w| {
+            let j = self.basic[i];
+            self.z[j] -= w;
+            if self.rows_ready {
+                self.note_row(i);
+            }
+        });
+        self.flip_column = moved;
+    }
+
+    /// Solve for the entering column `j`, `alpha = B^-1 a_j`, into `alpha`.
+    fn solve_entering(&mut self, j: usize) {
+        let mut alpha = std::mem::take(&mut self.alpha);
+        alpha.reset(self.lp.m);
+        if j < self.lp.n_structural {
+            let (rows, vals) = self.lp.matrix.column(j);
+            for (&i, &v) in rows.iter().zip(vals) {
+                alpha.val[i] = v;
+                alpha.idx.push(i);
+            }
+        } else {
+            let i = j - self.lp.n_structural;
+            alpha.val[i] = -1.0;
+            alpha.idx.push(i);
+        }
+        self.basis.ftran_entering_h(&mut alpha);
+        self.alpha = alpha;
     }
 
     /// Rebuild the basis inverse, repairing singular positions with logicals.
@@ -1879,6 +2742,14 @@ impl<'a> Solver<'a> {
                 .refactorize(&self.basis_columns, lp.tol.pivot, lp.deadline)
             {
                 Ok(()) => {
+                    #[cfg(debug_assertions)]
+                    for (i, &j) in self.basic.iter().enumerate() {
+                        debug_assert!(
+                            matches!(self.status[j], Status::Basic { row } if row == i),
+                            "position {i} lists {j}, whose status is {:?}",
+                            self.status[j]
+                        );
+                    }
                     self.factorized = true;
                     self.recompute_basic_values();
                     return Ok(());
@@ -1888,10 +2759,15 @@ impl<'a> Solver<'a> {
                 Err(BasisError::Singular { row }) => {
                     // `row` is a *basis position*, not a model row, so the logical that
                     // shares its index is only the first candidate. If it is already
-                    // sitting here the basis is still singular with it in place, and
-                    // any logical not currently basic will do instead.
+                    // basic, here or at another position, any logical not currently
+                    // basic will do instead. Basic at another position is the case that
+                    // was missed: the logical went in twice, and a later repair at the
+                    // other position parked it while this one still listed it, which on
+                    // `piperout-27` left phase 1 reading a violation of 4.68 off a
+                    // variable it priced as nonbasic and reporting a relaxation with
+                    // optimum 7114.21 infeasible.
                     let preferred = lp.n_structural + row;
-                    let replacement = if self.basic[row] == preferred {
+                    let replacement = if matches!(self.status[preferred], Status::Basic { .. }) {
                         match (0..lp.m)
                             .map(|r| lp.n_structural + r)
                             .find(|&l| !matches!(self.status[l], Status::Basic { .. }))
@@ -1992,7 +2868,7 @@ impl<'a> Solver<'a> {
         let mut found: Option<(usize, At)> = None;
         for i in 0..self.lp.m {
             let violation = self.violation[i];
-            if violation <= tol {
+            if violation <= tol || (!self.rejected_rows.is_empty() && self.rejected[i]) {
                 continue;
             }
             let j = self.basic[i];
@@ -2104,7 +2980,7 @@ impl<'a> Solver<'a> {
     /// Must be called after [`Solver::pivot_row`] and before [`Basis::update`], because
     /// `rho` is a row of the *old* `B^-1`.
     fn update_column_weights(&mut self, entering: usize, r: usize) {
-        let pivot = self.alpha[r];
+        let pivot = self.alpha.val[r];
         if pivot.abs() <= self.lp.tol.pivot {
             return;
         }
@@ -2154,13 +3030,14 @@ impl<'a> Solver<'a> {
     /// which costs one extra FTRAN per iteration. That is the price of the rule, and
     /// the reason it is paid only here, where the alternative is choosing a row by a
     /// number with no fixed meaning across rows.
-    fn update_row_weights(&mut self, r: usize, rho: &[f64]) {
-        let pivot = self.alpha[r];
+    fn update_row_weights(&mut self, r: usize, rho: &HVec) {
+        let pivot = self.alpha.val[r];
         if pivot.abs() <= self.lp.tol.pivot {
             return;
         }
         let mut tau = std::mem::take(&mut self.tau);
-        self.basis.ftran(rho, &mut tau);
+        tau.copy_from(rho);
+        self.basis.ftran_h(&mut tau);
 
         // The chosen row's weight is available exactly rather than carried forward:
         // `rho` is `B^-T e_r`, so the squared norm this weight holds is `rho . rho`.
@@ -2168,18 +3045,20 @@ impl<'a> Solver<'a> {
         // the update compounding its own error, which is what a recurrence like this
         // does if left to itself: carried forward, `drayage-100-23` took 487230
         // iterations where the exact value takes 2374.
-        let reference = Self::clamp_weight(rho.iter().map(|v| v * v).sum());
-        for (i, &tau_i) in tau.iter().enumerate().take(self.lp.m) {
+        let mut norm = 0.0;
+        rho.for_each(|_, v| norm += v * v);
+        let reference = Self::clamp_weight(norm);
+        // Only the rows the entering column reaches change.
+        let alpha = std::mem::take(&mut self.alpha);
+        alpha.for_each(|i, a| {
             if i == r {
-                continue;
+                return;
             }
-            let ratio = self.alpha[i] / pivot;
-            if ratio == 0.0 {
-                continue;
-            }
-            let updated = self.row_weights[i] - 2.0 * ratio * tau_i + ratio * ratio * reference;
+            let ratio = a / pivot;
+            let updated = self.row_weights[i] - 2.0 * ratio * tau.val[i] + ratio * ratio * reference;
             self.row_weights[i] = Self::clamp_weight(updated);
-        }
+        });
+        self.alpha = alpha;
         self.row_weights[r] = Self::clamp_weight(reference / (pivot * pivot));
         self.tau = tau;
     }
@@ -2202,7 +3081,7 @@ impl<'a> Solver<'a> {
     ) -> Option<LpStatus> {
         let tol = self.lp.tol.dual_feasibility;
         let pivot_tol = self.lp.tol.pivot;
-        let mut rho: Vec<f64> = Vec::new();
+        let mut rho = HVec::default();
         let mut perturbed_at = 0usize;
         // Degenerate steps in a row before switching to Bland's rule. The primal
         // method has had this since it first cycled; the dual method had nothing,
@@ -2226,10 +3105,25 @@ impl<'a> Solver<'a> {
         let mut stalled = 0usize;
         let mut degenerate = 0usize;
         let mut bland_run = BLAND_RUN;
+        // The iteration at which an infeasibility claim was last checked; see below.
+        let mut verified_at = usize::MAX;
 
         // Polled rather than checked every pivot: reading the clock is not free, and on
         // a small LP a pivot costs little more.
         let clock = self.lp.clock_interval();
+        // A cold entry perturbs from the start, as dual simplex codes do: it crosses
+        // the whole model, and on a degenerate one ties at zero from the first pivot.
+        // `neos-827175`'s relaxation takes 6191 pivots perturbed, against more than
+        // 80000 by the primal method and more than two minutes unperturbed.
+        //
+        // Whatever the costs, unlike a warm solve: a model whose columns are mostly
+        // uncosted is the most degenerate there is, every reduced cost starting at
+        // zero. `graph20-20-1rand` takes 83203 pivots and 30 seconds unperturbed and
+        // 1403 pivots perturbed; `cbs-cta`, 127725 pivots and 69 seconds against 5446 and
+        // half a second.
+        if self.dual_steepest && self.perturbed.is_none() && !self.unperturbed {
+            self.perturb_costs();
+        }
         while *iterations < max_iterations {
             if iterations.is_multiple_of(clock) && self.lp.out_of_time() {
                 return Some(LpStatus::IterationLimit);
@@ -2238,6 +3132,9 @@ impl<'a> Solver<'a> {
             if stalled > STALL_LIMIT + bland_run {
                 stalled = 0;
                 bland_run *= 2;
+            }
+            if bland {
+                self.bland_iterations += 1;
             }
             // The cutoff compares the objective with an incumbent, which says something
             // only of the model's own costs.
@@ -2251,7 +3148,14 @@ impl<'a> Solver<'a> {
             // were carried across each pivot instead; see [`Solver::sync_duals`].
             self.sync_duals(false);
 
-            let Some((r, violated)) = self.most_infeasible_row(bland) else {
+            let picked = self.most_infeasible_row(bland);
+            if picked.is_none() && !self.rejected_rows.is_empty() {
+                // Every violated row left is one no column could repair at this basis,
+                // which is not primal feasibility: the primal method takes over.
+                self.clear_rejected();
+                return None;
+            }
+            let Some((r, violated)) = picked else {
                 // Primal feasible. For a warm start that is the optimum, because the
                 // basis came in dual feasible and the ratio test holds it there.
                 //
@@ -2268,8 +3172,8 @@ impl<'a> Solver<'a> {
                 return None;
             };
 
-            self.basis.btran_unit(r, &mut rho);
-            self.form_row(&rho);
+            self.basis.btran_unit_h(r, &mut rho);
+            self.form_row_h(&rho);
             // The leaving variable must rise to its lower bound, or fall to its upper.
             let rising = violated == At::Lower;
 
@@ -2277,6 +3181,8 @@ impl<'a> Solver<'a> {
             let mut best_ratio = f64::INFINITY;
             let mut best_pivot = 0.0;
             let mut rejected_small = false;
+            let mut candidates = std::mem::take(&mut self.dual_candidates);
+            candidates.clear();
             for k in 0..self.row_nz.len() {
                 let j = self.row_nz[k];
                 let Status::NonBasic(at) = self.status[j] else {
@@ -2308,6 +3214,10 @@ impl<'a> Solver<'a> {
                 let d = self.d[j];
                 let ratio = (d.abs() / arj.abs()).max(0.0);
                 let pivot = arj.abs();
+                if !bland {
+                    candidates.push((ratio, j, arj));
+                    continue;
+                }
                 // Ties go to the largest pivot, which is numerically safest. Under
                 // Bland's they go to the lowest index instead: the rule only
                 // guarantees termination when it governs both choices, which is the
@@ -2325,6 +3235,58 @@ impl<'a> Solver<'a> {
                     best_pivot = pivot;
                 }
             }
+
+            // The long-step test, outside Bland's rule. Passing a boxed column's
+            // breakpoint costs the leaving variable `|a_rj| (u_j - l_j)` of the
+            // infeasibility it is being moved to repair, and leaves that column dual
+            // feasible at its other bound, so it is flipped there rather than pivoted
+            // in, and the dual step goes on to the next breakpoint. The column entering
+            // is the first whose passing would use up what is left, or the first with no
+            // other bound to flip to. One pivot then does what the short step took
+            // several for, on models whose columns are mostly boxed, which is most MIPs.
+            let mut flips = std::mem::take(&mut self.dual_flips);
+            flips.clear();
+            if !bland && !candidates.is_empty() {
+                candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                let leaving = self.basic[r];
+                let mut slope = if rising {
+                    self.lp.lower[leaving] - self.z[leaving]
+                } else {
+                    self.z[leaving] - self.lp.upper[leaving]
+                };
+                let mut stop = candidates.len() - 1;
+                if !self.lp.tol.long_step {
+                    slope = f64::NEG_INFINITY;
+                }
+                for (k, &(_, j, arj)) in candidates.iter().enumerate() {
+                    let range = self.lp.upper[j] - self.lp.lower[j];
+                    if !range.is_finite() || matches!(self.status[j], Status::NonBasic(At::Zero)) {
+                        stop = k;
+                        break;
+                    }
+                    slope -= arj.abs() * range;
+                    if slope <= 0.0 {
+                        stop = k;
+                        break;
+                    }
+                }
+                // Among the ratios tied with the one stopped at, the largest pivot.
+                let limit = candidates[stop].0 + tol;
+                let mut chosen = stop;
+                for k in stop..candidates.len() {
+                    if candidates[k].0 > limit {
+                        break;
+                    }
+                    if candidates[k].2.abs() > candidates[chosen].2.abs() {
+                        chosen = k;
+                    }
+                }
+                let (ratio, j, arj) = candidates[chosen];
+                best = Some((j, arj));
+                best_ratio = ratio;
+                flips.extend(candidates[..stop].iter().map(|&(_, j, _)| j));
+            }
+            self.dual_candidates = candidates;
 
             // A column the row does not reach has an entry of exactly zero, and the test
             // above, run over every column as it was, counted such a column as rejected
@@ -2360,26 +3322,53 @@ impl<'a> Solver<'a> {
                 // the basis to the primal loop instead is what the dual method already
                 // does wherever its own invariants have lapsed.
                 if rejected_small {
+                    // This row, at this basis. Another may pivot safely, and once one
+                    // has, this row's entries are different ones: the long-step test
+                    // flips columns into rows the short step never had to repair, and
+                    // giving up on the first such row handed `air05` to the primal
+                    // method after 981 pivots, which took 8300 more.
+                    if !bland && self.rejected_rows.len() < MAX_REJECTED_ROWS {
+                        if self.rejected.len() < self.lp.m {
+                            self.rejected.resize(self.lp.m, false);
+                        }
+                        self.rejected[r] = true;
+                        self.rejected_rows.push(r);
+                        continue;
+                    }
+                    self.clear_rejected();
                     return None;
                 }
                 // The row the dual could not repair is the certificate: aggregating the
                 // model by `B^-T e_r` yields a form no point of this box satisfies. Kept
                 // so a caller can *check* that and, if it holds, say which bounds are to
                 // blame. It is handed over unverified on purpose; see `LpSolution::farkas`.
-                self.farkas = Some(rho.clone());
+                // And the row has to be violated, which is read off basic values
+                // carried across every pivot and flip since the last factorization.
+                // One wrong update there and the certificate is of nothing, so the
+                // values are rebuilt and the rows chosen again before it is believed.
+                if verified_at != *iterations {
+                    verified_at = *iterations;
+                    if let Err(status) = self.refactorize() {
+                        return Some(status);
+                    }
+                    continue;
+                }
+                self.farkas = Some(rho.val.clone());
                 return Some(LpStatus::Infeasible);
             };
 
+            // The flips first, as one move of the basic variables: `B^-1` applied to the
+            // sum of the flipped columns, each times how far it moved.
+            if !flips.is_empty() {
+                self.flip_bounds(&flips);
+            }
+            self.dual_flips = flips;
+
             // Pivot the chosen column into row r.
-            let mut col = std::mem::take(&mut self.col);
-            self.lp.column_into(entering, &mut col);
-            let mut alpha = std::mem::take(&mut self.alpha);
-            self.basis.ftran_entering(&col, &mut alpha);
-            self.col = col;
-            self.alpha = alpha;
+            self.solve_entering(entering);
             self.count_entering_density();
 
-            if self.alpha[r].abs() <= pivot_tol {
+            if self.alpha.val[r].abs() <= pivot_tol {
                 // The pivot row and column disagree about this element's magnitude,
                 // which means the inverse has drifted. Rebuild and try again.
                 if let Err(status) = self.refactorize() {
@@ -2395,7 +3384,7 @@ impl<'a> Solver<'a> {
             let target = self.lp.value_at(leaving, violated);
             // Move the entering variable exactly far enough to place the leaving one
             // on the bound it was violating.
-            let step = (target - self.z[leaving]) / -self.alpha[r];
+            let step = (target - self.z[leaving]) / -self.alpha.val[r];
             // Counted by primal step length, which is the wrong signal in principle:
             // degeneracy here is a zero *ratio*, meaning the entering column was
             // already priced at zero and the dual objective cannot move whatever the
@@ -2458,17 +3447,7 @@ impl<'a> Solver<'a> {
                 }
             }
             self.z[entering] += step;
-            for i in 0..self.lp.m {
-                let a = self.alpha[i];
-                if a == 0.0 {
-                    continue;
-                }
-                let bj = self.basic[i];
-                self.z[bj] -= a * step;
-                if self.rows_ready {
-                    self.note_row(i);
-                }
-            }
+            self.move_basics(step);
             self.z[leaving] = target;
 
             // Before the basis moves: the update reads `alpha` and the pivot row
@@ -2480,7 +3459,10 @@ impl<'a> Solver<'a> {
             self.update_duals(entering, r, false);
             std::mem::swap(&mut self.rho, &mut rho);
 
-            self.basis.update(&self.alpha, r);
+            self.basis.update_h(&self.alpha, r);
+            if !self.rejected_rows.is_empty() {
+                self.clear_rejected();
+            }
             self.basic[r] = entering;
             self.set_status(entering, Status::Basic { row: r });
             self.set_status(leaving, Status::NonBasic(violated));
@@ -2700,7 +3682,8 @@ impl<'a> Solver<'a> {
         if !self.lp.tol.entering_density_stats {
             return;
         }
-        let nonzeros = self.alpha.iter().filter(|v| **v != 0.0).count();
+        let mut nonzeros = 0usize;
+        self.alpha.for_each(|_, _| nonzeros += 1);
         self.entering_solves += 1;
         self.entering_nonzeros += nonzeros as u64;
         if nonzeros as f64 <= HYPERSPARSE_SHARE * self.alpha.len() as f64 {
@@ -2834,10 +3817,38 @@ impl<'a> Solver<'a> {
             } else {
                 max_iterations / DUAL_SHARE
             };
-            let outcome = self.run_dual(budget, cutoff, &mut iterations);
+            let mut outcome = self.run_dual(budget, cutoff, &mut iterations);
             if self.perturbed.take().is_some() {
                 // The duals were carried on the shifted costs.
                 self.duals = None;
+                // Optimal for the shifted costs, and on the real ones what is wrong is
+                // usually only boxed columns on the bound the shift preferred, which
+                // the long-step test leaves many of. Each moves to the other bound,
+                // which costs nothing in dual feasibility, and the dual method
+                // repairs the primal side that moved, unshifted this time: on `air05`
+                // the primal method needed 7700 pivots to clean up after 1590.
+                // A crossover's shift is a few reduced costs a hair wrong on a basis the
+                // shifted dual method has just made primal feasible: the primal method
+                // finishes that in a few pivots, where flipping bounds undoes the
+                // feasibility. On `s100` the flips left a violation of 27 and the dual
+                // method spent its budget on it.
+                let mut rounds = if std::mem::take(&mut self.crossover_shift) {
+                    CLEANUP_ROUNDS
+                } else {
+                    0
+                };
+                while outcome == Some(LpStatus::Optimal)
+                    && rounds < CLEANUP_ROUNDS
+                    && !self.is_dual_feasible()
+                    && self.flip_to_dual_feasible()
+                {
+                    rounds += 1;
+                    self.unperturbed = true;
+                    let left = budget.saturating_sub(iterations);
+                    outcome = self.run_dual(iterations + left, cutoff, &mut iterations);
+                    self.duals = None;
+                }
+                self.unperturbed = false;
                 match outcome {
                     // Optimal for the shifted costs. Usually still optimal for the
                     // real ones; when not, the basis is primal feasible and the primal
@@ -2928,12 +3939,7 @@ impl<'a> Solver<'a> {
                 return self.done(status, iterations);
             };
 
-            let mut col = std::mem::take(&mut self.col);
-            self.lp.column_into(entering, &mut col);
-            let mut alpha = std::mem::take(&mut self.alpha);
-            self.basis.ftran_entering(&col, &mut alpha);
-            self.col = col;
-            self.alpha = alpha;
+            self.solve_entering(entering);
             self.count_entering_density();
 
             match self.ratio_test(entering, sigma, phase_one, bland) {
@@ -2976,7 +3982,7 @@ impl<'a> Solver<'a> {
                     self.take_step(entering, sigma, step);
                     let leaving = self.basic[leaving_row];
 
-                    self.basis.update(&self.alpha, leaving_row);
+                    self.basis.update_h(&self.alpha, leaving_row);
                     self.basic[leaving_row] = entering;
                     self.set_status(entering, Status::Basic { row: leaving_row });
                     self.set_status(leaving, Status::NonBasic(to));
@@ -3288,7 +4294,7 @@ mod tests {
         // Row 0 offers the shortest step by far, but on an entry a hundred-millionth
         // the size of the column's largest, well above the absolute floor of 1e-9.
         // Rows 1 and 2 are sound, and row 1 is the shorter of them.
-        solver.alpha = vec![-1e-8, -2.0, -1.0];
+        solver.alpha.set_dense(&[-1e-8, -2.0, -1.0]);
         for (&j, v) in rows.iter().zip([1.0 - 5e-9, -0.5, -2.0]) {
             solver.z[j] = v;
         }
@@ -3301,7 +4307,7 @@ mod tests {
 
         // The same entry scaled up is no longer negligible and is chosen: the test is
         // relative to the column, not an absolute floor on the entry.
-        solver.alpha[0] = -4.0;
+        solver.alpha.val[0] = -4.0;
         let Step::Pivot { leaving_row, .. } = solver.ratio_test(0, 1.0, false, false) else {
             panic!("a bounded column must produce a pivot");
         };
@@ -3642,5 +4648,92 @@ mod cache_tests {
         assert!(lp.factors.is_empty());
         // And it still solves correctly afterwards.
         assert_eq!(lp.solve().status, LpStatus::Optimal);
+    }
+}
+
+#[cfg(test)]
+mod interior_tests {
+    use super::*;
+    use crate::model::{Builder, RowSense, Sense};
+
+    /// A feasible, bounded LP: rows around a known point, boxed columns, some with only
+    /// a lower bound and a nonnegative cost, a few free with none, and some equations.
+    fn random_lp(rows: usize, cols: usize, seed: u64) -> Problem {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut b = Builder::new(Sense::Minimize);
+        let mut point = Vec::new();
+        let mut objective = Vec::new();
+        for j in 0..cols {
+            let kind = rand();
+            let (lo, hi, cost) = if kind < 0.1 {
+                (f64::NEG_INFINITY, f64::INFINITY, 0.0)
+            } else if kind < 0.35 {
+                (0.0, f64::INFINITY, rand() * 5.0)
+            } else {
+                (-2.0 * rand(), 1.0 + 3.0 * rand(), rand() * 10.0 - 5.0)
+            };
+            let c = b.continuous(&format!("x{j}"), lo, hi);
+            let x0 = if hi.is_finite() { lo + (hi - lo) * rand() } else { rand() * 3.0 };
+            point.push(x0);
+            objective.push((c, cost));
+        }
+        b.objective(&objective);
+        for _ in 0..rows {
+            let mut terms = Vec::new();
+            for j in 0..cols {
+                if rand() < 4.0 / cols as f64 + 0.02 {
+                    terms.push((j, (rand() * 8.0 - 4.0).round().max(-3.0) + 0.5));
+                }
+            }
+            if terms.is_empty() {
+                terms.push(((rand() * cols as f64) as usize % cols, 1.0));
+            }
+            let activity: f64 = terms.iter().map(|&(j, a)| a * point[j]).sum();
+            let pick = rand();
+            if pick < 0.15 {
+                b.row(&terms, RowSense::Eq, activity);
+            } else if pick < 0.6 {
+                b.row(&terms, RowSense::Le, activity + rand());
+            } else {
+                b.row(&terms, RowSense::Ge, activity - rand());
+            }
+        }
+        b.build()
+    }
+
+    #[test]
+    fn the_interior_point_route_reaches_the_simplex_optimum() {
+        let mut checked = 0;
+        for seed in 1..60u64 {
+            // Wide, square and tall, so both forms of the normal equations run.
+            let (rows, cols) = match seed % 3 {
+                0 => (30 + (seed as usize % 20), 90),
+                1 => (60, 60),
+                _ => (180 + (seed as usize % 40), 40),
+            };
+            let p = random_lp(rows, cols, seed);
+            let mut lp = Lp::relaxation(&p);
+            let simplex = lp.clone().solve_with_limit(1_000_000);
+            let interior = lp.solve_interior(1_000_000);
+            if simplex.status != LpStatus::Optimal {
+                continue;
+            }
+            assert_eq!(interior.status, LpStatus::Optimal, "seed {seed} ({rows}x{cols})");
+            let scale = 1.0 + simplex.objective.abs();
+            assert!(
+                (interior.objective - simplex.objective).abs() <= 1e-7 * scale,
+                "seed {seed} ({rows}x{cols}): interior {} simplex {}",
+                interior.objective,
+                simplex.objective
+            );
+            checked += 1;
+        }
+        assert!(checked >= 40, "only {checked} models were bounded and feasible");
     }
 }

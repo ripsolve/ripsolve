@@ -59,6 +59,8 @@ pub struct Scratch {
     stack: Vec<u32>,
     seen: Vec<bool>,
     seen_list: Vec<u32>,
+    /// Matrix entries and literals the last [`propagate`] read.
+    work: usize,
 }
 
 impl Scratch {
@@ -71,7 +73,19 @@ impl Scratch {
             stack: Vec::new(),
             seen: vec![false; n_cols],
             seen_list: Vec::new(),
+            work: 0,
         }
+    }
+
+    /// The columns whose bounds have moved since [`Scratch::begin`], the seeds included,
+    /// for a caller that has to put them back.
+    pub fn touched(&self) -> &[u32] {
+        &self.touched
+    }
+
+    /// Matrix entries and literals the last [`propagate`] read.
+    pub fn work(&self) -> usize {
+        self.work
     }
 
     /// Forget every reason recorded, starting a fresh explanation graph.
@@ -183,13 +197,13 @@ pub fn propagate(
         }
     }
     let mut fixed = 0usize;
-    let mut work = 0usize;
+    scratch.work = 0;
     let mut head = 0usize;
 
     // A local closure cannot hold `scratch` and the bounds at once, so pushing is written
     // out where it is needed rather than shared.
     while head < scratch.queue.len() {
-        if work >= budget {
+        if scratch.work >= budget {
             break;
         }
         let j = scratch.queue[head] as usize;
@@ -232,7 +246,7 @@ pub fn propagate(
                     scratch.queue.push(k as u32);
                 }
             }
-            work += conflicts.degree(node);
+            scratch.work += conflicts.degree(node);
         }
 
         // The clauses this column appears in. A clause with every literal but one
@@ -240,7 +254,7 @@ pub fn propagate(
         if !clauses.is_empty() {
             for &id in &clauses.mentions[j] {
                 let clause = &clauses.clauses[id as usize];
-                work += clause.len();
+                scratch.work += clause.len();
                 let mut unassigned = None;
                 let mut satisfied = false;
                 for &(k, want) in clause {
@@ -290,11 +304,11 @@ pub fn propagate(
         // Row activity, over the rows this column appears in.
         let (rows, _) = problem.matrix.column(j);
         for &i in rows {
-            if work >= budget {
+            if scratch.work >= budget {
                 break;
             }
             let (columns, values) = rows_of_a.column(i);
-            work += columns.len();
+            scratch.work += columns.len();
             let (row_lb, row_ub) = (problem.row_lb[i], problem.row_ub[i]);
             if !row_lb.is_finite() && !row_ub.is_finite() {
                 continue;

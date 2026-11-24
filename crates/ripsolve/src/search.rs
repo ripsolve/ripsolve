@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::aggregate;
+use crate::reduce;
 use crate::cdcl;
 use crate::propagate;
 use crate::branch::{self, Pseudocosts};
@@ -44,6 +44,10 @@ pub enum Status {
     /// Stopped at the time limit; any incumbent is best-so-far, not proven.
     TimeLimit,
 }
+
+/// Pivots per row and column, in halves, the root relaxation's dual solve is given
+/// before the primal method takes over; see [`solve_once`].
+const ROOT_DUAL_PIVOTS: usize = 3;
 
 /// Limits and tolerances for a search.
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +184,13 @@ pub struct Options {
     pub local_cuts_per_node: usize,
     /// Restart a stalled root relaxation from a perturbed one.
     pub perturb_stalled_root: bool,
+    /// Solve the root relaxation by the dual method first, where the model can start it
+    /// dual feasibly, rather than by the primal; see [`Lp::solve_cold_dual`].
+    pub root_dual: bool,
+    /// Race the interior-point method against the two simplex methods for the root
+    /// relaxation, on a third thread, where the search has one; see
+    /// [`Lp::solve_interior`].
+    pub root_interior: bool,
     /// Narrow columns the root's bound and the incumbent together already decide.
     ///
     /// A toggle because the claim it makes is a proof about the whole tree, and a proof
@@ -338,6 +349,8 @@ impl Default for Options {
             local_cuts_per_node: 8,
             jump_moves: 200,
             perturb_stalled_root: true,
+            root_dual: true,
+            root_interior: true,
             fix_by_reduced_cost: true,
             restart_share: 25,
             cut_rounds: 50,
@@ -752,7 +765,7 @@ impl<'a> Worker<'a> {
     /// found a tenth, and it is that tenth which decides whether presolving and cutting
     /// again is worth the time it takes.
     fn wants_restart(&self, incumbent: f64, options: &Options) -> bool {
-        if self.lurking.is_empty() || !incumbent.is_finite() {
+        if options.restart_share == 0 || self.lurking.is_empty() || !incumbent.is_finite() {
             return false;
         }
         let cutoff = match self.granularity {
@@ -990,6 +1003,36 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Children for a node whose LP did not finish: the free integer column with the
+    /// widest range at this node, split in half, each side with the parent's bound.
+    /// `None` when every integer column is already fixed here.
+    fn blind_children(&self, node: &Node) -> Option<Vec<Node>> {
+        let column = (0..self.problem.n_cols())
+            .filter(|&j| self.problem.is_integer(j) && self.node_ub[j] > self.node_lb[j])
+            .max_by(|&p, &q| {
+                let width = |j: usize| self.node_ub[j] - self.node_lb[j];
+                width(p).total_cmp(&width(q)).then(q.cmp(&p))
+            })?;
+        let (lo, hi) = (self.node_lb[column], self.node_ub[column]);
+        let middle = if hi.is_finite() && lo.is_finite() { ((lo + hi) / 2.0).floor() } else { lo.max(0.0).min(hi - 1.0) };
+        Some(
+            [(lo, middle), (middle + 1.0, hi)]
+                .into_iter()
+                .map(|(l, u)| {
+                    let mut fixings = node.fixings.clone();
+                    fixings.push((column as u32, l, u));
+                    Node {
+                        fixings,
+                        bound: node.bound,
+                        basis: node.basis.clone(),
+                        origin: None,
+                        depth: node.depth + 1,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn process(&mut self, node: &Node, incumbent: f64, index: usize) -> NodeOutcome {
         let problem = self.problem;
         let options = self.options;
@@ -1123,7 +1166,7 @@ impl<'a> Worker<'a> {
             && solved.iterations < options.max_iterations_per_node
             && !self.lp.out_of_time()
         {
-            let rescued = self.lp.solve_cold_dual(options.max_iterations_per_node);
+            let rescued = self.lp.solve_cold_dual_boxed(options.max_iterations_per_node);
             self.iterations += rescued.iterations;
             if rescued.status == LpStatus::IterationLimit && !self.lp.out_of_time() {
                 let primal = self.lp.solve_with_limit(options.max_iterations_per_node);
@@ -1172,7 +1215,15 @@ impl<'a> Worker<'a> {
             }
             LpStatus::CutOff | LpStatus::Unbounded => return out,
             LpStatus::IterationLimit => {
-                out.exhausted = true;
+                // No bound of its own, so it keeps its parent's and is split anyway:
+                // its children have narrower bounds, and their LPs usually solve where
+                // its own did not. Given up on instead, it ended `swath1`'s search at
+                // 26 seconds of 80 with the rest of the tree exhausted and nothing
+                // proved. Only with time left and something left to split.
+                match self.blind_children(node) {
+                    Some(children) if !self.lp.out_of_time() => out.children = children,
+                    _ => out.exhausted = true,
+                }
                 return out;
             }
             LpStatus::Optimal => {}
@@ -1182,7 +1233,7 @@ impl<'a> Worker<'a> {
         // anything. A relaxation worth 52000.3 on a model whose objectives step by 200
         // is a proof that nothing here beats 52200.
         let mut relaxed = lift_to_granularity(solved.objective, self.granularity);
-        if !improves(relaxed, incumbent, options.gap_tolerance) {
+        if !improves(relaxed, incumbent, options.gap_tolerance, problem.obj_offset) {
             return out;
         }
 
@@ -1222,7 +1273,7 @@ impl<'a> Worker<'a> {
                 }
                 solved = resolved;
                 relaxed = lift_to_granularity(solved.objective, self.granularity);
-                if !improves(relaxed, incumbent, options.gap_tolerance) {
+                if !improves(relaxed, incumbent, options.gap_tolerance, problem.obj_offset) {
                     return out;
                 }
                 rounds += 1;
@@ -1244,7 +1295,7 @@ impl<'a> Worker<'a> {
             && let Some(tightened) = self.separate_locally(&solved, &options, cutoff)
         {
             bound = lift_to_granularity(tightened, self.granularity);
-            if !improves(bound, incumbent, options.gap_tolerance) {
+            if !improves(bound, incumbent, options.gap_tolerance, problem.obj_offset) {
                 return out;
             }
         }
@@ -1621,7 +1672,7 @@ fn run_parallel(
                         }
                     }
                     let best = shared.incumbent();
-                    if !improves(node.bound, best, options.gap_tolerance) {
+                    if !improves(node.bound, best, options.gap_tolerance, problem.obj_offset) {
                         shared.give_back(Vec::new());
                         continue;
                     }
@@ -1701,6 +1752,7 @@ fn run_parallel(
                 f64::from_bits(shared.unresolved_bound.load(Ordering::Relaxed)),
                 incumbent,
                 options.gap_tolerance,
+                problem.obj_offset,
             ) =>
         {
             // Nodes are skipped when their LP runs into the deadline too; see the
@@ -1794,6 +1846,8 @@ fn separate_at_root(
     // own deadline; see the caller.
     stop_cutting: Option<Instant>,
     separation: Option<&Separation>,
+    // The best point's value as it stands, which may improve while the loop runs.
+    incumbent: &dyn Fn() -> f64,
 ) -> RootCuts {
     // Nothing to do, and in particular no reason to clone the model, which is the
     // common case since root cutting is off by default.
@@ -1831,6 +1885,7 @@ fn separate_at_root(
     let mut rows: Vec<(cuts::Cut, Option<u32>)> = Vec::new();
     // Which of them the last round's ageing condemned, to leave at the next rebuild.
     let mut doomed: Vec<bool> = Vec::new();
+    let granularity = objective_granularity(&base);
 
     for _ in 0..options.cut_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d)
@@ -1839,6 +1894,12 @@ fn separate_at_root(
             break;
         }
         if root.status != LpStatus::Optimal {
+            break;
+        }
+        // A bound that has met the incumbent has nothing left to prove. `neos-1122047`
+        // held a point at 161 against a root of 161 and cut on to the time limit.
+        let best = incumbent();
+        if lift_to_granularity(root.objective, granularity) >= best - 1e-9 * best.abs().max(1.0) {
             break;
         }
         // An integral root is the answer, unless it breaks a row the caller holds.
@@ -2160,19 +2221,28 @@ fn solve_separating(
         options.symmetry = false;
         options.cdcl = false;
     }
-    // Aggregation is applied once, around everything: the restart loop, presolve, the
-    // cut loop and every node then see only the smaller model, so no index inside the
-    // search has to know this happened. The solution comes back through the map at the
-    // end, and a caller's starting point goes down through it at the start.
+    // The renumbering reductions are applied once, around everything: the restart loop,
+    // presolve, the cut loop and every node then see only the smaller model, so no index
+    // inside the search has to know this happened. The solution comes back through the
+    // map at the end, and a caller's starting point goes down through it at the start.
     if options.aggregate {
-        match aggregate::aggregate(problem, AGGREGATE_TOLERANCE) {
+        match reduce::reduce_with_presolve(problem, AGGREGATE_TOLERANCE) {
             Err(_) => return Solution::without_solution(Status::Infeasible, 0, 0, None),
-            Ok(Some((smaller, map))) => {
+            Ok(Some((smaller, map, _))) => {
                 let restricted = start.map(|x| map.restrict(x));
                 let mut solution =
                     solve_all_restarts(&smaller, options, restricted.as_deref(), separation);
-                if !solution.x.is_empty() {
+                // Not `!x.is_empty()`: reduction can leave no columns at all, and then
+                // the reduced optimum is the empty vector and every value comes from
+                // the map.
+                if solution.objective.is_some() && solution.x.len() == smaller.n_cols() {
                     solution.x = map.expand(&solution.x);
+                    // Scored again on the model the caller gave, so the value reported
+                    // is the one of the point returned. The two differ by what the
+                    // reduced point's tolerance-sized slack is worth at the costs the
+                    // map put on it: on `binkar10_1`, whose own costs reach 1e6, the
+                    // reduced score came out 0.64 below the point's.
+                    solution.objective = Some(problem.objective_value(objective_at(problem, &solution.x)));
                 }
                 return solution;
             }
@@ -2378,6 +2448,11 @@ impl Mailbox {
     fn is_proved(&self) -> bool {
         self.proved.load(Ordering::Relaxed)
     }
+
+    /// The value of the best point, without taking it.
+    fn value(&self) -> Option<f64> {
+        self.best.lock().expect("mailbox lock").as_ref().map(|(value, _)| *value)
+    }
 }
 
 /// The conflict-driven search, run on its own thread for the length of a solve.
@@ -2400,7 +2475,7 @@ fn search_beside(problem: &Problem, options: Options, started: Instant, mailbox:
     let granularity = objective_granularity(&model);
     let next = |v: f64| match granularity {
         Some(g) => lift_to_granularity(v, granularity) - g,
-        None => v - (options.gap_tolerance * v.abs()).max(1e-9),
+        None => v - (options.gap_tolerance * (v + model.obj_offset).abs()).max(1e-9),
     };
     let conflicts = Conflicts::of(&model);
     let found = cdcl::optimize(
@@ -2530,11 +2605,14 @@ fn restart_loop(
         });
         model = Some(narrowed);
     }
-    // Out of restarts. One more pass, and whatever it says is the answer.
+    // Out of restarts. One more pass, and whatever it says is the answer, so it may
+    // not stop to ask for another: allowed to, `swath1`'s last pass did at 41 seconds
+    // of 80 and the solve reported a node limit nobody set.
     let attempt = solve_once(
         model.as_ref().unwrap_or(problem),
         Options {
             max_iterations: options.max_iterations.saturating_sub(iterations),
+            restart_share: 0,
             ..options
         },
         started,
@@ -2624,6 +2702,8 @@ fn solve_once(
     let mut lp = Lp::relaxation(problem).with_tolerances(crate::lp::Tolerances {
         refactor_interval: options.refactor_interval,
         warm_steepest_edge: options.warm_steepest_edge,
+        // The short step at the root, the long one in the tree; see below.
+        long_step: false,
         ..Default::default()
     });
     // The budget belongs to the LP as well as the node loop. Checking only between
@@ -2802,8 +2882,113 @@ fn solve_once(
             None => first,
         }));
     }
-    let mut root = lp.solve_with_limit(options.max_iterations_per_node.min(options.max_iterations));
+    // The dual method first, perturbed, with the primal behind it. Over the 240
+    // instances of MIPLIB's benchmark set the dual method takes half the primal's time
+    // on the relaxations both finish, and finishes some the primal does not:
+    // `neos-827175`'s takes 6191 pivots against more than 80000. It also has models it
+    // wanders on, `ns1208400` past 240000 pivots where the primal needs 12066, and a
+    // dual solve that has not finished in one and a half pivots per row and column was
+    // slower than the primal on every model measured. So that is its budget, and the
+    // primal starts afresh after it.
+    //
+    // The budget is also half the time left of the first attempt's share, since a
+    // pivot count says nothing about what a pivot costs: `neos-2987310-joes`'s dual
+    // pivots take twice the primal's, its 85000-pivot budget outlasted the whole share,
+    // and the primal, which needs 12000 pivots and three seconds, never ran.
+    let cap = options.max_iterations_per_node.min(options.max_iterations);
+    let dual_cap = cap.min(ROOT_DUAL_PIVOTS * (lp.n_rows() + lp.n_columns()) / 2);
+    let first_deadline = options
+        .time_limit
+        .map(|limit| started + limit.mul_f64(ROOT_LP_FIRST_SHARE))
+        .map_or(deadline, |first| Some(deadline.map_or(first, |hard| hard.min(first))));
+    let race = options.root_dual && options.threads > 1;
+    let interior = race && options.root_interior && options.threads > 2;
+    let mut raced_dual = false;
+    let mut root = if race {
+        // Both at once, on two threads, and the first to finish stops the other: the
+        // root then costs whichever method suits the model, which nothing read off the
+        // model beforehand predicts. Over the relaxations the search misses on, the
+        // primal method takes 10 seconds on `mzzv42z` where the dual does not finish
+        // in 54, and the dual 18 on `hypothyroid-k1` where the primal does not in 56.
+        //
+        // With a third thread the interior-point method races too. Of the 61 roots
+        // over MIPLIB's benchmark set that neither simplex method finishes in a minute,
+        // it takes `brazil3` in 8 seconds, `thor50dday` in 6, `uccase12` in 11.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut other = lp.clone();
+        let mut third = interior.then(|| lp.clone());
+        lp.set_deadline(first_deadline);
+        other.set_deadline(first_deadline);
+        lp.set_interrupt(Some(stop.clone()));
+        other.set_interrupt(Some(stop.clone()));
+        if let Some(third) = third.as_mut() {
+            third.set_deadline(first_deadline);
+            third.set_interrupt(Some(stop.clone()));
+        }
+        let (primal, dual, inner) = std::thread::scope(|scope| {
+            let dual = scope.spawn(|| {
+                let solved = other.solve_cold_dual_boxed(cap);
+                if solved.status == LpStatus::Optimal {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                solved
+            });
+            let inner = third.as_mut().map(|third| {
+                let stop = &stop;
+                scope.spawn(move || {
+                    let solved = third.solve_interior(cap);
+                    if solved.status == LpStatus::Optimal {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    solved
+                })
+            });
+            let solved = lp.solve_with_limit(cap);
+            if solved.status == LpStatus::Optimal {
+                stop.store(true, Ordering::Relaxed);
+            }
+            (
+                solved,
+                dual.join().expect("the dual root solve panicked"),
+                inner.map(|h| h.join().expect("the interior root solve panicked")),
+            )
+        });
+        let inner_iterations = inner.as_ref().map_or(0, |s| s.iterations);
+        if primal.status == LpStatus::Optimal {
+            iterations += dual.iterations + inner_iterations;
+            primal
+        } else if dual.status == LpStatus::Optimal {
+            iterations += primal.iterations + inner_iterations;
+            lp = other;
+            raced_dual = true;
+            dual
+        } else if let Some(inner) = inner.filter(|s| s.status == LpStatus::Optimal) {
+            iterations += primal.iterations + dual.iterations;
+            lp = third.expect("an interior solve ran");
+            inner
+        } else {
+            iterations += dual.iterations + inner_iterations;
+            primal
+        }
+    } else if options.root_dual {
+        if let Some(end) = first_deadline {
+            let now = Instant::now();
+            lp.set_deadline(Some(now + end.saturating_duration_since(now) / 2));
+        }
+        let dual = lp.solve_cold_dual_boxed(dual_cap);
+        lp.set_deadline(first_deadline);
+        dual
+    } else {
+        lp.solve_with_limit(cap)
+    };
+    let mut dual_first = if race { raced_dual } else { options.root_dual && root.status == LpStatus::Optimal };
+    if !race && options.root_dual && !dual_first && !lp.out_of_time() {
+        iterations += root.iterations;
+        root = lp.solve_with_limit(cap);
+        dual_first = false;
+    }
     lp.set_deadline(deadline);
+    lp.set_interrupt(mailbox.map(|m| m.proved.clone()));
     iterations += root.iterations;
     // What every improvement search below is allowed, sized from the one solve every
     // model makes and before anything timed has run, so that it is the same on every
@@ -2824,25 +3009,21 @@ fn solve_once(
     // The second rescue was unreachable for that reason alone.
     let budget = root.iterations.clamp(1, options.max_iterations_per_node);
 
-    // The dual method first, because it is cheap where it works: `air04`'s relaxation
-    // goes from not finishing in 130 seconds to finishing in 1.5, and `tanglegram6`'s
-    // in 0.5. Where it does not work it is bounded like everything else here.
-    //
-    // Asked here and nowhere else, and that is the whole of why it is safe. The primal
-    // method reaches feasibility through phase 1, whose cost vector scores a basic
-    // variable by whether it currently violates a bound and so is blind to the kink at
-    // one sitting exactly on one; no ratio test repairs a column choice made that way,
-    // and the dual method has no phase 1 to get stuck in. Made the default it loses
-    // anyway: the two methods end on *different* optimal vertices, and everything
-    // downstream reads the root's vertex rather than its objective, since Gomory cuts
-    // come off that tableau and branching reads its fractional values. On this set the
-    // vertex it reaches is usually the worse one to start from. Asked only where the
-    // primal method produced no vertex at all, there is nothing to be worse than.
+    // Then whichever method the first attempt did not finish with. The primal method
+    // reaches feasibility through phase 1, whose cost vector scores a basic variable by
+    // whether it currently violates a bound and so is blind to the kink at one sitting
+    // exactly on one; no ratio test repairs a column choice made that way, and the dual
+    // method has no phase 1 to get stuck in: `air04`'s relaxation went from not
+    // finishing in 130 seconds to finishing in 1.5 this way, and `tanglegram6`'s in 0.5.
     if root.status != LpStatus::Optimal
         && deadline.is_none_or(|d| Instant::now() < d)
         && iterations < options.max_iterations
     {
-        let rescued = lp.solve_cold_dual(budget);
+        let rescued = if dual_first {
+            lp.solve_with_limit(budget)
+        } else {
+            lp.solve_cold_dual(budget)
+        };
         iterations += rescued.iterations;
         if rescued.status == LpStatus::Optimal {
             root = rescued;
@@ -2978,10 +3159,18 @@ fn solve_once(
     let stop_cutting = options
         .time_limit
         .map(|limit| started + limit.mul_f64(ROOT_CUT_SHARE));
-    let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting, separation);
+    let best = || mailbox.and_then(Mailbox::value).map_or(incumbent, |value| value.min(incumbent));
+    let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting, separation, &best);
     iterations += cut.iterations;
     let cuts_added = cut.added;
     let mut lp = cut.lp;
+    // The long-step dual ratio test only once the tree opens. At the root it lands on a
+    // vertex the cut loop and the dives do worse from: `neos-1122047` closes in 1.6
+    // seconds without it and stays open at 80 with it, `drayage-100-23` takes 30
+    // seconds against 2. In the tree, repairing a branched bound, it pays:
+    // `neos-1582420` closes in 38 seconds with it and not at all without.
+    let tree_tol = crate::lp::Tolerances { long_step: true, ..lp.tolerances() };
+    lp = lp.with_tolerances(tree_tol);
     let root = cut.root;
     // Held here so the borrow below outlives the branch that produced it.
     let with_cuts_model = cut.model;
@@ -3194,7 +3383,7 @@ fn solve_once(
     // the same trap recorded against the earlier attempt at root improvement, and it
     // was walked into again by assuming the situation had changed.
     if options.improvement_frequency > 0
-        && improves(root_bound, incumbent, options.gap_tolerance)
+        && improves(root_bound, incumbent, options.gap_tolerance, problem.obj_offset)
         && let Some((objective, x)) = reduced_cost_neighbourhood(
             problem,
             &lurking,
@@ -3214,7 +3403,7 @@ fn solve_once(
     // A model built on implied bounds is a much smaller model with the same answer, and
     // this is the search for it. See `aggregate_by_implied_bounds`.
     if options.improvement_frequency > 0
-        && improves(root_bound, incumbent, options.gap_tolerance)
+        && improves(root_bound, incumbent, options.gap_tolerance, problem.obj_offset)
         && let Some((objective, x)) = aggregated_search(
             problem,
             &root.x,
@@ -3239,7 +3428,7 @@ fn solve_once(
     // point gives a different neighbourhood, and under the same guard as above.
     for _ in 0..ROOT_RINS_ROUNDS {
         if options.improvement_frequency == 0
-            || !improves(root_bound, incumbent, options.gap_tolerance)
+            || !improves(root_bound, incumbent, options.gap_tolerance, problem.obj_offset)
         {
             break;
         }
@@ -3372,7 +3561,7 @@ fn solve_once(
         }
         // The parent's bound may have been overtaken by an incumbent found since
         // this node was pushed, in which case it needs no solve at all.
-        if !improves(node.bound, incumbent, options.gap_tolerance) {
+        if !improves(node.bound, incumbent, options.gap_tolerance, problem.obj_offset) {
             continue;
         }
         // Asked only of a node that would be solved: one already pruned is no reason
@@ -3461,7 +3650,7 @@ fn solve_once(
         // A node is skipped when its LP runs into the deadline, too, and a tree
         // emptied that way stopped on the clock, not on a node limit nobody set.
         (Status::Optimal, _)
-            if unresolved > 0 && improves(unresolved_bound, incumbent, options.gap_tolerance) =>
+            if unresolved > 0 && improves(unresolved_bound, incumbent, options.gap_tolerance, problem.obj_offset) =>
         {
             if options.deadline.is_some_and(|d| Instant::now() >= d) {
                 Status::TimeLimit
@@ -4459,13 +4648,20 @@ fn objective_at(problem: &Problem, x: &[f64]) -> f64 {
 
 /// Would a node with this bound improve on the incumbent by enough to be worth
 /// exploring?
-fn improves(bound: f64, incumbent: f64, gap_tolerance: f64) -> bool {
+///
+/// `bound` and `incumbent` are the model's own objective, without `offset`, and the
+/// gap is relative to the objective with it, which is the one the caller set the
+/// tolerance against. Taken relative to the bare value, a large constant moved into
+/// the offset scales the slack with it: `reduce` leaves `binkar10_1` an offset of
+/// -999211 under an optimum of 6742, a bare objective near 1e6, and a 1e-4 gap then
+/// pruned anything within 100 of the incumbent and closed the instance at 6763.
+fn improves(bound: f64, incumbent: f64, gap_tolerance: f64, offset: f64) -> bool {
     if !incumbent.is_finite() {
         return true;
     }
     // An absolute floor as well as the relative gap: without it, an incumbent of
     // zero would make the relative test vacuous.
-    let slack = (gap_tolerance * incumbent.abs()).max(1e-9);
+    let slack = (gap_tolerance * (incumbent + offset).abs()).max(1e-9);
     bound < incumbent - slack
 }
 
@@ -4537,6 +4733,17 @@ mod tests {
         assert_eq!(lift_to_granularity(52200.0, granularity), 52200.0);
         assert_eq!(lift_to_granularity(52200.000000001, granularity), 52200.0);
         assert_eq!(lift_to_granularity(-400.5, granularity), -400.0);
+    }
+
+    #[test]
+    fn the_gap_is_relative_to_the_objective_with_its_offset() {
+        // `binkar10_1` after `reduce`: a bare objective near 1e6 over an offset that
+        // brings it back to 6742. The slack is a ten-thousandth of 6742, not of 1e6.
+        let offset = -999_211.49;
+        let incumbent = 6763.12 - offset;
+        assert!(improves(6742.2 - offset, incumbent, 1e-4, offset));
+        assert!(!improves(6763.0 - offset, incumbent, 1e-4, offset));
+        assert!(!improves(6742.2 - offset, incumbent, 1e-4, 0.0));
     }
 
     #[test]
