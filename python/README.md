@@ -65,16 +65,13 @@ every point before it may become the incumbent; the other `where` codes, `cbSetS
 and `terminate` are not there. `MIPNODE` runs at every node, so a costly separator
 should return quickly where it finds nothing. One callback runs at a time even with
 several threads, as in gurobipy. `addVar` accepts `GRB.BINARY`, `GRB.INTEGER` and
-`GRB.CONTINUOUS`, and rejects anything else rather than silently solving a model it
-cannot honour.
+`GRB.CONTINUOUS`, and raises an error for any other type.
 
-`vtype` defaults to continuous, as gurobipy's does. Defaulting to binary would suit
-this solver's history and is exactly the wrong trade: a ported script calling
-`addVar()` would silently get a different model.
+`vtype` defaults to continuous, as in gurobipy, so a ported script that calls
+`addVar()` builds the same model.
 
-Unknown parameter names raise `KeyError` rather than being ignored, so a
-misspelling fails loudly. Attribute names, as in gurobipy, may be written in any
-case: `model.status` is `model.Status`.
+Unknown parameter names raise `KeyError` instead of being ignored. Attribute names,
+as in gurobipy, may be written in any case: `model.status` is `model.Status`.
 
 ## Threads
 

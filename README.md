@@ -18,23 +18,22 @@ There is a command-line application, a Rust library, and a Python module shaped 
 rows. In that range it is quicker than HiGHS, SCIP and CBC on most of the benchmark
 set, and competitive with Gurobi.
 
-Outside that shape it is not competitive, and the distance is not small. On a seeded
+Outside that range it falls well behind. On a seeded
 random sample of MIPLIB 2017's `easy` list, sixteen threads and a sixty-second limit for
 every solver, it closed **three of the sixteen instances Gurobi closes**. Six of the
 thirteen it missed are ones Gurobi finishes in under three seconds. Reach for HiGHS or
 SCIP there.
 
-`bench/miplib_sample.py` reproduces that. It runs the reference first and skips any
-instance the reference cannot close within the same budget, because a timeout on both
-sides measures the instance rather than this solver, and it caches the reference's
-answers so a re-run costs only ripsolve's time.
+`bench/miplib_sample.py` reproduces that. It runs the reference first, skips any
+instance the reference cannot close within the same budget, and caches the reference's
+answers so a re-run times only ripsolve.
 
 Implemented: LP and MPS readers, presolve, knapsack cover cuts, Gomory mixed-integer
 cuts, node-local cut separation, pseudocost branching, primal heuristics, a sparse LU
-factorization, best-bound search, and parallel tree search.
+factorization, best-bound search, parallel tree search, and callbacks that add cuts and
+lazy constraints.
 
-Not implemented: quadratic terms, SOS constraints, callbacks, lazy constraints,
-multi-objective.
+Not implemented: quadratic terms, SOS constraints, multi-objective.
 
 ## Install
 
@@ -50,14 +49,14 @@ Rust library:
 cargo add ripsolve
 ```
 
-Python module, which needs a Python with development headers:
+Python module:
 
 ```sh
-git clone https://github.com/ripsolve/ripsolve
-cd ripsolve/python && ./build.sh
+pip install ripsolve
 ```
 
-That writes `ripsolve.so` next to the script. Put it on your `PYTHONPATH`.
+One wheel per platform serves every CPython from 3.9 on. Where none fits, pip builds
+from the source distribution, which needs a Rust toolchain.
 
 ## Command line
 
@@ -146,22 +145,46 @@ m = gp.read("model.mps")
 m.optimize()
 ```
 
+### Callbacks
+
+Lazy constraints and cuts are added from a callback, as in gurobipy. It is called at
+`GRB.Callback.MIPNODE` for the root's and every node's relaxation, and at
+`GRB.Callback.MIPSOL` for every point before it may become the incumbent. A model whose
+rows are too many to write down can leave them to the callback:
+
+```python
+m.setParam("LazyConstraints", 1)
+m._y = y                                     # for the callback to read
+
+def callback(model, where):
+    if where == GRB.Callback.MIPSOL:
+        value = model.cbGetSolution(model._y)
+        for a, b, c in broken_triangles(value):
+            model.cbLazy(model._y[a, b] + model._y[b, c] - model._y[a, c] <= 1)
+
+m.optimize(callback)
+```
+
+`cbGetNodeRel` reads a node's relaxation and `cbCut` adds a cut there. A `Var`, a list
+or a dict of them comes back as a value, a list or a dict. An exception raised in the
+callback is raised again from `optimize()`.
+
 ### Supported surface
 
 | | |
 |---|---|
-| Model | `Model(name)`, `optimize`, `getVars`, `write`, `setParam`, `read` |
+| Model | `Model(name)`, `optimize`, `getVars`, `write`, `setParam`, `Params`, `read` |
 | Variables | `addVar`, `addVars`, `.X`, `.VarName`, `.VType`, `.Obj`, `.LB`, `.UB` |
 | Expressions | `+ - *`, unary `-`, `<= >= ==`, `quicksum` |
-| Constraints | `addConstr`, `addConstrs`, `.ConstrName` |
+| Constraints | `addConstr`, `addConstrs`, `addLConstr`, `.ConstrName` |
 | Objective | `setObjective(expr, GRB.MINIMIZE / GRB.MAXIMIZE)` |
 | Attributes | `ObjVal`, `ObjBound`, `Status`, `SolCount`, `NodeCount`, `Runtime`, `MIPGap`, `NumVars`, `NumConstrs`, `ModelName`, `ModelSense` |
-| Parameters | `TimeLimit`, `Threads`, `MIPGap`, `OutputFlag` |
+| Parameters | `TimeLimit`, `Threads`, `MIPGap`, `OutputFlag`, `LazyConstraints`, `PreCrush` |
+| Callbacks | `optimize(callback)`, `GRB.Callback.MIPNODE` / `MIPSOL`, `cbGet`, `cbGetSolution`, `cbGetNodeRel`, `cbLazy`, `cbCut` |
 
-Two deliberate differences from gurobipy's behaviour. `vtype` defaults to continuous,
-as gurobipy's does, even though binary would suit this solver's history: a ported
-script calling `addVar()` should not silently get a different model. Unknown parameter
-names raise `KeyError` rather than being ignored, so a misspelling fails loudly.
+`vtype` defaults to continuous, as in gurobipy, so a ported script that calls
+`addVar()` builds the same model. Unknown parameter names raise `KeyError` instead of
+being ignored.
 
 `optimize()` releases the GIL, so a solve does not block other Python threads.
 
@@ -201,9 +224,9 @@ assert_eq!(solution.objective, Some(23.0));
 ```
 
 `continuous` adds a column with no integrality requirement, and `range` adds a row
-bounded on both sides. A binary column is an integer column bounded to `[0, 1]`;
-nothing treats that as a distinct case, because branching splits a range and
-degenerates to fixing at 0 or 1.
+bounded on both sides. A binary column is an integer column bounded to `[0, 1]`.
+No code treats it as a special case: branching splits the range, which for a binary
+column fixes it at 0 or 1.
 
 `Problem` is also a plain struct with public fields, so it can be filled in directly
 when translating a model from somewhere else.
@@ -231,9 +254,8 @@ Full API documentation is on [docs.rs](https://docs.rs/ripsolve).
 ## Benchmarks
 
 Every solver on one thread with the same 60-second limit, timing only the solve.
-`bench/open_compare.py` reproduces this, and fails if any two solvers that both claim
-optimality disagree on the optimum, so it is a differential test as much as a
-benchmark.
+`bench/open_compare.py` reproduces this, and fails if two solvers that both claim
+optimality disagree on the optimum.
 
 | instance | rows | ripsolve | HiGHS | SCIP | CBC |
 |---|---:|---:|---:|---:|---:|
@@ -252,7 +274,7 @@ benchmark.
 
 Fastest or tied on nine of twelve, and every proven optimum agrees. The models it loses
 are the widest: both thousand-row instances, and `v064c200` by a fifth of a second. CBC
-finds nothing at all on three.
+finds no solution on three.
 
 Against Gurobi on the same models and the same limit, matching thread counts so the
 comparison is of algorithms rather than of core usage:
@@ -263,27 +285,25 @@ comparison is of algorithms rather than of core usage:
 | 2x to 3x | `v081c162n009`, `v256c256n100`, `v064c200` | `v048c128`, `v128c1000n100`, `mkp_200`, `v064c1000n100` |
 | worst | `v064c1000n100` and `mkp_200` at 7x | `v064c1000n100` at 3x |
 
-Every objective it proves matches. Two models sit outside: `v064c1000n020` yields no
+Every objective it proves matches. Two models are not counted: `v064c1000n020` yields no
 feasible point to either solver, and `mkp_500` reaches the same 6191 Gurobi does at one
 thread, but does not close it at sixteen, where the extra workers find more incumbents
 and prove less.
 
-All three tables come from one sitting on one machine, which matters more than it
-sounds: absolute times here drifted by a factor of two across a day of benchmarking, so
-figures are comparable within a table and not against an older copy of this file. Every
-comparison runs both solvers in the same session for that reason.
+All three tables come from one sitting on one machine. Absolute times drifted by a
+factor of two over a day of benchmarking, so compare figures within a table, not against
+an older copy of this file.
 
-Gurobi is run under an academic licence. It is named here rather than anonymised, and
-the figures for it are reported the same way as everyone else's: same machine, same
-limit, same thread count, one sitting. `bench/compare.py` and `bench/binary_bench.py`
-reproduce these for anyone holding a licence. Nothing is withheld.
+Gurobi was run under an academic licence, with the same machine, limit and thread count
+as the others. `bench/compare.py` and `bench/binary_bench.py` reproduce these figures for
+anyone holding a licence.
 
 ### MIPLIB, against the open-source field
 
 The tables above are generated models. This one is MIPLIB: the 140 instances of its
-`easy` set whose every column is binary, at a 60-second limit. Membership is a property
-of the model rather than of what any solver manages on it, so the set cannot flatter
-the solver being measured. `bench/binary_bench.py` reproduces it, and
+`easy` set whose every column is binary, at a 60-second limit. The set is chosen by
+column type alone, not by how any solver does on it. `bench/binary_bench.py` reproduces
+it, and
 `docs/baselines/binary-2026-10-23.json` holds every measurement below
 (`binary-2026-10-23-1t.json` the one-thread run).
 
@@ -298,7 +318,7 @@ Counting over the whole 140, at sixteen threads and at one:
 | CBC | 30 | 31 |
 
 Of the 140, 66 are closed at sixteen threads by at least one open-source solver, and
-those are the rows below; the other 74 defeat all four. The sets are not nested.
+those are the rows below; none of the four closes the other 74. The sets are not nested.
 ripsolve closes 15 that HiGHS does not and 13 that SCIP does not, and misses 15 that
 one of them closes: `ab71-20-100`, `air04`, `air05`, `bley_xl1`, `cod105`,
 `graph20-20-1rand`, `mine-166-5`, `neos-1324574`, `neos-780889`, `neos-787933`,
@@ -383,16 +403,15 @@ which is a complete answer and counts as closed.
 | `neos-960392` | 4744 | 59376 | -- | **21.9s** | -- | -- | 4.7s |
 | `tanglegram6` | 17712 | 9182 | -- | -- | **19.2s** | -- | 0.1s |
 
-Some cautions about reading this table. It is one run: the parallel search is not
+This table is one run, and the parallel search is not
 deterministic, and an instance finishing near the limit may not finish on the next run.
 `neos-787933` closed at 57.8 seconds in the previous run and does not close here, while
 `nw04` closes anywhere from 30 to 55 seconds depending on when the conflict-driven search
 beside the tree hands over its first point. The other solvers' times were measured
 earlier on the same machine and reused from the harness's cache; only ripsolve was rerun
 for this table. The one-thread column is from the 0.4.0 release build, before the
-time-limit fixes. And Gurobi, at the same limit and thread count, closes 60 of these 66
-and 94 of the 140 -- which is a more useful thing to know about the state of the art
-than any ranking among the rest.
+time-limit fixes. Gurobi, at the same limit and thread count, closes 60 of these 66 and
+94 of the 140.
 
 ## Building and testing
 
@@ -403,11 +422,11 @@ cargo test
 
 Builds on stable Rust. The test suite is self-contained and needs no external solver.
 
-Correctness is additionally checked against other solvers used strictly as oracles.
+Correctness is also checked against other solvers, used only as oracles.
 `bench/refresh_fixtures.py` records reference relaxation and optimal values into
 `crates/ripsolve/tests/fixtures/reference.json`, and the tests read only that file.
 Each entry carries a digest of its instance, so changing the generator fails the suite
-as a stale fixture rather than silently pairing new instances with old values.
+as a stale fixture instead of pairing new instances with old values.
 `bench/mip_fuzz.py` compares randomized mixed-integer models against a reference
 solver.
 
@@ -418,7 +437,7 @@ solver.
 | `crates/ripsolve` | The solver library |
 | `crates/ripsolve-cli` | The `ripsolve` command-line application |
 | `crates/ripsolve-py` | The Python extension module |
-| `python/` | Python build script and test suite |
+| `python/` | Python packaging, development build script and test suite |
 | `samples/` | Example models in LP and MPS format |
 | `bench/` | Benchmark and fixture-refresh tooling |
 | `docs/design-notes.md` | Why the solver is built the way it is |
