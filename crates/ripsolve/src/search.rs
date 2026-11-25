@@ -187,8 +187,9 @@ pub struct Options {
     /// Solve the root relaxation by the dual method first, where the model can start it
     /// dual feasibly, rather than by the primal; see [`Lp::solve_cold_dual`].
     pub root_dual: bool,
-    /// Race the interior-point method against the two simplex methods for the root
-    /// relaxation, on a third thread, where the search has one; see
+    /// Use the interior-point method on the root relaxation as well as the two simplex
+    /// methods: on a thread of its own with three or more, ahead of the primal on its
+    /// thread with two, and between the dual and the primal with one; see
     /// [`Lp::solve_interior`].
     pub root_interior: bool,
     /// Narrow columns the root's bound and the incumbent together already decide.
@@ -2902,7 +2903,8 @@ fn solve_once(
         .map(|limit| started + limit.mul_f64(ROOT_LP_FIRST_SHARE))
         .map_or(deadline, |first| Some(deadline.map_or(first, |hard| hard.min(first))));
     let race = options.root_dual && options.threads > 1;
-    let interior = race && options.root_interior && options.threads > 2;
+    let interior = options.root_dual && options.root_interior;
+    let three = options.threads > 2;
     let mut raced_dual = false;
     let mut root = if race {
         // Both at once, on two threads, and the first to finish stops the other: the
@@ -2914,6 +2916,14 @@ fn solve_once(
         // With a third thread the interior-point method races too. Of the 61 roots
         // over MIPLIB's benchmark set that neither simplex method finishes in a minute,
         // it takes `brazil3` in 8 seconds, `thor50dday` in 6, `uccase12` in 11.
+        //
+        // With two, the interior-point method shares the primal's thread: the primal
+        // for an eighth of the first share, then the interior-point method, then the
+        // primal again. Over the 240 roots on one thread each, that finishes 199 inside
+        // the first share where the dual against the primal finishes 188. The primal's
+        // second turn is there because the interior-point method often gives up early,
+        // and five roots, `dano3_3` and `roi5alpha10n8` among them, only the primal
+        // solves.
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let mut other = lp.clone();
         let mut third = interior.then(|| lp.clone());
@@ -2925,7 +2935,7 @@ fn solve_once(
             third.set_deadline(first_deadline);
             third.set_interrupt(Some(stop.clone()));
         }
-        let (primal, dual, inner) = std::thread::scope(|scope| {
+        let (primal, dual, inner, leash) = std::thread::scope(|scope| {
             let dual = scope.spawn(|| {
                 let solved = other.solve_cold_dual_boxed(cap);
                 if solved.status == LpStatus::Optimal {
@@ -2933,42 +2943,99 @@ fn solve_once(
                 }
                 solved
             });
-            let inner = third.as_mut().map(|third| {
-                let stop = &stop;
-                scope.spawn(move || {
-                    let solved = third.solve_interior(cap);
+            let (here, spawned) = match third.as_mut() {
+                Some(third) if !three => (Some(third), None),
+                Some(third) => {
+                    let stop = &stop;
+                    (None, Some(scope.spawn(move || {
+                        let solved = third.solve_interior(cap);
+                        if solved.status == LpStatus::Optimal {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        solved
+                    })))
+                }
+                None => (None, None),
+            };
+            // Sharing a thread, the primal goes first on a short leash, and the
+            // interior-point method only where that was not enough. Easy roots then
+            // end as they did before it: its crossover lands on a vertex of its own,
+            // and on roots any method takes in a hundredth of a second that sent the
+            // cut loop elsewhere, `p200x1188c` from 9 seconds to 40 on two threads.
+            // And `neos-2987310-joes`, whose primal takes half a second and dual far
+            // longer, waited 11 seconds on the interior-point method.
+            let mut inner = None;
+            let mut leash = 0;
+            let primal = match here {
+                Some(third) => {
+                    if let Some(end) = first_deadline {
+                        let now = Instant::now();
+                        lp.set_deadline(Some(now + end.saturating_duration_since(now) / 8));
+                    }
+                    let first = lp.solve_with_limit(dual_cap);
+                    lp.set_deadline(first_deadline);
+                    if first.status == LpStatus::Optimal {
+                        stop.store(true, Ordering::Relaxed);
+                        Some(first)
+                    } else if stop.load(Ordering::Relaxed) {
+                        Some(first)
+                    } else {
+                        leash = first.iterations;
+                        let solved = third.solve_interior(cap);
+                        if solved.status == LpStatus::Optimal {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        inner = Some(solved);
+                        (!stop.load(Ordering::Relaxed)).then(|| {
+                            let solved = lp.solve_with_limit(cap);
+                            if solved.status == LpStatus::Optimal {
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                            solved
+                        })
+                    }
+                }
+                None => (!stop.load(Ordering::Relaxed)).then(|| {
+                    let solved = lp.solve_with_limit(cap);
                     if solved.status == LpStatus::Optimal {
                         stop.store(true, Ordering::Relaxed);
                     }
                     solved
-                })
-            });
-            let solved = lp.solve_with_limit(cap);
-            if solved.status == LpStatus::Optimal {
-                stop.store(true, Ordering::Relaxed);
+                }),
+            };
+            if let Some(handle) = spawned {
+                inner = Some(handle.join().expect("the interior root solve panicked"));
             }
-            (
-                solved,
-                dual.join().expect("the dual root solve panicked"),
-                inner.map(|h| h.join().expect("the interior root solve panicked")),
-            )
+            (primal, dual.join().expect("the dual root solve panicked"), inner, leash)
         });
+        iterations += leash;
+        let optimal = |s: &Option<crate::lp::LpSolution>| {
+            s.as_ref().is_some_and(|s| s.status == LpStatus::Optimal)
+        };
+        let primal_iterations = primal.as_ref().map_or(0, |s| s.iterations);
         let inner_iterations = inner.as_ref().map_or(0, |s| s.iterations);
-        if primal.status == LpStatus::Optimal {
+        if optimal(&primal) {
             iterations += dual.iterations + inner_iterations;
-            primal
+            primal.expect("checked above")
         } else if dual.status == LpStatus::Optimal {
-            iterations += primal.iterations + inner_iterations;
+            iterations += primal_iterations + inner_iterations;
             lp = other;
             raced_dual = true;
             dual
-        } else if let Some(inner) = inner.filter(|s| s.status == LpStatus::Optimal) {
-            iterations += primal.iterations + dual.iterations;
+        } else if optimal(&inner) {
+            iterations += primal_iterations + dual.iterations;
             lp = third.expect("an interior solve ran");
-            inner
-        } else {
+            inner.expect("checked above")
+        } else if let Some(primal) = primal {
             iterations += dual.iterations + inner_iterations;
             primal
+        } else {
+            // Nothing finished and the primal never started, which only a stop from
+            // outside the race does; the dual's basis is the one to carry on from.
+            iterations += inner_iterations;
+            lp = other;
+            raced_dual = true;
+            dual
         }
     } else if options.root_dual {
         if let Some(end) = first_deadline {
@@ -2982,7 +3049,24 @@ fn solve_once(
         lp.solve_with_limit(cap)
     };
     let mut dual_first = if race { raced_dual } else { options.root_dual && root.status == LpStatus::Optimal };
-    if !race && options.root_dual && !dual_first && !lp.out_of_time() {
+    // On one thread, the interior-point method between the two, on half of what is left
+    // of the first share. Over the 240 roots this finishes about 195 inside the share
+    // where the dual and then the primal finish 179.
+    if !race && interior && !dual_first && !lp.out_of_time() {
+        let mut third = lp.clone();
+        if let Some(end) = first_deadline {
+            let now = Instant::now();
+            third.set_deadline(Some(now + end.saturating_duration_since(now) / 2));
+        }
+        let inner = third.solve_interior(cap);
+        iterations += root.iterations;
+        root = inner;
+        if root.status == LpStatus::Optimal {
+            third.set_deadline(first_deadline);
+            lp = third;
+        }
+    }
+    if !race && options.root_dual && !dual_first && root.status != LpStatus::Optimal && !lp.out_of_time() {
         iterations += root.iterations;
         root = lp.solve_with_limit(cap);
         dual_first = false;
@@ -3084,6 +3168,15 @@ fn solve_once(
         }
     }
     nodes += 1;
+    if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+        eprintln!(
+            "root: {:?} at {:.1}s, {} iterations, objective {}",
+            root.status,
+            started.elapsed().as_secs_f64(),
+            iterations,
+            root.objective
+        );
+    }
 
     // The search beside the tree may already hold a point, or the answer. The status is
     // settled by the caller from the mailbox; all that matters here is stopping.

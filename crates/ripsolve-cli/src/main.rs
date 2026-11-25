@@ -85,7 +85,7 @@ enum Command {
         /// Skip the conflict-driven search that runs before the relaxation.
         #[arg(long)]
         no_cdcl: bool,
-        /// Leave the interior-point method out of the root relaxation's race.
+        /// Leave the interior-point method out of the root relaxation.
         #[arg(long)]
         no_root_interior: bool,
         /// Rounds of root cut separation. Zero disables cuts.

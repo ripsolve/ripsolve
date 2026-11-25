@@ -24,7 +24,12 @@ fn main() {
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let mut problem = Problem::from_file(std::path::Path::new(&path)).unwrap();
         let started = Instant::now();
-        if std::env::var_os("ROOTLP_NOPRESOLVE").is_none() {
+        if std::env::var_os("ROOTLP_REDUCE").is_some() {
+            // The model the search itself starts from, presolve and reductions both.
+            if let Ok(Some((smaller, _, _))) = ripsolve::reduce::reduce_with_presolve(&problem, 1e-9) {
+                problem = smaller;
+            }
+        } else if std::env::var_os("ROOTLP_NOPRESOLVE").is_none() {
             ripsolve::presolve::presolve(&mut problem, 20);
         }
         let presolved = started.elapsed().as_secs_f64();

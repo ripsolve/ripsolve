@@ -94,6 +94,17 @@
   without it does not: `bab6`, `map16715-04`, `neos-3988577-wolgan`, `neos-873061`,
   `nursesched-medium-hint03`, `sing44`, `thor50dday` and `uccase12`. It costs none
   of them a root it reached before. `--no-root-interior` turns it off.
+- **The interior-point method also runs on one and two threads.** On two, it shares
+  the primal method's thread: the primal for an eighth of the first share, then the
+  interior-point method, then the primal again, against the dual on the other thread.
+  On one, it runs between the dual and the primal on half of what is left of the
+  share. Over the 240 benchmark roots, one thread each, the first share then finishes
+  about 199 on two threads where it finished 188, and 195 on one where it finished
+  179. On 68 instances at 80 seconds, the root is reached on 11 more on one thread and
+  12 more on two, `thor50dday`, `neos-3988577-wolgan` and `uccase12` among them, with
+  none lost and no wrong answers. The primal's short first turn keeps easy roots as
+  they were: without it, `p200x1188c`'s root went to the crossover's vertex and the
+  run from 9 seconds to 40.
 - **The root relaxation is solved by the dual method first.** Its costs are perturbed
   from the first pivot, whatever they are, and a model whose costs point at bounds its
   columns lack is boxed for it and finished warm without the box. Over MIPLIB's 240
