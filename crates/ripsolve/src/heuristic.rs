@@ -1725,7 +1725,7 @@ pub fn feasibility_jump(
     deadline: Option<std::time::Instant>,
 ) -> Option<Incumbent> {
     let mut budget = usize::MAX;
-    feasibility_jump_within(problem, start, limits, max_moves, &mut budget, deadline)
+    feasibility_jump_within(problem, start, limits, max_moves, &mut budget, deadline, None)
 }
 
 /// [`feasibility_jump`] on a budget of work, counted in columns scored and taken from
@@ -1741,6 +1741,9 @@ pub fn feasibility_jump_within(
     max_moves: usize,
     budget: &mut usize,
     deadline: Option<std::time::Instant>,
+    // Read with the clock, for a caller on another thread whose answer is no longer
+    // wanted.
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Incumbent> {
     // Checked on a stride of work rather than of moves: the clock is far more expensive
     // than a move, but a move costs a rescoring of every column in the rows it touches,
@@ -1868,7 +1871,9 @@ pub fn feasibility_jump_within(
         // reaches the relaxation at all.
         if work >= next_reading {
             next_reading = work + CLOCK_STRIDE;
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 break;
             }
         }

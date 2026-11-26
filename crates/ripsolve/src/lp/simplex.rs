@@ -167,6 +167,16 @@ pub struct Tolerances {
     /// Let the dual ratio test pass boxed columns' breakpoints, flipping them to
     /// their other bound, rather than stop at the first.
     pub long_step: bool,
+    /// Let a stalled warm dual solve perturb its costs however few columns carry one;
+    /// see [`PERTURB_MIN_COSTED`].
+    ///
+    /// For re-solves after cuts. A node repairs one branched bound, and there the
+    /// primal method is the better way out of a stall on a model with few costs. Cuts
+    /// leave the basis primal infeasible across many rows at once, and the primal
+    /// method does not find its way back: on `neos-950242`, objective on one column in
+    /// a few thousand, the first round's re-solve handed over after 100 pivots and the
+    /// primal method spent the rest of a minute on it. Perturbed, it takes 133 pivots.
+    pub perturb_uncosted: bool,
 }
 
 impl Default for Tolerances {
@@ -180,6 +190,7 @@ impl Default for Tolerances {
             entering_density_stats: false,
             warm_steepest_edge: true,
             long_step: true,
+            perturb_uncosted: false,
         }
     }
 }
@@ -602,7 +613,7 @@ impl Lp {
             .iter()
             .filter(|&&c| c != 0.0)
             .count();
-        costed as f64 >= PERTURB_MIN_COSTED * self.n_structural as f64
+        self.tol.perturb_uncosted || costed as f64 >= PERTURB_MIN_COSTED * self.n_structural as f64
     }
 
     pub fn n_rows(&self) -> usize {

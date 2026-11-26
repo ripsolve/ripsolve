@@ -1484,6 +1484,17 @@ struct Shared {
 /// round and bind again once the next round's cuts move the vertex.
 const CUT_MAX_AGE: u32 = 2;
 
+/// Rounds of cutting over which the bound must rise by [`CUT_STALL_GAIN`], relative to
+/// its size, or the fractional columns fall below their fewest before, for the loop to
+/// go on.
+const CUT_STALL_ROUNDS: usize = 5;
+const CUT_STALL_GAIN: f64 = 1e-6;
+
+/// Pivots a cut round's re-solve may take: this many, or [`CUT_RESOLVE_FACTOR`] times
+/// the root relaxation's, whichever is more.
+const CUT_RESOLVE_PIVOTS: usize = 10_000;
+const CUT_RESOLVE_FACTOR: usize = 2;
+
 /// Row activity within this of a cut's bound counts as binding. This is a tolerance
 /// on constraint activity, which is why it is not `integrality_tolerance`.
 const CUT_SLACK_TOLERANCE: f64 = 1e-7;
@@ -1887,6 +1898,18 @@ fn separate_at_root(
     // Which of them the last round's ageing condemned, to leave at the next rebuild.
     let mut doomed: Vec<bool> = Vec::new();
     let granularity = objective_granularity(&base);
+    // The bound and the count of fractional integer columns after each round, the
+    // root's first.
+    let mut progress = vec![(
+        root.objective,
+        problem
+            .integer_columns()
+            .filter(|&j| (root.x[j] - root.x[j].round()).abs() > options.integrality_tolerance)
+            .count(),
+    )];
+    let root_pivots = root.iterations;
+    let loop_started = Instant::now();
+    let stall_from = stop_cutting.map(|end| loop_started + end.saturating_duration_since(loop_started) / 3);
 
     for _ in 0..options.cut_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d)
@@ -1915,11 +1938,13 @@ fn separate_at_root(
             (Some(separation), Some(x)) => separation.violated(x, Point::Candidate),
             (Some(separation), None) => separation.violated(&root.x, Point::Root),
         };
+        let round_started = Instant::now();
         let found = if integral.is_some() {
             Vec::new()
         } else {
             root_families(problem, &lp, &root, &conflicts, options, deadline)
         };
+        let separated = round_started.elapsed().as_secs_f64();
         if found.is_empty() && caller.is_empty() {
             break;
         }
@@ -1958,20 +1983,42 @@ fn separate_at_root(
         next_rows.extend(found.into_iter().map(|c| (c, Some(0))));
         next_rows.extend(caller.into_iter().map(|c| (c, None)));
 
-        let mut candidate = Lp::relaxation(&with_cuts).with_tolerances(lp.tolerances());
-        candidate.set_deadline(deadline);
+        let mut candidate = Lp::relaxation(&with_cuts)
+            .with_tolerances(crate::lp::Tolerances { perturb_uncosted: true, ..lp.tolerances() });
+        // Held to the loop's share as well as the run's. A round whose re-solve does not
+        // finish in it is dropped, below, and the search gets the rest of the run.
+        candidate.set_deadline(match (deadline, stop_cutting) {
+            (Some(hard), Some(soft)) => Some(hard.min(soft)),
+            (hard, soft) => hard.or(soft),
+        });
         // The flag that stops this solve when the search beside the tree proves its
         // point. A fresh LP does not inherit it, and without it the cut loop ran on for
         // 27 seconds after `bnatt400` had been settled; it went unnoticed while the
         // root relaxation was slow enough to still be running when the proof came.
         candidate.set_interrupt(lp.interrupt());
+        // A round re-solves in a few thousand pivots or not at all: on `kumeu` and
+        // `peg-solitaire-a3` one re-solve ran 34000 and 47000 pivots to the end of the
+        // loop's share, where the rounds before it took under 5000.
+        let resolve_cap = options
+            .max_iterations_per_node
+            .min(CUT_RESOLVE_PIVOTS.max(CUT_RESOLVE_FACTOR * root_pivots));
         let resolved = match &warm {
-            Some(state) => {
-                candidate.solve_warm(state, None, options.max_iterations_per_node)
-            }
-            None => candidate.solve_with_limit(options.max_iterations_per_node),
+            Some(state) => candidate.solve_warm(state, None, resolve_cap),
+            None => candidate.solve_with_limit(resolve_cap),
         };
+        // The share above was for this solve; the LP may go on to be the search's.
+        candidate.set_deadline(deadline);
         iterations += resolved.iterations;
+        if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+            eprintln!(
+                "  cut round: separated {} in {separated:.2}s, resolved {:?} in {:.2}s ({} iterations), bound {}",
+                with_cuts.n_rows() - old_rows,
+                resolved.status,
+                round_started.elapsed().as_secs_f64() - separated,
+                resolved.iterations,
+                resolved.objective
+            );
+        }
         if resolved.status != LpStatus::Optimal {
             // Keep the model that is known to solve rather than pressing on with one
             // that does not; the bound already gained is still sound.
@@ -2011,6 +2058,34 @@ fn separate_at_root(
         problem = model.as_ref().expect("just set");
         lp = candidate;
         root = resolved;
+
+        // Rounds that move neither the bound nor the point towards integrality are rounds
+        // the search could have had: `neos-5107597-kakapo` cut 38 rounds at 119484 and
+        // `CMS750_4` 38 at -750, each to the end of the loop's share. The point counts as
+        // well as the bound: `cbs-cta` holds its bound at 0 throughout and closes in two
+        // nodes from the point its 1915 cuts leave, and in 3432 from where 320 leave it.
+        // Nor do its counts of fractional columns fall in the first rounds, and they are
+        // cheap rounds, so the rule waits until the loop has spent a third of its share.
+        let fractional = problem
+            .integer_columns()
+            .filter(|&j| (root.x[j] - root.x[j].round()).abs() > options.integrality_tolerance)
+            .count();
+        progress.push((root.objective, fractional));
+
+        if progress.len() > CUT_STALL_ROUNDS {
+            let (before, was) = progress[progress.len() - 1 - CUT_STALL_ROUNDS];
+            let fewest = progress[..progress.len() - CUT_STALL_ROUNDS]
+                .iter()
+                .map(|&(_, f)| f)
+                .min()
+                .unwrap_or(was);
+            if stall_from.is_none_or(|from| Instant::now() >= from)
+                && root.objective - before <= CUT_STALL_GAIN * before.abs().max(1.0)
+                && progress[progress.len() - CUT_STALL_ROUNDS..].iter().all(|&(_, f)| f >= fewest)
+            {
+                break;
+            }
+        }
     }
 
     // One last purge before the tree opens. Every remaining slack cut would otherwise
@@ -2363,24 +2438,44 @@ fn solve_all_restarts(
         deadline: earliest(options.deadline, options.time_limit.map(|limit| started + limit)),
         ..options
     };
-    let beside = options.cdcl && (0..problem.n_cols()).any(|j| problem.is_binary(j));
+    let cdcl = options.cdcl && (0..problem.n_cols()).any(|j| problem.is_binary(j));
+    // Feasibility jump from the start, on a thread of its own, where there are threads
+    // to spare: until the root is solved and cut the tree's are idle. In the chain after
+    // the relaxation it comes last and is reached only once the relaxation, the cut
+    // loop, diving and the pump have had their turn, which on the models it rescues is
+    // most of the run: `neos-950242` waited 33 seconds for a point jump found in one.
+    // Not with rows still to be separated, which its points have not seen.
+    let jumping = separation.is_none()
+        && options.threads > 2
+        && options.heuristic_frequency > 0
+        && !objective_is_constant(problem);
+    let beside = cdcl || jumping;
     let mailbox = Mailbox::default();
     let mut solution = std::thread::scope(|scope| {
-        if beside {
-            let mailbox = &mailbox;
+        let mailbox = &mailbox;
+        if cdcl {
             scope.spawn(move || search_beside(problem, options, started, mailbox));
+        }
+        if jumping {
+            scope.spawn(move || jump_beside(problem, options, mailbox));
         }
         let solution = restart_loop(
             problem,
             options,
             start,
             started,
-            beside.then_some(&mailbox),
+            beside.then_some(mailbox),
             separation,
         );
         mailbox.cancel.store(true, Ordering::Relaxed);
         solution
     });
+    // A point jump beside the tree held for a root that never asked for it.
+    if let Some((value, x)) = mailbox.release_jump()
+        && admitted(separation, &x)
+    {
+        mailbox.post(value, &x);
+    }
     if !beside {
         return solution;
     }
@@ -2427,6 +2522,18 @@ struct Mailbox {
     proved: Arc<AtomicBool>,
     /// Set by the solve when it has finished, so the search stops too.
     cancel: AtomicBool,
+    /// Jump beside the tree's point, held for the root; see `release_jump`.
+    jump: Mutex<JumpSlot>,
+}
+
+/// What jump beside the tree has found, and whether the root has asked for it yet.
+#[derive(Default)]
+struct JumpSlot {
+    point: Option<(f64, Vec<f64>)>,
+    /// It has finished, found or not.
+    done: bool,
+    /// The root has had its chain; from here on a point goes straight to the mailbox.
+    released: bool,
 }
 
 impl Mailbox {
@@ -2450,10 +2557,49 @@ impl Mailbox {
         self.proved.load(Ordering::Relaxed)
     }
 
+    /// Jump beside the tree's result: held for the root until it asks, posted once it has.
+    fn offer_jump(&self, found: Option<(f64, Vec<f64>)>) {
+        let mut slot = self.jump.lock().expect("mailbox lock");
+        slot.done = true;
+        match found {
+            Some((value, x)) if slot.released => {
+                drop(slot);
+                self.post(value, &x);
+            }
+            found => slot.point = found,
+        }
+    }
+
+    fn jump_done(&self) -> bool {
+        self.jump.lock().expect("mailbox lock").done
+    }
+
+    /// The point jump beside the tree has held for the root, if any; anything it finds
+    /// from now on goes to the mailbox instead.
+    fn release_jump(&self) -> Option<(f64, Vec<f64>)> {
+        let mut slot = self.jump.lock().expect("mailbox lock");
+        slot.released = true;
+        slot.point.take()
+    }
+
     /// The value of the best point, without taking it.
     fn value(&self) -> Option<f64> {
         self.best.lock().expect("mailbox lock").as_ref().map(|(value, _)| *value)
     }
+}
+
+/// Feasibility jump on its own thread, from the start of a solve; see
+/// `solve_all_restarts`.
+fn jump_beside(problem: &Problem, options: Options, mailbox: &Mailbox) {
+    let began = Instant::now();
+    let found = jump_search(problem, &options, None, JUMP_BUDGET, options.deadline, Some(mailbox));
+    if std::env::var_os("RIPSOLVE_TRACE").is_some() {
+        eprintln!("jump beside: {} after {:.1}s", found.is_some(), began.elapsed().as_secs_f64());
+    }
+    let found = found
+        .filter(|found| heuristic::is_feasible(problem, &found.x, options.heuristic_limits.feasibility_tolerance))
+        .map(|found| (found.objective, found.x));
+    mailbox.offer_jump(found);
 }
 
 /// The conflict-driven search, run on its own thread for the length of a solve.
@@ -2509,6 +2655,122 @@ fn search_beside(problem: &Problem, options: Options, started: Instant, mailbox:
     if found.proved && consistent {
         mailbox.proved.store(true, Ordering::Relaxed);
     }
+}
+
+/// Feasibility jump from `from`, or from the bounds, restarted from random corners; see
+/// where `solve_once` asks for it.
+fn jump_search(
+    problem: &Problem,
+    options: &Options,
+    from: Option<&[f64]>,
+    allowance: JumpBudget,
+    deadline: Option<Instant>,
+    mailbox: Option<&Mailbox>,
+) -> Option<heuristic::Incumbent> {
+    if options.heuristic_frequency == 0 {
+        return None;
+    }
+    let start: Vec<f64> = (0..problem.n_cols())
+        .map(|j| match from {
+            Some(x) => x[j].clamp(problem.col_lb[j], problem.col_ub[j]),
+            // No relaxation to round, so start from whichever bound is nearer zero
+            // and let the weights do the rest.
+            None if problem.col_lb[j] > 0.0 => problem.col_lb[j],
+            None => 0.0f64.clamp(problem.col_lb[j], problem.col_ub[j]),
+        })
+        .collect();
+    // In work, so that two runs of the same model make the same moves and find the
+    // same point; see `JumpBudget`. Across every attempt rather than per attempt,
+    // since the restarts are what a model that will not yield spends it on.
+    let mut budget = allowance.of(problem);
+    // The backstop, from now rather than from the start of the run. This is asked
+    // for late, after the relaxation and the cutting and the whole chain above it
+    // have had their turn, and a budget measured from the beginning of a minute has
+    // already been spent by the time it is reached: every instance this heuristic
+    // wins came back empty when the deadline was anchored that way, having been
+    // given no time at all rather than too little.
+    let jump_deadline = options
+        .time_limit
+        .map(|limit| Instant::now() + limit.mul_f64(allowance.backstop))
+        .or(deadline);
+    // Never past the run's own end.
+    let jump_deadline = match (jump_deadline, deadline) {
+        (Some(own), Some(hard)) => Some(own.min(hard)),
+        (own, hard) => own.or(hard),
+    };
+    // Restarted from randomised corners when the first attempt fails, which is what
+    // the search stopping is for: a run that has settled has settled, and the
+    // weights that got it there are the reason it will not move again. Where it
+    // begins decides which local minimum it has to climb out of, and it is cheaper
+    // to begin somewhere else than to keep climbing.
+    //
+    // `neos-3226448-wkra` is the case: nothing from the model's own bounds however
+    // long it is given, and a feasible point on the seventeenth random start. The
+    // budget is the same either way, so a model this does not help pays only the
+    // scheduling.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for attempt in 0..JUMP_RESTARTS {
+        // The search beside the tree may settle the model while this is still
+        // restarting. On `easter_monster` it proves the sudoku in ten milliseconds,
+        // and the restarts went on for two and a half seconds without noticing.
+        if mailbox.is_some_and(|m| m.is_proved() || m.cancel.load(Ordering::Relaxed)) {
+            break;
+        }
+        let from: Vec<f64> = if attempt == 0 {
+            start.clone()
+        } else {
+            (0..problem.n_cols())
+                .map(|j| {
+                    let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
+                    let pick = if next() & 1 == 0 { lo } else { hi };
+                    if pick.is_finite() { pick } else { start[j] }
+                })
+                .collect()
+        };
+        // Attempts follow the Luby sequence, in units of four flips a column and
+        // capped at the full budget: mostly short, with a long one now and then.
+        // An attempt that succeeds does so within a millisecond or two, and one
+        // that fails runs until a cutoff stops it, so short attempts buy more
+        // starts for the same time. On sudokus, across five seeds each, the median
+        // fell from 10.6s to 2.5s on the hardest and from 1.6s to 0.29s on
+        // `escargot`. The long ones are for `neos-3226448-wkra`, which needs full
+        // length attempts: the plain Luby sequence, which never exceeds 64 flips a
+        // column in 200 starts, took it from 9.3s to 33s; in units of four it takes
+        // 7.2s.
+        let moves = options
+            .jump_moves
+            .min(JUMP_UNIT << luby_exponent(attempt).min(usize::BITS as usize - 8));
+        let found = heuristic::feasibility_jump_within(
+            problem,
+            &from,
+            &options.heuristic_limits,
+            // Per attempt, and per *column*: an absolute count of flips is a
+            // budget of two and a half flips a column on a model of ten thousand
+            // and two hundred and fifty on a model of a hundred, which is the same
+            // mistake this file complains about elsewhere. What actually bounds a
+            // run that is going nowhere is the stall cutoff inside the search, and
+            // what bounds the whole of it is the work budget; this is the third guard
+            // and it should not be the binding one. `neos-3226448-wkra` closes at
+            // two hundred flips a column and does not at two and a half.
+            moves.saturating_mul(problem.n_cols().max(1)),
+            &mut budget,
+            jump_deadline,
+            mailbox.map(|m| &m.cancel),
+        );
+        if found.is_some() {
+            return found;
+        }
+        if budget == 0 || jump_deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+    }
+    None
 }
 
 /// The restart loop, on whatever model it was handed.
@@ -2740,110 +3002,8 @@ fn solve_once(
     // from 0.27 seconds to 11.5 and `mod010` from 0.78 to 12.9, on instances whose own
     // heuristics find a point in under a second. Asked only after those have failed, it
     // costs nothing on either.
-    let jump = |from: Option<&[f64]>, allowance: JumpBudget| -> Option<heuristic::Incumbent> {
-        if options.heuristic_frequency == 0 {
-            return None;
-        }
-        let start: Vec<f64> = (0..problem.n_cols())
-            .map(|j| match from {
-                Some(x) => x[j].clamp(problem.col_lb[j], problem.col_ub[j]),
-                // No relaxation to round, so start from whichever bound is nearer zero
-                // and let the weights do the rest.
-                None if problem.col_lb[j] > 0.0 => problem.col_lb[j],
-                None => 0.0f64.clamp(problem.col_lb[j], problem.col_ub[j]),
-            })
-            .collect();
-        // In work, so that two runs of the same model make the same moves and find the
-        // same point; see `JumpBudget`. Across every attempt rather than per attempt,
-        // since the restarts are what a model that will not yield spends it on.
-        let mut budget = allowance.of(problem);
-        // The backstop, from now rather than from the start of the run. This is asked
-        // for late, after the relaxation and the cutting and the whole chain above it
-        // have had their turn, and a budget measured from the beginning of a minute has
-        // already been spent by the time it is reached: every instance this heuristic
-        // wins came back empty when the deadline was anchored that way, having been
-        // given no time at all rather than too little.
-        let jump_deadline = options
-            .time_limit
-            .map(|limit| Instant::now() + limit.mul_f64(allowance.backstop))
-            .or(deadline);
-        // Never past the run's own end.
-        let jump_deadline = match (jump_deadline, deadline) {
-            (Some(own), Some(hard)) => Some(own.min(hard)),
-            (own, hard) => own.or(hard),
-        };
-        // Restarted from randomised corners when the first attempt fails, which is what
-        // the search stopping is for: a run that has settled has settled, and the
-        // weights that got it there are the reason it will not move again. Where it
-        // begins decides which local minimum it has to climb out of, and it is cheaper
-        // to begin somewhere else than to keep climbing.
-        //
-        // `neos-3226448-wkra` is the case: nothing from the model's own bounds however
-        // long it is given, and a feasible point on the seventeenth random start. The
-        // budget is the same either way, so a model this does not help pays only the
-        // scheduling.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for attempt in 0..JUMP_RESTARTS {
-            // The search beside the tree may settle the model while this is still
-            // restarting. On `easter_monster` it proves the sudoku in ten milliseconds,
-            // and the restarts went on for two and a half seconds without noticing.
-            if mailbox.is_some_and(Mailbox::is_proved) {
-                break;
-            }
-            let from: Vec<f64> = if attempt == 0 {
-                start.clone()
-            } else {
-                (0..problem.n_cols())
-                    .map(|j| {
-                        let (lo, hi) = (problem.col_lb[j], problem.col_ub[j]);
-                        let pick = if next() & 1 == 0 { lo } else { hi };
-                        if pick.is_finite() { pick } else { start[j] }
-                    })
-                    .collect()
-            };
-            // Attempts follow the Luby sequence, in units of four flips a column and
-            // capped at the full budget: mostly short, with a long one now and then.
-            // An attempt that succeeds does so within a millisecond or two, and one
-            // that fails runs until a cutoff stops it, so short attempts buy more
-            // starts for the same time. On sudokus, across five seeds each, the median
-            // fell from 10.6s to 2.5s on the hardest and from 1.6s to 0.29s on
-            // `escargot`. The long ones are for `neos-3226448-wkra`, which needs full
-            // length attempts: the plain Luby sequence, which never exceeds 64 flips a
-            // column in 200 starts, took it from 9.3s to 33s; in units of four it takes
-            // 7.2s.
-            let moves = options
-                .jump_moves
-                .min(JUMP_UNIT << luby_exponent(attempt).min(usize::BITS as usize - 8));
-            let found = heuristic::feasibility_jump_within(
-                problem,
-                &from,
-                &options.heuristic_limits,
-                // Per attempt, and per *column*: an absolute count of flips is a
-                // budget of two and a half flips a column on a model of ten thousand
-                // and two hundred and fifty on a model of a hundred, which is the same
-                // mistake this file complains about elsewhere. What actually bounds a
-                // run that is going nowhere is the stall cutoff inside the search, and
-                // what bounds the whole of it is the work budget; this is the third guard
-                // and it should not be the binding one. `neos-3226448-wkra` closes at
-                // two hundred flips a column and does not at two and a half.
-                moves.saturating_mul(problem.n_cols().max(1)),
-                &mut budget,
-                jump_deadline,
-            );
-            if found.is_some() {
-                return found;
-            }
-            if budget == 0 || jump_deadline.is_some_and(|d| Instant::now() >= d) {
-                break;
-            }
-        }
-        None
+    let jump = |from: Option<&[f64]>, allowance: JumpBudget| {
+        jump_search(problem, &options, from, allowance, deadline, mailbox)
     };
 
     // A model with nothing to optimise is asking for a feasible point, and the whole
@@ -3209,10 +3369,22 @@ fn solve_once(
         // those one found now. It is not proven optimal and never claims to be, but
         // reporting nothing when something feasible is in hand throws away the only
         // result there was.
+        // Jump beside the tree's point where it has one, rather than the same search
+        // again.
         let rescued = if status == Status::Infeasible {
             None
         } else {
-            jump(None, JUMP_BUDGET).filter(|found| admitted(separation, &found.x))
+            mailbox
+                .and_then(Mailbox::release_jump)
+                .map(|(objective, x)| heuristic::Incumbent { objective, x })
+                .or_else(|| {
+                    if mailbox.is_some_and(Mailbox::jump_done) {
+                        None
+                    } else {
+                        jump(None, JUMP_BUDGET)
+                    }
+                })
+                .filter(|found| admitted(separation, &found.x))
         };
         let held = incumbent_x.take().map(|x| (incumbent, x, false));
         let found = rescued.map(|found| (found.objective, found.x, true));
@@ -3256,13 +3428,27 @@ fn solve_once(
     let cut = separate_at_root(problem, lp, root, &options, deadline, stop_cutting, separation, &best);
     iterations += cut.iterations;
     let cuts_added = cut.added;
+    let tracing = std::env::var_os("RIPSOLVE_TRACE").is_some();
+    if tracing {
+        eprintln!(
+            "cuts: done at {:.1}s, {} added, bound {} -> {}",
+            started.elapsed().as_secs_f64(),
+            cuts_added,
+            first_bound,
+            cut.root.objective
+        );
+    }
     let mut lp = cut.lp;
     // The long-step dual ratio test only once the tree opens. At the root it lands on a
     // vertex the cut loop and the dives do worse from: `neos-1122047` closes in 1.6
     // seconds without it and stays open at 80 with it, `drayage-100-23` takes 30
     // seconds against 2. In the tree, repairing a branched bound, it pays:
     // `neos-1582420` closes in 38 seconds with it and not at all without.
-    let tree_tol = crate::lp::Tolerances { long_step: true, ..lp.tolerances() };
+    let tree_tol = crate::lp::Tolerances {
+        long_step: true,
+        perturb_uncosted: false,
+        ..lp.tolerances()
+    };
     lp = lp.with_tolerances(tree_tol);
     let root = cut.root;
     // Held here so the borrow below outlives the branch that produced it.
@@ -3286,13 +3472,28 @@ fn solve_once(
 
     // An incumbent before the first branch is worth more than one found later: the
     // search cannot prune anything until it holds one.
+    // Whether jump beside the tree has finished, found or not. Its point is held back
+    // until the chain below has had its turn, see `Mailbox::release_jump`, and the
+    // chain's own jump and corners, which start from the bounds as it does, have nothing
+    // to add once it has run.
+    let jumped = mailbox.is_some_and(Mailbox::jump_done);
     if options.heuristic_frequency > 0 && root.status == LpStatus::Optimal {
         // Rounding costs no LP at all, diving a short chain of them, the pump the
         // most. Fixing with propagation costs no LP either and still comes last: it is
         // ordered by what its points are worth rather than by what they cost.
-        let found = heuristic::round(problem, &root.x, &options.heuristic_limits)
+        let timed = |name: &str, found: Option<heuristic::Incumbent>| {
+            if tracing {
+                eprintln!(
+                    "  {name}: {} at {:.1}s",
+                    found.as_ref().map_or("nothing".to_string(), |f| format!("found {}", f.objective)),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            found
+        };
+        let found = timed("round", heuristic::round(problem, &root.x, &options.heuristic_limits))
             .or_else(|| {
-                heuristic::dive(
+                let found = heuristic::dive(
                     problem,
                     &mut lp,
                     &root.basis,
@@ -3300,17 +3501,19 @@ fn solve_once(
                     None,
                     &options.heuristic_limits,
                     &mut iterations,
-                )
+                );
+                timed("dive", found)
             })
             .or_else(|| {
-                heuristic::feasibility_pump(
+                let found = heuristic::feasibility_pump(
                     problem,
                     &mut lp,
                     &root.basis,
                     &root.x,
                     &options.heuristic_limits,
                     &mut iterations,
-                )
+                );
+                timed("pump", found)
             })
             .or_else(|| {
                 // Last rather than first despite being the cheapest of them. It finds
@@ -3321,12 +3524,13 @@ fn solve_once(
                 // here worth having, and where it does not this is the whole of what
                 // there is.
                 let conflicts = cuts::Conflicts::of(problem);
-                heuristic::fix_and_propagate(
+                let found = heuristic::fix_and_propagate(
                     problem,
                     &conflicts,
                     &root.x,
                     &options.heuristic_limits,
-                )
+                );
+                timed("fix-and-propagate", found)
             })
             // The point found before the relaxation, for the same reason and with the
             // same evidence: installed ahead of the chain rather than behind it, it
@@ -3356,7 +3560,10 @@ fn solve_once(
                 // start and is not, losing `acc-tight2`, `disctom` and `neos-913984`
                 // outright. The weights are what find the point, and where they start
                 // from decides which local minimum they have to climb out of first.
-                jump(None, JUMP_BUDGET)
+                if jumped {
+                    return None;
+                }
+                timed("jump", jump(None, JUMP_BUDGET))
             })
             // Last of all, and cheapest of all. A corner of the box is usually a poor
             // point and is not offered ahead of anything: put in front of diving, a
@@ -3365,7 +3572,20 @@ fn solve_once(
             // when everything above has failed, it is the difference between reporting
             // a feasible solution and reporting none, and no quality bar is applied
             // because at that point there is nothing to compare it against.
-            .or_else(|| heuristic::corners(problem, &options.heuristic_limits));
+            .or_else(|| {
+                if jumped {
+                    return None;
+                }
+                timed("corners", heuristic::corners(problem, &options.heuristic_limits))
+            });
+        // Jump beside the tree's point, now that the chain has had its turn, and only
+        // where the chain found nothing: it is a point from the bounds, usually a poor
+        // one, and where the chain has a point the search does better from that alone.
+        // Installed ahead of the chain, it took `neos-860300` from 41 seconds to unsolved
+        // at 80, holding 3657 against an optimum of 3201; handed to the tree beside the
+        // chain's, from 41 seconds to anywhere between 42 and unsolved.
+        let released = mailbox.and_then(Mailbox::release_jump);
+        let found = found.or_else(|| released.map(|(objective, x)| heuristic::Incumbent { objective, x }));
         // Whatever produced the point, its continuous columns are still sitting where
         // the relaxation left them. Re-optimizing them is one LP and is often worth
         // far more than the choice of heuristic that found the integers.

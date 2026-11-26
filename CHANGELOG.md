@@ -78,6 +78,29 @@
 
 ### Performance
 
+- **The root cut loop keeps to its share of the run.** A round's re-solve used to run
+  until the run's deadline, and on 4 of 6 instances examined that took the whole run:
+  `neos-950242`'s first round added 10 cuts to a root solved in 1645 pivots and then
+  spent 47000 pivots and 59 seconds without finishing. The heuristics and the tree
+  were never reached. Its dual method stalled and handed over to the primal method,
+  without perturbing its costs, because the objective is on few columns; a cut
+  round's re-solve now perturbs them anyway, and takes 133 pivots. Each re-solve is
+  also held to the loop's share and to 10000 pivots or twice the root's, whichever
+  is more, and the loop stops once five rounds have moved neither the bound nor the
+  count of fractional columns, after its first third of the share.
+  `neos-5107597-kakapo` had cut 38 rounds at an unchanged bound.
+- **Feasibility jump also runs on its own thread from the start of the solve,** with
+  three or more threads. Until the root is solved and cut, the other threads have
+  nothing to do, and the heuristics after the root reach jump last: `neos-950242`
+  waited 33 seconds for a point jump finds in one. Its point is used only where the
+  root's other heuristics find none, since a poor early point sends the search
+  elsewhere: given to the tree beside theirs, it took `neos-860300` from 41 seconds
+  to anything between 42 seconds and unsolved at 80.
+  With both changes, 12 of the 62 benchmark instances whose root relaxation solved
+  without any feasible point in 80 seconds on 12 threads now have one, among them
+  `neos-950242`, `net12`, `rmatr200-p5` and `s250r10`; none of them closes yet. The
+  30 that closed still close, and 10% faster by geometric mean: `cbs-cta` in 21
+  seconds against 37, `neos-827175` 41 against 70, `neos-787933` 30 against 51.
 - **An interior-point method races the simplex methods at the root.** With three or
   more threads, a Mehrotra predictor-corrector method runs beside the primal and dual
   simplex methods on the root relaxation, and whichever finishes first is used. It
