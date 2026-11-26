@@ -843,6 +843,16 @@ pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
     // `aggregate_and_round`.
     let mut work = 0usize;
     let budget = AGGREGATION_WORK_FACTOR * problem.matrix.nnz() + AGGREGATION_WORK_FLOOR;
+    // Every row's activity at the point, once. Aggregation asks it of every row holding
+    // the column it is cancelling, and summed afresh each time that was the whole of
+    // the root on `app1-2`: 28 seconds in one round, its continuous columns each in
+    // hundreds of long rows.
+    let activity: Vec<f64> = (0..problem.n_rows())
+        .map(|i| {
+            let (cols, vals) = csr.column(i);
+            cols.iter().zip(vals).map(|(&k, &v)| v * x[k]).sum()
+        })
+        .collect();
 
     for i in 0..problem.n_rows() {
         let (cols, vals) = csr.column(i);
@@ -868,7 +878,7 @@ pub fn separate_mir(problem: &Problem, x: &[f64], limit: usize) -> Vec<Cut> {
             if found.len() == before
                 && work < budget
                 && let Some(cut) =
-                    aggregate_and_round(problem, &csr, i, terms, bound, x, &vubs, &mut work)
+                    aggregate_and_round(problem, &csr, &activity, i, terms, bound, x, &vubs, &mut work)
             {
                 found.push(cut);
             }
@@ -987,6 +997,7 @@ const AGGREGATION_WORK_FLOOR: usize = 100_000;
 fn aggregate_and_round(
     problem: &Problem,
     csr: &crate::sparse::SparseMatrix,
+    activity: &[f64],
     start: usize,
     terms: Vec<(usize, f64)>,
     bound: f64,
@@ -1027,13 +1038,12 @@ fn aggregate_and_round(
             if !side.is_finite() {
                 continue;
             }
-            let (cols, vals) = csr.column(r);
-            let activity: f64 = cols.iter().zip(vals).map(|(&k, &v)| v * x[k]).sum();
-            if (activity - side).abs() > AGGREGATION_TIGHT * (1.0 + side.abs()) {
+            if (activity[r] - side).abs() > AGGREGATION_TIGHT * (1.0 + side.abs()) {
                 continue;
             }
-            if chosen.is_none_or(|(_, _, _, len)| cols.len() < len) {
-                chosen = Some((r, lambda, side, cols.len()));
+            let len = csr.column(r).0.len();
+            if chosen.is_none_or(|(_, _, _, held)| len < held) {
+                chosen = Some((r, lambda, side, len));
             }
         }
         let (r, lambda, side, _) = chosen?;

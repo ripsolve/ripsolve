@@ -78,6 +78,20 @@
 
 ### Performance
 
+- **RENS at the root, where the root heuristics find nothing.** Every integer column
+  the root relaxation leaves integral is fixed there, every fractional one is held
+  between the integers either side, and what is left is searched as a sub-MIP. When
+  that sub-model has no point, the columns sharing a row with a free one are freed
+  too, at most twice, while half the integers stay fixed. On the 62 instances whose
+  root solves but which ended with no point, it finds the first point on
+  `milo-v12-6-r2-40-1` and `uccase9`. Most of its sub-models hold no point at all,
+  and it spent at most 18 seconds on any instance. The 30 instances that close still
+  close.
+- **MIR aggregation reads each row's activity once per round.** It recomputed the
+  activity of every row holding the column it was cancelling, at every step, and on
+  `app1-2` one separation round took 28 seconds. The first round now takes 0.02
+  seconds, and the cuts are the same. Its later rounds still take up to 14 seconds,
+  scanning the rows of columns that sit in thousands of them.
 - **The root cut loop keeps to its share of the run.** A round's re-solve used to run
   until the run's deadline, and on 4 of 6 instances examined that took the whole run:
   `neos-950242`'s first round added 10 cuts to a root solved in 1645 pivots and then

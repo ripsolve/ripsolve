@@ -3584,8 +3584,30 @@ fn solve_once(
         // Installed ahead of the chain, it took `neos-860300` from 41 seconds to unsolved
         // at 80, holding 3657 against an optimum of 3201; handed to the tree beside the
         // chain's, from 41 seconds to anywhere between 42 and unsolved.
-        let released = mailbox.and_then(Mailbox::release_jump);
-        let found = found.or_else(|| released.map(|(objective, x)| heuristic::Incumbent { objective, x }));
+        let released = mailbox
+            .and_then(Mailbox::release_jump)
+            .map(|(objective, x)| heuristic::Incumbent { objective, x });
+        let found = found.or_else(|| {
+            // Where the chain found nothing, the neighbourhood of the relaxation too,
+            // and the better of its point and jump's; see `rens`.
+            let searched = (options.improvement_frequency > 0)
+                .then(|| {
+                    let found = rens(
+                        problem,
+                        &root.x,
+                        &options,
+                        remaining_until(options.deadline),
+                        separation,
+                    )
+                    .map(|(objective, x)| heuristic::Incumbent { objective, x });
+                    timed("rens", found)
+                })
+                .flatten();
+            match (searched, released) {
+                (Some(a), Some(b)) => Some(if b.objective < a.objective { b } else { a }),
+                (a, b) => a.or(b),
+            }
+        });
         // Whatever produced the point, its continuous columns are still sitting where
         // the relaxation left them. Re-optimizing them is one LP and is often worth
         // far more than the choice of heuristic that found the integers.
@@ -4954,6 +4976,138 @@ fn improve(
     let objective = objective_at(problem, &x);
     (objective < incumbent_objective).then_some((objective, x))
 }
+
+/// Search the neighbourhood of the root relaxation: every integer column it leaves
+/// integral fixed there, every fractional one held between the integers either side.
+/// This is Berthold's RENS.
+///
+/// The improvement search above needs a point to start from and this one does not,
+/// which is the whole reason for it: it is for the models the root chain found nothing
+/// on. Its sub-model is a restriction of the caller's, so whatever comes back is a
+/// point of the original, and it is checked rather than trusted all the same.
+fn rens(
+    problem: &Problem,
+    relaxation: &[f64],
+    options: &Options,
+    remaining: Option<Duration>,
+    separation: Option<&Separation>,
+) -> Option<(f64, Vec<f64>)> {
+    if remaining.is_some_and(|left| left.is_zero()) || relaxation.len() != problem.n_cols() {
+        return None;
+    }
+    let tolerance = options.integrality_tolerance;
+    let integers = problem.integer_columns().count();
+    if integers == 0 {
+        return None;
+    }
+    // Free: the integer columns the relaxation leaves fractional, to begin with.
+    let mut free: Vec<bool> = (0..problem.n_cols())
+        .map(|j| problem.is_integer(j) && (relaxation[j] - relaxation[j].round()).abs() > tolerance)
+        .collect();
+    let rows = problem.matrix.to_csr();
+    let deadline = remaining.map(|left| Instant::now() + left);
+    for _ in 0..=RENS_WIDENINGS {
+        let fixed = problem.integer_columns().filter(|&j| !free[j]).count();
+        // Too little decided and the sub-model is the original again, which the tree
+        // is about to search anyway.
+        if fixed * 100 < integers * RENS_MIN_FIXED {
+            return None;
+        }
+        let mut neighbourhood = problem.clone();
+        for j in problem.integer_columns() {
+            let v = relaxation[j];
+            let (lo, hi) = if !free[j] {
+                (v.round(), v.round())
+            } else if (v - v.round()).abs() > tolerance {
+                (v.floor(), v.ceil())
+            } else {
+                // Freed by widening, so free to move as far as the model lets it.
+                continue;
+            };
+            neighbourhood.col_lb[j] = lo.max(problem.col_lb[j]);
+            neighbourhood.col_ub[j] = hi.min(problem.col_ub[j]);
+        }
+        if let Ok(found) = rens_search(
+            problem,
+            &neighbourhood,
+            options,
+            remaining_until(deadline),
+            separation,
+        ) {
+            return found;
+        }
+        // The relaxation's integral values do not extend to a point, which says the
+        // fixings around the fractional columns are the ones in the way: free every
+        // integer column that shares a row with a free one, and look again.
+        let mut touched = vec![false; problem.n_rows()];
+        for j in (0..problem.n_cols()).filter(|&j| free[j]) {
+            for &i in problem.matrix.column(j).0 {
+                touched[i] = true;
+            }
+        }
+        for (i, _) in touched.iter().enumerate().filter(|(_, t)| **t) {
+            for &j in rows.column(i).0 {
+                if problem.is_integer(j) {
+                    free[j] = true;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One RENS sub-search, `Err` when the sub-model is proved to hold no point.
+fn rens_search(
+    problem: &Problem,
+    neighbourhood: &Problem,
+    options: &Options,
+    remaining: Option<Duration>,
+    separation: Option<&Separation>,
+) -> Result<Option<(f64, Vec<f64>)>, compact::Infeasible> {
+    let compacted = if separation.is_none() {
+        compact::compact(neighbourhood, options.integrality_tolerance)?
+    } else {
+        None
+    };
+    let (searched, compaction) = match &compacted {
+        Some((model, map)) => (model, Some(map)),
+        None => (neighbourhood, None),
+    };
+    let found = solve_separating(
+        searched,
+        // With its own feasibility search, as in `reduced_cost_neighbourhood`: there is
+        // no point to start from, and finding one is the whole job.
+        sub_search(
+            options,
+            remaining.map(|left| left.mul_f64(NEIGHBOURHOOD_SHARE)),
+        ),
+        None,
+        separation,
+    );
+    if found.status == Status::Infeasible {
+        return Err(compact::Infeasible);
+    }
+    if found.x.len() != searched.n_cols() {
+        return Ok(None);
+    }
+    let x = match compaction {
+        Some(map) => map.expand(&found.x),
+        None => found.x,
+    };
+    let tolerance = options.heuristic_limits.feasibility_tolerance;
+    Ok(
+        (x.len() == problem.n_cols() && heuristic::is_feasible(problem, &x, tolerance))
+            .then(|| (objective_at(problem, &x), x)),
+    )
+}
+
+/// How many times RENS frees the ring of columns around the ones it left free, when
+/// what it searched holds no point.
+const RENS_WIDENINGS: usize = 2;
+
+/// The share of the integer columns the root relaxation must leave integral before
+/// RENS searches what is left. Half, as in SCIP.
+const RENS_MIN_FIXED: usize = 50;
 
 fn objective_at(problem: &Problem, x: &[f64]) -> f64 {
     problem.obj.iter().zip(x).map(|(c, &v)| c * v).sum()
