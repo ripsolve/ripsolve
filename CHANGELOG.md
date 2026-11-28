@@ -78,6 +78,20 @@
 
 ### Performance
 
+- **A second feasibility jump, HiGHS's, taking turns with the first.** The search
+  Luteberget and Sartor describe, as HiGHS runs it: each column keeps one candidate
+  move whose score is updated for a constant cost per entry as other columns move;
+  moves are chosen from a sample of the improving ones; and at a local minimum the
+  violated rows' weights go up and a column from one of them moves anyway. The older
+  search recomputes every touched column's move and always takes the best one. It
+  never moves uphill. HiGHS finds its first point on `brazil3`, `CMS750_4`,
+  `rococoC10-001000`, `app1-1`, `ns1830653` and `academictimetablesmall` by this
+  search, in under four seconds, and the older one found nothing on any of them in
+  the full solve. The two now alternate restarts, and the run beside the root gets
+  four times the work it had. Each finds points the other does not (the older one
+  finds `neos-950242`, `s250r10` and `neos-3004026-krka`). On the 62 instances whose
+  root solves but which ended with no point, 24 now have one, against 14, and none
+  lost one. The 30 that close still close.
 - **RENS at the root, where the root heuristics find nothing.** Every integer column
   the root relaxation leaves integral is fixed there, every fractional one is held
   between the integers either side, and what is left is searched as a sub-MIP. When

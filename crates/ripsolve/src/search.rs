@@ -2592,7 +2592,7 @@ impl Mailbox {
 /// `solve_all_restarts`.
 fn jump_beside(problem: &Problem, options: Options, mailbox: &Mailbox) {
     let began = Instant::now();
-    let found = jump_search(problem, &options, None, JUMP_BUDGET, options.deadline, Some(mailbox));
+    let found = jump_search(problem, &options, None, BESIDE_JUMP_BUDGET, options.deadline, Some(mailbox));
     if std::env::var_os("RIPSOLVE_TRACE").is_some() {
         eprintln!("jump beside: {} after {:.1}s", found.is_some(), began.elapsed().as_secs_f64());
     }
@@ -2715,7 +2715,15 @@ fn jump_search(
         state ^= state << 17;
         state
     };
-    for attempt in 0..JUMP_RESTARTS {
+    // Two searches, taking turns: the older one, which takes the best move every time,
+    // and HiGHS's, which samples, moves uphill at a local minimum, and keeps each
+    // move's score current for a constant cost an entry; see `jump`. Each finds points
+    // the other does not. The newer one finds the first point on `brazil3`,
+    // `app1-1`, `ns1830653`, `academictimetablesmall` and both `nursesched` models,
+    // where HiGHS's own finds it before its first LP; the older one finds
+    // `neos-950242`, `s250r10` and `neos-3004026-krka`, which the newer one does not.
+    for turn in 0..2 * JUMP_RESTARTS {
+        let attempt = turn / 2;
         // The search beside the tree may settle the model while this is still
         // restarting. On `easter_monster` it proves the sudoku in ten milliseconds,
         // and the restarts went on for two and a half seconds without noticing.
@@ -2746,6 +2754,24 @@ fn jump_search(
         let moves = options
             .jump_moves
             .min(JUMP_UNIT << luby_exponent(attempt).min(usize::BITS as usize - 8));
+        if turn % 2 == 1 {
+            let found = crate::jump::jump(
+                problem,
+                &from,
+                &options.heuristic_limits,
+                0x9E37_79B9_7F4A_7C15 ^ attempt as u64,
+                &mut budget,
+                jump_deadline,
+                mailbox.map(|m| &m.cancel),
+            );
+            if found.is_some() {
+                return found;
+            }
+            if budget == 0 || jump_deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            continue;
+        }
         let found = heuristic::feasibility_jump_within(
             problem,
             &from,
@@ -4577,6 +4603,16 @@ const JUMP_BUDGET: JumpBudget = JumpBudget {
     per_nonzero: 25_000,
     ceiling: 500_000_000,
     backstop: 0.1,
+};
+
+/// The same search on its own thread beside the root, which takes nothing from the
+/// relaxation and can be given more. Shared between the two searches that take turns
+/// in `jump_search`, the budget above leaves the newer one too little: on `brazil3`
+/// it finds a point after 3.6 seconds alone, and taking turns stopped it at 3.3.
+const BESIDE_JUMP_BUDGET: JumpBudget = JumpBudget {
+    per_nonzero: 100_000,
+    ceiling: 2_000_000_000,
+    backstop: 0.25,
 };
 
 /// Conflicts without a better point or a proof before the search beside the tree gives

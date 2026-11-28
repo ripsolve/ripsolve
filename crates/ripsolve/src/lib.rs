@@ -106,6 +106,7 @@ pub mod cdcl;
 pub mod cuts;
 pub mod generate;
 pub mod heuristic;
+pub mod jump;
 pub mod lp;
 pub mod model;
 pub mod presolve;
